@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.2.0 |
+| 02-IITP-DABT-Route | v1.3.0 |
 
 ## 구조
 
@@ -42,11 +42,15 @@ pip install -r requirements.txt          # 서비스 구동
 pip install -r requirements-build.txt    # 그래프 구축 시에만
 
 cp .env.example .env                     # 값 채우기 (레포에 커밋 금지)
-# 안양 보행망 + 공개DEM 으로 그래프 구축
+# (1) 수치지형도 등고선 -> 5m DEM 생성
+python scripts/dem_from_contours.py \
+    --src "<수치지도 zip 폴더>" --out data/dem/anyang_5m.tif --res 5
+
+# (2) 안양 보행망 + 5m DEM 으로 그래프 구축
 python scripts/build_network.py --source osm \
     --place "Anyang-si, Gyeonggi-do, South Korea" \
-    --dem data/dem/anyang_37612_90m.img \
-    --out data/network_anyang.gpickle --version anyang-osm-dem90-2026Q3
+    --dem data/dem/anyang_5m.tif \
+    --out data/network_anyang.gpickle --version anyang-osm-dem5-2026Q3
 
 # 품질 확인 (경사 커버리지가 0 이면 경사 회피가 동작하지 않는다)
 python scripts/inspect_network.py --network data/network_anyang.gpickle \
@@ -128,27 +132,24 @@ curl -X POST localhost:18100/route/plan -H "Content-Type: application/json" -d '
 | 구분 | 현재 | 비고 |
 |---|---|---|
 | 보행 네트워크 | **OSM 안양 보행망** — 노드 6,750 / 링크 9,712 | 원본(node/link) 수령 시 `--source tabular` 로 재구축 후 `/admin/reload-network` — API 스키마 불변 |
-| 경사 | **국토지리정보원 공개DEM 90m**(도엽 37612) — 커버리지 99.5% | 5m DEM 확보 시 `--dem` 만 교체. DEM 이 없으면 `--elevation terrain`(공개 지형 타일, 인증 불필요) |
+| 경사 | **5m DEM** — 1:5,000 수치지형도 등고선(주곡선 5m)을 보간해 생성 (`scripts/dem_from_contours.py`) | 공개DEM 90m(`.img`)도 그대로 사용 가능. DEM 이 아예 없으면 `--elevation terrain`(공개 지형 타일, 인증 불필요) |
 | 무장애 관광지·역·정류장 | 01-IITP-DABT-Database (`POI_BACKEND=db`) | 파이프라인 적재 전에는 `file`/`none` 백엔드로 기동 가능 |
 
-### 안양 그래프 실측 (v1.2.0)
+### 안양 그래프 실측 (v1.3.0)
 
-| 링크 타입 | 비율 | | 경사 | |
-|---|---|---|---|---|
-| 도로·이면도로 | 71.1% | | 4° 초과(수동 휠체어 통행 불가) | **1,087개 (11.2%)** |
-| 보도 | 20.9% | | 최대 | 28.0° |
-| 횡단보도 | 4.3% | | 경사 커버리지 | 99.5% |
-| 계단·육교·지하보도 | 1.4% | | 보도폭 커버리지 | 0.1% (OSM 한계) |
+노드 6,750 / 링크 9,712 — 도로 71.3% · 보도 20.8% · 횡단보도 4.3% · 계단 50 · 육교 44 · 지하보도 35
 
-경로 비교 (안양역 → 안양예술공원)
+| 경사 격자 | 4° 초과 링크 | 안양역 → 안양예술공원 (수동 휠체어) |
+|---|---|---|
+| 공개DEM 90m | 1,087개 (11.2%) | 2,390m (일반 보행 대비 **+5m**) |
+| **수치지형도 5m** | 965개 (9.9%) | 2,608m (일반 보행 대비 **+220m**) |
 
-| 프로필 | 거리 | 최대 경사 | 계단 |
-|---|---|---|---|
-| 수동 휠체어 | 2,390m | **3.21°** | 0 |
-| 일반 보행 | 2,385m | 4.78° | 0 |
+90m 격자는 언덕의 경사를 인접 평지 도로에까지 번지게 하면서, 정작 짧은 급경사 구간은
+평활화해 놓친다. 5m 로 바꾸자 **실제로 피해야 할 오르막이 드러나 +220m 우회가 발생**한다.
+경사 데이터의 해상도가 곧 안내의 정확도다.
 
-+5m 우회로 급경사 구간을 회피한다. 보도폭·턱낮춤은 OSM 태그 커버리지가 낮아
-현재는 판정에 거의 기여하지 못한다 — 융기원 원본 데이터에서 보강해야 하는 항목이다.
+보도폭·턱낮춤은 OSM 태그 커버리지가 0.1%/0% 라 현재 판정에 거의 기여하지 못한다 —
+융기원 원본 데이터(WIDTH·CURB)에서 보강해야 하는 항목이다.
 
 데이터 품질은 `/meta/network` 와 경로 응답의 `data_quality` 로 항상 노출한다. 계단·경사 속성이
 없는 네트워크에서는 회피 판정이 성립하지 않으므로 반드시 확인할 것.
