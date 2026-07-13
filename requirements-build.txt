@@ -1,0 +1,8 @@
+# 그래프 구축 전용 (scripts/build_network.py)
+osmnx>=1.9
+pandas>=2.0
+openpyxl>=3.1
+numpy>=1.24
+# DEM 경사 부여 시
+xdem>=0.1
+pyproj>=3.6

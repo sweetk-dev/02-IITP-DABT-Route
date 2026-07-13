@@ -11,6 +11,7 @@ dist/
 # Environments
 .env
 .env.*
+!.env.example
 .venv/
 venv/
 ENV/
@@ -31,3 +32,9 @@ logs/
 # Local workspace meta
 .workspace/
 WORKSPACE.md
+
+# 네트워크 그래프 · POI 데이터 · 결과물 (대용량/실데이터 — 커밋 금지)
+data/*.gpickle
+data/dem/
+data/poi/*.json
+results/
