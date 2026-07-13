@@ -21,12 +21,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import pickle
 
 from .geo import haversine_m
 from .snap import snap
+
+logger = logging.getLogger("route_access")
 
 
 class BuildingIndex:
@@ -36,7 +39,12 @@ class BuildingIndex:
         self.polys = []          # [(shapely Polygon, name)]
         self.loaded = False
         if path and os.path.exists(path):
-            self.load(path)
+            try:
+                self.load(path)
+            except Exception as e:  # shapely 미설치·파일 손상 등
+                # 접근점 해석은 부가 기능이다. 실패해도 경로 안내 자체는 계속돼야 하므로
+                # 서비스를 죽이지 않고 비활성화한다(목적지는 시설 대표점으로 해석).
+                logger.warning("건물 폴리곤 로드 실패 — 접근점 해석 비활성화 (%s)", e)
 
     def load(self, path: str):
         with open(path, "rb") as f:

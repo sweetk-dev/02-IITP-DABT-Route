@@ -198,3 +198,14 @@ def test_plan_reports_destination_note(client):
     assert d["resolved_by"] in ("manual_survey", "accessible_entrance",
                                 "building_access", "facility_centroid")
     assert d["note"]
+
+
+def test_missing_building_index_does_not_kill_service(tmp_path):
+    """건물 폴리곤 로드 실패는 부가 기능 손실일 뿐, 서비스를 죽이면 안 된다."""
+    from route_service.engine.access import BuildingIndex
+
+    bad = tmp_path / "broken.pkl"
+    bad.write_bytes(b"not a pickle")
+    idx = BuildingIndex(str(bad))
+    assert idx.loaded is False
+    assert idx.containing(37.39, 126.95) is None
