@@ -93,7 +93,7 @@ def _boundary_samples(poly, step_m: float = 5.0):
 
 def resolve_access_point(store, lat: float, lng: float, profile,
                          buildings: BuildingIndex = None,
-                         max_walk_m: float = 120.0) -> dict:
+                         max_walk_m: float = 120.0, allowed=None) -> dict:
     """목적지 좌표 -> 접근 지점.
 
     반환: {"lat","lng","source","snap_dist_m"}
@@ -108,7 +108,7 @@ def resolve_access_point(store, lat: float, lng: float, profile,
     best = None
     for blat, blng in _boundary_samples(poly):
         try:
-            s = snap(store, blat, blng, profile, max_dist_m=max_walk_m)
+            s = snap(store, blat, blng, profile, max_dist_m=max_walk_m, allowed=allowed)
         except Exception:
             continue
         if not s["reachable"] or not s.get("profile_ok", True):

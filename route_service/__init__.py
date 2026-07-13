@@ -5,4 +5,4 @@ poi/     : 무장애 관광지 · 대중교통 접근점 조회
 api/     : FastAPI 래퍼 (12-AccessistantAI 등 클라이언트가 호출)
 """
 
-__version__ = "1.1.0"
+__version__ = "1.6.0"

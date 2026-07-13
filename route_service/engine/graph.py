@@ -95,6 +95,7 @@ class NetworkStore:
         self._meta = {}
         self._node_ids = []
         self._node_coords = []
+        self._components = {}     # (profile_id, max_slope) -> 최대 연결요소 노드 집합
 
     # ---- 로드 ----
     def load(self, path: str, version: str = "unknown", region: str = "") -> dict:
@@ -112,6 +113,7 @@ class NetworkStore:
                 (G.nodes[n]["lat"], G.nodes[n]["lon"]) for n in self._node_ids
             ]
             self._meta = self._build_meta(G, path, version, region)
+            self._components = {}
         return self._meta
 
     def load_graph_object(self, G: nx.Graph, version="memory", region="") -> dict:
@@ -124,6 +126,7 @@ class NetworkStore:
                 (G.nodes[n]["lat"], G.nodes[n]["lon"]) for n in self._node_ids
             ]
             self._meta = self._build_meta(G, "", version, region)
+            self._components = {}
         return self._meta
 
     @staticmethod
@@ -178,6 +181,33 @@ class NetworkStore:
     def node_index(self):
         """(node_ids, coords) — 스냅용."""
         return self._node_ids, self._node_coords
+
+    def reachable_nodes(self, profile, max_slope_deg: float) -> set:
+        """프로필 제약을 적용했을 때 **서로 오갈 수 있는 최대 덩어리**의 노드 집합.
+
+        계단·급경사를 걷어내면 보행망은 수백 개 조각으로 쪼개진다(안양 실측: 수동 휠체어
+        4도 기준 522개 컴포넌트). 가장 가까운 통행 가능 노드에 스냅하면 그 노드가 고립된
+        조각에 속해 "경로 없음" 이 나온다 — 실제로는 갈 수 있는 길이 있는데도.
+        그래서 스냅 후보를 이 집합으로 제한한다.
+        """
+        import networkx as nx
+
+        key = (profile.id, round(float(max_slope_deg), 2))
+        with self._lock:
+            if key in self._components:
+                return self._components[key]
+
+            from .planner import edge_passable
+
+            H = nx.Graph()
+            H.add_nodes_from(self._G.nodes())
+            for u, v, d in self._G.edges(data=True):
+                if edge_passable(d, profile, max_slope_deg):
+                    H.add_edge(u, v)
+            comps = list(nx.connected_components(H))
+            main = max(comps, key=len) if comps else set()
+            self._components[key] = main
+            return main
 
 
 STORE = NetworkStore()
