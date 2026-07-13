@@ -3,6 +3,8 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 pydantic>=2.5
 networkx>=3.1
+# 건물 폴리곤(접근점 해석) 로드에 필요 — 없으면 접근점 해석이 비활성화된다
+shapely>=2.0
 
 # POI: db 백엔드 사용 시
 SQLAlchemy>=2.0
