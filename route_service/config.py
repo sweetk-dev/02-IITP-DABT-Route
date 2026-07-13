@@ -22,6 +22,11 @@ class Settings:
     poi_data_dir: str = os.environ.get("POI_DATA_DIR", "data/poi")
     poi_db_dsn: str = os.environ.get("POI_DB_DSN", "")
 
+    # 목적지 접근점(무장애 출입구) 해석
+    buildings_path: str = os.environ.get("BUILDINGS_PATH", "data/buildings_anyang.pkl")
+    entrances_path: str = os.environ.get("ENTRANCES_PATH", "data/poi/entrances.json")
+    entrance_max_walk_m: float = float(os.environ.get("ENTRANCE_MAX_WALK_M", "120"))
+
     # 서비스
     api_token: str = os.environ.get("ROUTE_API_TOKEN", "")
     allowed_origins: list = field(
