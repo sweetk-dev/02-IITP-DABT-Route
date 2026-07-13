@@ -65,9 +65,19 @@ def _edge_warnings(data: dict, profile: Profile) -> list:
     return out
 
 
+def _josa(word: str, with_batchim: str, without_batchim: str) -> str:
+    """받침 유무에 따른 조사 선택 — 음성 안내 문장이 어색해지지 않도록."""
+    if not word:
+        return without_batchim
+    ch = word[-1]
+    if not ("가" <= ch <= "힣"):
+        return without_batchim
+    return with_batchim if (ord(ch) - 0xAC00) % 28 else without_batchim
+
+
 def _sentence(maneuver: str, distance_m: float, link_name, data: dict, warnings: list) -> str:
     dist = int(round(distance_m))
-    where = ("%s을 따라 " % link_name) if link_name else ""
+    where = ("%s%s 따라 " % (link_name, _josa(link_name, "을", "를"))) if link_name else ""
     lt = data["link_type"]
 
     if maneuver == "depart":

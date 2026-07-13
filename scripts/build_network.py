@@ -27,6 +27,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows 기본 콘솔 인코딩(cp949)에서 한글·기호 출력이 깨지지 않도록
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:  # pragma: no cover
+    pass
+
 from route_service.engine.graph import normalize_graph  # noqa: E402
 from route_service.engine.sources import build_from_osm, build_from_tabular  # noqa: E402
 
@@ -38,7 +45,10 @@ def main():
     ap.add_argument("--bbox", help="min_lat,min_lng,max_lat,max_lng")
     ap.add_argument("--node", help="tabular: node 파일(xlsx/csv)")
     ap.add_argument("--link", help="tabular: link 파일(xlsx/csv)")
-    ap.add_argument("--dem", help="DEM(.img) 경로 — 없으면 경사 0 으로 두고 진행")
+    ap.add_argument("--dem", help="DEM(.img) 경로 (국토정보플랫폼 5m 등)")
+    ap.add_argument("--elevation", choices=("none", "terrain"), default="none",
+                    help="DEM 이 없을 때 경사 산출 방식. terrain=공개 지형 타일(인증 불필요, 약 30m급)")
+    ap.add_argument("--tile-zoom", type=int, default=13, help="지형 타일 zoom (기본 13)")
     ap.add_argument("--out", default="data/network.gpickle")
     ap.add_argument("--version", default="unknown")
     args = ap.parse_args()
@@ -65,8 +75,14 @@ def main():
 
         stat = apply_slope_from_dem(G, args.dem, bbox=bbox)
         print("[build] 경사 적용: %s" % json.dumps(stat, ensure_ascii=False))
+    elif args.elevation == "terrain":
+        print("[build] 지형 타일로 종단경사 산출 (zoom=%d)" % args.tile_zoom)
+        from route_service.engine.elevation import apply_slope_from_terrain
+
+        stat = apply_slope_from_terrain(G, zoom=args.tile_zoom)
+        print("[build] 경사 적용: %s" % json.dumps(stat, ensure_ascii=False))
     else:
-        print("[build] DEM 미지정 — 경사 0 (경사 회피가 동작하지 않습니다)")
+        print("[build] 경사 데이터 없음 — 경사 회피가 동작하지 않습니다 (--dem 또는 --elevation terrain 사용)")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "wb") as f:

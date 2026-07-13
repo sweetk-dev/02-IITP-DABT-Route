@@ -61,7 +61,7 @@ def _astar(G, start, goal, profile, max_slope_deg, penalized_edges=None):
     return nx.astar_path(G, start, goal, heuristic=heuristic, weight=weight)
 
 
-def _summarize(G, path, profile) -> dict:
+def _summarize(G, path, profile, slope_coverage: float = 1.0) -> dict:
     dist = 0.0
     slopes = []
     counts = {"steps": 0, "crossing": 0, "elevator": 0, "ramp": 0}
@@ -89,6 +89,12 @@ def _summarize(G, path, profile) -> dict:
     slope_score = max(0.0, 1.0 - (max_slope / max(profile.max_slope_deg, 0.1)))
     penalty = 0.3 * counts["steps"] + 0.05 * len(set(warnings))
     score = max(0.0, min(1.0, 0.6 * slope_score + 0.4 - penalty))
+
+    # 경사 데이터가 없는 네트워크에서 "경사 0 = 만점"은 거짓 안심을 준다.
+    # 점수를 깎고 사실을 경고로 알린다.
+    if slope_coverage < 0.5:
+        warnings.append("경사 데이터가 없어 경사 회피가 적용되지 않았습니다")
+        score = min(score, 0.6)
 
     return {
         "total_distance_m": round(dist),
@@ -167,12 +173,13 @@ def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
             break
         routes.append(alt)
 
+    coverage = float(store.meta.get("slope_coverage", 1.0) or 0.0)
     out = []
     for path in routes:
         out.append(
             {
                 "path": path,
-                "summary": _summarize(G, path, profile),
+                "summary": _summarize(G, path, profile, coverage),
                 "geometry": _geometry(G, path),
             }
         )

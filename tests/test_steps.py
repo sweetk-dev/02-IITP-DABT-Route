@@ -35,3 +35,13 @@ def test_warning_for_steep_segment(store):
     steps = build_steps(store.graph, ["N1", "N4", "N3"], p)
     texts = " ".join(s["instruction"] for s in steps)
     assert "계단" in texts
+
+
+def test_josa_selection_for_road_names(store):
+    """받침 유무에 따라 '을/를'을 골라야 음성 안내가 어색해지지 않는다."""
+    from route_service.engine.steps import _josa
+
+    assert _josa("평촌대로254번길", "을", "를") == "을"   # 받침 있음
+    assert _josa("달안로", "을", "를") == "를"           # 받침 없음
+    assert _josa("경수대로", "을", "를") == "를"
+    assert _josa(None, "을", "를") == "를"

@@ -80,11 +80,24 @@ def incline_to_deg(tags: dict):
         return None
 
 
+# osmnx 는 기본적으로 소수의 way 태그만 보존한다(useful_tags_way).
+# 그 기본값에는 footway·incline·kerb·wheelchair·surface 가 없어서,
+# 그대로 쓰면 횡단보도·경사·턱낮춤·휠체어 통행 가부를 전부 잃는다 — 회피 판정이 무력화된다.
+WALK_TAGS = [
+    "bridge", "tunnel", "oneway", "ref", "name", "highway", "service", "access", "area",
+    "junction", "width", "est_width",
+    # 무장애 판정에 필수
+    "footway", "incline", "kerb", "wheelchair", "surface", "conveying",
+    "tactile_paving", "ramp", "handrail", "step_count", "crossing",
+]
+
+
 def build_from_osm(place: str = "Anyang-si, Gyeonggi-do, South Korea",
                    bbox=None, network_type: str = "walk") -> nx.Graph:
     """osmnx 로 보행망을 받아 표준 Graph 를 만든다.
 
     place 또는 bbox(min_lat, min_lng, max_lat, max_lng) 중 하나를 준다.
+    osmnx 1.x / 2.x 양쪽의 graph_from_bbox 시그니처를 모두 처리한다.
     """
     try:
         import osmnx as ox
@@ -93,10 +106,23 @@ def build_from_osm(place: str = "Anyang-si, Gyeonggi-do, South Korea",
             "osmnx 가 필요합니다: pip install osmnx  (그래프 구축 시에만 필요)"
         ) from e
 
+    try:
+        ox.settings.useful_tags_way = WALK_TAGS
+    except AttributeError:  # osmnx 1.x 이전
+        ox.utils.config(useful_tags_way=WALK_TAGS)
+
     if bbox:
         min_lat, min_lng, max_lat, max_lng = bbox
-        Gx = ox.graph_from_bbox(max_lat, min_lat, max_lng, min_lng, network_type=network_type,
-                                simplify=True, retain_all=False)
+        try:
+            # osmnx >= 2.0 : bbox=(left, bottom, right, top) = (서, 남, 동, 북)
+            Gx = ox.graph_from_bbox(
+                bbox=(min_lng, min_lat, max_lng, max_lat),
+                network_type=network_type, simplify=True, retain_all=False,
+            )
+        except TypeError:
+            # osmnx 1.x : (north, south, east, west) 위치 인자
+            Gx = ox.graph_from_bbox(max_lat, min_lat, max_lng, min_lng,
+                                    network_type=network_type, simplify=True, retain_all=False)
     else:
         Gx = ox.graph_from_place(place, network_type=network_type, simplify=True, retain_all=False)
 

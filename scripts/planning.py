@@ -18,6 +18,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Windows 기본 콘솔 인코딩(cp949)에서 한글·기호 출력이 깨지지 않도록
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:  # pragma: no cover
+    pass
+
 from route_service.engine.graph import NetworkStore  # noqa: E402
 from route_service.engine.planner import NoRouteError, plan  # noqa: E402
 from route_service.engine.profiles import get_profile  # noqa: E402
