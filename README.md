@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.1.0 |
+| 02-IITP-DABT-Route | v1.2.0 |
 
 ## 구조
 
@@ -42,10 +42,15 @@ pip install -r requirements.txt          # 서비스 구동
 pip install -r requirements-build.txt    # 그래프 구축 시에만
 
 cp .env.example .env                     # 값 채우기 (레포에 커밋 금지)
+# 안양 보행망 + 공개DEM 으로 그래프 구축
 python scripts/build_network.py --source osm \
     --place "Anyang-si, Gyeonggi-do, South Korea" \
-    --dem data/dem/anyang_5m.img \
-    --out data/network_anyang.gpickle --version anyang-osm-2026Q3
+    --dem data/dem/anyang_37612_90m.img \
+    --out data/network_anyang.gpickle --version anyang-osm-dem90-2026Q3
+
+# 품질 확인 (경사 커버리지가 0 이면 경사 회피가 동작하지 않는다)
+python scripts/inspect_network.py --network data/network_anyang.gpickle \
+    --route 37.4025,126.9227,37.3856,126.9256
 
 uvicorn route_service.api.main:app --host 0.0.0.0 --port 18100
 ```
@@ -122,9 +127,28 @@ curl -X POST localhost:18100/route/plan -H "Content-Type: application/json" -d '
 
 | 구분 | 현재 | 비고 |
 |---|---|---|
-| 보행 네트워크 | **OSM 안양 보행망** (선구축) | 원본(node/link) 수령 시 `--source tabular` 로 재구축 후 `/admin/reload-network` — API 스키마 불변 |
-| 경사(DEM) | 국토정보플랫폼 안양 5m DEM(.img) | 미지정 시 경사 0 (경사 회피 미동작) — `/meta/network` 의 `slope_coverage` 로 확인 |
+| 보행 네트워크 | **OSM 안양 보행망** — 노드 6,750 / 링크 9,712 | 원본(node/link) 수령 시 `--source tabular` 로 재구축 후 `/admin/reload-network` — API 스키마 불변 |
+| 경사 | **국토지리정보원 공개DEM 90m**(도엽 37612) — 커버리지 99.5% | 5m DEM 확보 시 `--dem` 만 교체. DEM 이 없으면 `--elevation terrain`(공개 지형 타일, 인증 불필요) |
 | 무장애 관광지·역·정류장 | 01-IITP-DABT-Database (`POI_BACKEND=db`) | 파이프라인 적재 전에는 `file`/`none` 백엔드로 기동 가능 |
+
+### 안양 그래프 실측 (v1.2.0)
+
+| 링크 타입 | 비율 | | 경사 | |
+|---|---|---|---|---|
+| 도로·이면도로 | 71.1% | | 4° 초과(수동 휠체어 통행 불가) | **1,087개 (11.2%)** |
+| 보도 | 20.9% | | 최대 | 28.0° |
+| 횡단보도 | 4.3% | | 경사 커버리지 | 99.5% |
+| 계단·육교·지하보도 | 1.4% | | 보도폭 커버리지 | 0.1% (OSM 한계) |
+
+경로 비교 (안양역 → 안양예술공원)
+
+| 프로필 | 거리 | 최대 경사 | 계단 |
+|---|---|---|---|
+| 수동 휠체어 | 2,390m | **3.21°** | 0 |
+| 일반 보행 | 2,385m | 4.78° | 0 |
+
++5m 우회로 급경사 구간을 회피한다. 보도폭·턱낮춤은 OSM 태그 커버리지가 낮아
+현재는 판정에 거의 기여하지 못한다 — 융기원 원본 데이터에서 보강해야 하는 항목이다.
 
 데이터 품질은 `/meta/network` 와 경로 응답의 `data_quality` 로 항상 노출한다. 계단·경사 속성이
 없는 네트워크에서는 회피 판정이 성립하지 않으므로 반드시 확인할 것.

@@ -3,6 +3,8 @@ osmnx>=1.9
 pandas>=2.0
 openpyxl>=3.1
 numpy>=1.24
-# DEM 경사 부여 시
-xdem>=0.1
+# DEM 경사 부여 시 (국토지리정보원 공개DEM .img 직접 읽기)
+rasterio>=1.3
 pyproj>=3.6
+# 지형 타일(--elevation terrain) 사용 시
+pillow>=10.0

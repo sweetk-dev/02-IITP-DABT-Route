@@ -55,3 +55,16 @@ def test_off_route_distance(store):
     geom = plan(store, "N1", "N3", get_profile("wheelchair_manual"))["routes"][0]["geometry"]
     assert off_route_distance_m(geom, 37.3900, 126.9505) < 20
     assert off_route_distance_m(geom, 37.3850, 126.9505) > 200
+
+
+def test_no_slope_data_does_not_score_perfect(store):
+    """경사 데이터가 없는 네트워크에서 '경사 0 = 만점'은 거짓 안심을 준다."""
+    G = store.graph
+    for _u, _v, d in G.edges(data=True):
+        d["slope"] = 0.0
+    store.load_graph_object(G, version="no-slope")
+    assert store.meta["slope_coverage"] == 0.0
+
+    s = plan(store, "N1", "N3", get_profile("wheelchair_manual"))["routes"][0]["summary"]
+    assert s["accessibility_score"] <= 0.6
+    assert any("경사 데이터가 없어" in w for w in s["warnings"])
