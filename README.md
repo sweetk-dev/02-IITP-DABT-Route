@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.3.1 |
+| 02-IITP-DABT-Route | v1.4.0 |
 
 ## 구조
 
@@ -72,7 +72,7 @@ uvicorn route_service.api.main:app --host 0.0.0.0 --port 18100
 | GET | `/route/{route_id}` | 직전 경로 조회(캐시) |
 | GET | `/tour/bf-spots` | 무장애 관광지 목록 |
 | GET | `/tour/bf-spots/{id}` | 관광지 상세 (편의시설 Y/N) |
-| GET | `/tour/bf-spots/{id}/entrance` | **무장애 출입구 좌표** (없으면 시설 대표 좌표로 대체 표기) |
+| GET | `/tour/bf-spots/{id}/entrance` | **무장애 접근 지점** — 실측 출입구 > 건물 접근점 > 시설 대표점 |
 | POST | `/tour/recommend` | 장애 유형별 관광지 추천 랭킹 |
 | GET | `/transit/access-points` | 휠체어 접근 가능한 정류장·역 |
 | POST | `/admin/reload-network` | 그래프 무중단 교체 |
@@ -103,6 +103,38 @@ curl -X POST localhost:18100/route/plan -H "Content-Type: application/json" -d '
   "fallback": {"used": false},
   "data_quality": {"slope_coverage": 0.98, "link_type_available": true}
 }
+```
+
+## 목적지 접근 지점 (무장애 출입구)
+
+POI 좌표는 **시설 대표점(건물 중심)** 이다. 그대로 목적지로 쓰면 건물 뒤편 도로에 스냅되어,
+"도착했습니다" 라고 안내한 지점에서 실제 출입구까지 휠체어로 건물을 한 바퀴 돌아야 하는
+상황이 생긴다. 그래서 목적지를 3단계로 해석하고, **무엇으로 정했는지 응답에 반드시 남긴다.**
+
+| 우선순위 | `resolved_by` | 근거 |
+|---|---|---|
+| 1 | `manual_survey` | 현장 실측 출입구 (`data/poi/entrances.json`) — 답사 결과를 넣으면 최우선 |
+| 2 | `accessible_entrance` | 데이터에 등록된 출입구 좌표 |
+| 3 | `building_access` | 건물 외곽선 중 **보행망에 가장 가까운 지점** (프로필상 통행 가능한 링크만 후보) |
+| 4 | `facility_centroid` | 시설 대표점 — "도착 후 출입구를 확인하세요" 경고와 함께 반환 |
+
+### 데이터 실측 (2026-07-13, 안양)
+
+| 소스 | 결과 |
+|---|---|
+| OSM `entrance` 노드 | 안양 전역 86개, `wheelchair` 태그 **0개**, 관광지 13곳 중 50m 이내 매칭 **0곳** → 사용 불가 |
+| OSM 건물 폴리곤 | **9,563개** → 사용 |
+| 무장애 관광지 13곳 해석 | `building_access` **8곳** / `facility_centroid` 5곳(공원·시장 등 폴리곤 없음) |
+
+`building_access` 는 실제 출입구가 아니라 **건물의 도로 면**이다. 정확한 출입구는 현장 실증
+답사로 확보해 `entrances.json` 에 등록하는 것이 정답이며, 그때까지는 응답의 `note` 로
+한계를 사용자에게 알린다.
+
+```bash
+# 건물 폴리곤 수집 (그래프 구축 시 함께)
+python scripts/build_network.py --source osm --place "Anyang-si, ..." \
+    --dem data/dem/anyang_5m.tif --out data/network_anyang.gpickle \
+    --buildings data/buildings_anyang.pkl
 ```
 
 ## 통행 프로필

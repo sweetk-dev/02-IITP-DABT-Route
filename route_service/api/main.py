@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .. import __version__
 from ..config import get_settings
 from ..engine import profiles as prof
+from ..engine.access import BuildingIndex, ManualEntrances, resolve_access_point
 from ..engine.graph import STORE as NET
 from ..engine.planner import NoRouteError, off_route_distance_m, plan
 from ..engine.snap import SnapError, snap
@@ -38,6 +39,11 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     poi_store.configure(settings)
+    global BUILDINGS, ENTRANCES
+    BUILDINGS = BuildingIndex(settings.buildings_path)
+    ENTRANCES = ManualEntrances(settings.entrances_path)
+    logger.info("접근점 데이터: 건물 %s / 실측 출입구 %d건",
+                len(BUILDINGS.polys) if BUILDINGS.loaded else "없음", len(ENTRANCES.items))
     try:
         meta = NET.load(settings.network_path, settings.network_version, settings.region_name)
         logger.info(
@@ -67,6 +73,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 목적지 접근점(무장애 출입구) 해석용 — 기동 시 로드
+BUILDINGS = BuildingIndex()
+ENTRANCES = ManualEntrances()
 
 # 최근 경로 캐시 (재탐색·구간 설명용) — 최대 200건
 ROUTE_CACHE = OrderedDict()
@@ -118,13 +128,39 @@ def _profile_or_400(profile_id: str):
         raise HTTPException(status_code=400, detail="알 수 없는 프로필: %s" % profile_id)
 
 
-def _resolve_destination(dest: Destination) -> dict:
+def _resolve_destination(dest: Destination, profile) -> dict:
+    """목적지 좌표 해석.
+
+    관광지는 시설 대표점(건물 중심)이 들어오므로 그대로 쓰지 않는다.
+    실측 출입구 > 건물 접근점 > 대표점 순으로 해석하고, 무엇으로 정했는지 응답에 남긴다.
+    """
     if dest.type == "coord":
         if dest.lat is None or dest.lng is None:
             raise HTTPException(status_code=400, detail="목적지 좌표가 없습니다")
         return {"lat": dest.lat, "lng": dest.lng, "source": "coord"}
+
     if not dest.poi_id:
         raise HTTPException(status_code=400, detail="poi_id 가 필요합니다")
+
+    if dest.type == "tour":
+        manual = ENTRANCES.get(dest.poi_id)
+        if manual:
+            return manual
+        spot = poi_store.STORE.get_tour_spot(dest.poi_id)
+        if spot is None or spot["lat"] is None:
+            raise HTTPException(
+                status_code=404,
+                detail="목적지 POI 를 찾을 수 없습니다 (poi_backend=%s)" % poi_store.STORE.source,
+            )
+        ent = (spot.get("entrance") or {})
+        if ent.get("lat") is not None:      # 데이터 자체가 출입구 좌표를 가진 경우
+            return {"lat": float(ent["lat"]), "lng": float(ent["lng"]),
+                    "source": "accessible_entrance"}
+        return resolve_access_point(
+            NET, spot["lat"], spot["lng"], profile, BUILDINGS,
+            max_walk_m=settings.entrance_max_walk_m,
+        )
+
     resolved = poi_store.STORE.resolve_destination(dest.type, dest.poi_id)
     if resolved is None:
         raise HTTPException(
@@ -148,7 +184,7 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
         if constraints.avoid is not None:
             profile = replace(profile, avoid=tuple(constraints.avoid))
 
-    target = _resolve_destination(dest)
+    target = _resolve_destination(dest, profile)
 
     try:
         s = snap(NET, origin_lat, origin_lng, profile, settings.snap_max_dist_m)
@@ -189,7 +225,8 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
                    "snapped": s["snapped"], "snap_dist_m": s["dist_m"]},
         "destination": {"type": dest.type, "poi_id": dest.poi_id,
                         "lat": target["lat"], "lng": target["lng"],
-                        "resolved_by": target["source"]},
+                        "resolved_by": target["source"],
+                        "note": _entrance_note(target)},
         "routes": routes,
         "fallback": result["fallback"],
         "data_quality": {
@@ -200,6 +237,20 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
     }
     _cache_put(route_id, payload)
     return payload
+
+
+def _entrance_note(target: dict):
+    """목적지 좌표를 무엇으로 정했는지 사용자에게 알린다(과신 방지)."""
+    src = target.get("source")
+    if src == "manual_survey":
+        return "현장 실측 출입구 기준" + (" — %s" % target["note"] if target.get("note") else "")
+    if src == "building_access":
+        return "건물 외곽에서 보행로에 가장 가까운 지점 기준 (실제 출입구와 다를 수 있음)"
+    if src == "accessible_entrance":
+        return "데이터에 등록된 무장애 출입구 기준"
+    if src == "facility_centroid":
+        return "시설 대표 좌표 기준 — 건물 중심일 수 있으니 도착 후 출입구를 확인하세요"
+    return None
 
 
 @app.post("/route/plan", tags=["route"], dependencies=[Depends(auth)])
@@ -267,11 +318,29 @@ def tour_spot_detail(poi_id: str):
 
 
 @app.get("/tour/bf-spots/{poi_id}/entrance", tags=["tour"], dependencies=[Depends(auth)])
-def tour_spot_entrance(poi_id: str):
-    ent = poi_store.STORE.get_entrance(poi_id)
-    if ent is None:
+def tour_spot_entrance(poi_id: str, profile: str = Query("wheelchair_manual")):
+    """무장애 접근 지점. 실측 출입구 > 건물 접근점 > 시설 대표점 순으로 해석한다."""
+    p = _profile_or_400(profile)
+    manual = ENTRANCES.get(poi_id)
+    if manual:
+        manual["note"] = _entrance_note(manual)
+        return manual
+
+    spot = poi_store.STORE.get_tour_spot(poi_id)
+    if spot is None or spot["lat"] is None:
         raise HTTPException(status_code=404, detail="출입구 정보를 찾을 수 없습니다")
-    return ent
+    ent = (spot.get("entrance") or {})
+    if ent.get("lat") is not None:
+        return {"lat": float(ent["lat"]), "lng": float(ent["lng"]),
+                "source": "accessible_entrance",
+                "note": "데이터에 등록된 무장애 출입구 기준"}
+    if not NET.loaded:
+        raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
+
+    acc = resolve_access_point(NET, spot["lat"], spot["lng"], p, BUILDINGS,
+                               max_walk_m=settings.entrance_max_walk_m)
+    acc["note"] = _entrance_note(acc)
+    return acc
 
 
 @app.post("/tour/recommend", tags=["tour"], dependencies=[Depends(auth)])

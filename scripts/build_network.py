@@ -50,6 +50,7 @@ def main():
                     help="DEM 이 없을 때 경사 산출 방식. terrain=공개 지형 타일(인증 불필요, 약 30m급)")
     ap.add_argument("--tile-zoom", type=int, default=13, help="지형 타일 zoom (기본 13)")
     ap.add_argument("--out", default="data/network.gpickle")
+    ap.add_argument("--buildings", help="건물 폴리곤 저장 경로(.pkl) — 목적지 접근점(출입구) 해석용")
     ap.add_argument("--version", default="unknown")
     args = ap.parse_args()
 
@@ -88,6 +89,32 @@ def main():
     with open(args.out, "wb") as f:
         pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
     print("[build] 저장 완료: %s (version=%s)" % (args.out, args.version))
+
+    if args.buildings:
+        # POI 좌표는 건물 중심이라 그대로 목적지로 쓰면 건물 뒤편에 도착 안내가 된다.
+        # 건물 외곽선에서 보행망에 가장 가까운 지점을 접근점으로 쓰기 위해 폴리곤을 저장한다.
+        print("[build] 건물 폴리곤 수집: %s" % (args.bbox or args.place))
+        import osmnx as ox
+
+        if bbox:
+            min_lat, min_lng, max_lat, max_lng = bbox
+            gdf = ox.features_from_bbox(bbox=(min_lng, min_lat, max_lng, max_lat),
+                                        tags={"building": True})
+        else:
+            gdf = ox.features_from_place(args.place, tags={"building": True})
+
+        polys = []
+        for geom, name in zip(gdf.geometry, gdf.get("name", [None] * len(gdf))):
+            if geom is None or geom.geom_type not in ("Polygon", "MultiPolygon"):
+                continue
+            parts = geom.geoms if geom.geom_type == "MultiPolygon" else [geom]
+            for part in parts:
+                polys.append((part, name if isinstance(name, str) else None))
+
+        os.makedirs(os.path.dirname(os.path.abspath(args.buildings)), exist_ok=True)
+        with open(args.buildings, "wb") as f:
+            pickle.dump(polys, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print("[build] 건물 %d개 저장: %s" % (len(polys), args.buildings))
 
 
 if __name__ == "__main__":

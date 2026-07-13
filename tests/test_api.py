@@ -175,3 +175,26 @@ def test_transit_access_points_flag_lift_only_station(client):
     by_id = {i["poi_id"]: i for i in body["items"]}
     assert by_id["S1"]["warnings"] == []            # 엘리베이터 보유
     assert by_id["S2"]["warnings"]                  # 리프트만 -> 경고
+
+
+def test_entrance_endpoint_reports_source(client):
+    """목적지 좌표를 무엇으로 정했는지 반드시 알려야 한다(건물 중심 안내 방지)."""
+    r = client.get("/tour/bf-spots/TBF-1/entrance")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source"] == "accessible_entrance"
+    assert body["note"]
+
+
+def test_plan_reports_destination_note(client):
+    r = client.post(
+        "/route/plan",
+        json={
+            "origin": {"lat": 37.3900, "lng": 126.9500},
+            "destination": {"type": "tour", "poi_id": "TBF-1"},
+        },
+    )
+    d = r.json()["destination"]
+    assert d["resolved_by"] in ("manual_survey", "accessible_entrance",
+                                "building_access", "facility_centroid")
+    assert d["note"]
