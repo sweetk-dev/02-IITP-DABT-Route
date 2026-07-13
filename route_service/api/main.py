@@ -128,7 +128,7 @@ def _profile_or_400(profile_id: str):
         raise HTTPException(status_code=400, detail="알 수 없는 프로필: %s" % profile_id)
 
 
-def _resolve_destination(dest: Destination, profile) -> dict:
+def _resolve_destination(dest: Destination, profile, allowed=None) -> dict:
     """목적지 좌표 해석.
 
     관광지는 시설 대표점(건물 중심)이 들어오므로 그대로 쓰지 않는다.
@@ -158,7 +158,7 @@ def _resolve_destination(dest: Destination, profile) -> dict:
                     "source": "accessible_entrance"}
         return resolve_access_point(
             NET, spot["lat"], spot["lng"], profile, BUILDINGS,
-            max_walk_m=settings.entrance_max_walk_m,
+            max_walk_m=settings.entrance_max_walk_m, allowed=allowed,
         )
 
     resolved = poi_store.STORE.resolve_destination(dest.type, dest.poi_id)
@@ -184,11 +184,17 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
         if constraints.avoid is not None:
             profile = replace(profile, avoid=tuple(constraints.avoid))
 
-    target = _resolve_destination(dest, profile)
+    # 프로필 제약을 적용하면 보행망이 수백 조각으로 쪼개진다. 고립 조각에 스냅되면
+    # 실제로는 갈 수 있는 목적지가 "경로 없음" 이 되므로, 스냅 후보를 최대 연결요소로 제한한다.
+    # 제약 완화(폴백) 범위까지 고려해 여유 경사를 더한 기준으로 계산한다.
+    relax_margin = 4.0 if (constraints is None or constraints.relax_if_no_route) else 0.0
+    allowed = NET.reachable_nodes(profile, profile.max_slope_deg + relax_margin)
+
+    target = _resolve_destination(dest, profile, allowed)
 
     try:
-        s = snap(NET, origin_lat, origin_lng, profile, settings.snap_max_dist_m)
-        g = snap(NET, target["lat"], target["lng"], profile, settings.snap_max_dist_m)
+        s = snap(NET, origin_lat, origin_lng, profile, settings.snap_max_dist_m, allowed=allowed)
+        g = snap(NET, target["lat"], target["lng"], profile, settings.snap_max_dist_m, allowed=allowed)
     except SnapError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -279,9 +285,10 @@ def route_snap(req: SnapRequest):
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
     profile = _profile_or_400(req.profile) if req.profile else None
+    allowed = NET.reachable_nodes(profile, profile.max_slope_deg + 4.0) if profile else None
     try:
         return snap(NET, req.lat, req.lng, profile,
-                    req.max_dist_m or settings.snap_max_dist_m)
+                    req.max_dist_m or settings.snap_max_dist_m, allowed=allowed)
     except SnapError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -337,8 +344,9 @@ def tour_spot_entrance(poi_id: str, profile: str = Query("wheelchair_manual")):
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
 
+    allowed = NET.reachable_nodes(p, p.max_slope_deg + 4.0)
     acc = resolve_access_point(NET, spot["lat"], spot["lng"], p, BUILDINGS,
-                               max_walk_m=settings.entrance_max_walk_m)
+                               max_walk_m=settings.entrance_max_walk_m, allowed=allowed)
     acc["note"] = _entrance_note(acc)
     return acc
 

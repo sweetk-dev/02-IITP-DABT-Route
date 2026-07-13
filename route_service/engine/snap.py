@@ -26,11 +26,15 @@ def _reachable_by_profile(G, node, profile: Profile) -> bool:
 
 
 def snap(store, lat: float, lng: float, profile: Profile = None,
-         max_dist_m: float = 300.0, candidates: int = 12) -> dict:
+         max_dist_m: float = 300.0, candidates: int = 12, allowed=None) -> dict:
     """최근접 노드 스냅.
 
     profile 이 주어지면 해당 프로필로 통행 가능한 노드 중에서 고른다.
     (계단으로만 연결된 노드에 스냅되면 경로가 아예 나오지 않는다.)
+
+    allowed 가 주어지면 **그 집합 안에서만** 고른다. 프로필 제약을 적용한 보행망은
+    수백 개 조각으로 쪼개지므로(안양 실측 522개), 최대 연결요소를 넘겨 고립된 조각에
+    스냅되는 것을 막는다.
     """
     G = store.graph
     node_ids, coords = store.node_index
@@ -44,6 +48,21 @@ def snap(store, lat: float, lng: float, profile: Profile = None,
     scored.sort(key=lambda x: x[0])
 
     best_any = scored[0]
+
+    if allowed:
+        # 도달 가능한 덩어리 안에서만 고른다. 후보 수를 제한하지 않는다 —
+        # 가까운 노드가 전부 고립 조각이면 조금 더 걸어서라도 갈 수 있는 곳으로 붙여야 한다.
+        for d, nid, nlat, nlon in scored:
+            if nid in allowed:
+                return {
+                    "node_id": nid,
+                    "snapped": {"lat": nlat, "lng": nlon},
+                    "dist_m": round(d, 1),
+                    "reachable": d <= max_dist_m,
+                    "profile_ok": True,
+                    "in_main_component": True,
+                }
+
     if profile is not None:
         for d, nid, nlat, nlon in scored[:candidates]:
             if _reachable_by_profile(G, nid, profile):
