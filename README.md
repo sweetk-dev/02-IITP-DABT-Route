@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.4.0 |
+| 02-IITP-DABT-Route | v1.5.0 |
 
 ## 구조
 
@@ -57,6 +57,27 @@ python scripts/inspect_network.py --network data/network_anyang.gpickle \
     --route 37.4025,126.9227,37.3856,126.9256
 
 uvicorn route_service.api.main:app --host 0.0.0.0 --port 18100
+```
+
+### 컨테이너로 실행
+
+그래프 구축 의존성(osmnx·rasterio·geopandas)은 이미지에 넣지 않는다. 구축은 오프라인 작업이고,
+서비스는 완성된 그래프와 건물 폴리곤만 읽는다. **데이터는 볼륨으로 주입**하므로 이미지를 다시
+빌드하지 않고도 그래프를 교체할 수 있다.
+
+```bash
+docker build -t route-api .
+docker run -d --name route-api -p 18100:18100 \
+    -v "$PWD/data:/app/data:ro" \
+    -e NETWORK_PATH=/app/data/network_anyang.gpickle \
+    -e BUILDINGS_PATH=/app/data/buildings_anyang.pkl \
+    -e ENTRANCES_PATH=/app/data/poi/entrances.json \
+    -e POI_BACKEND=db \
+    -e POI_DB_DSN='postgresql+psycopg2://<user>:<pw>@<host>:5432/<db>' \
+    route-api
+
+curl -s localhost:18100/health
+curl -s localhost:18100/meta/network
 ```
 
 ## API
