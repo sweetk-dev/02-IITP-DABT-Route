@@ -1,0 +1,16 @@
+# 서비스 구동 (경로 API)
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.5
+networkx>=3.1
+
+# POI: db 백엔드 사용 시
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
+
+# 그래프 구축(scripts/build_network.py) 시에만 필요 — 서비스 구동에는 불필요
+# osmnx>=1.9
+# pandas>=2.0
+# openpyxl>=3.1
+# xdem>=0.1
+# pyproj>=3.6
