@@ -18,20 +18,21 @@ import os
 
 from ..engine.geo import haversine_m
 
+# 01-IITP-DABT-Database `poi_tour_bf_facility` 실제 컬럼 (2026-07-13 실측)
+TOUR_FIELDS = [
+    "toilet_yn", "elevator_yn", "parking_yn", "slope_yn", "subway_yn", "bus_stop_yn",
+    "wheelchair_rent_yn", "tactile_map_yn", "audio_guide_yn", "nursing_room_yn",
+    "accessible_room_yn", "stroller_rent_yn",
+]
+
 # 장애 유형 -> 필요한 편의시설 필드 (10-TripSense 매칭 로직과 동일한 사고)
 DISABILITY_REQUIREMENTS = {
-    "지체장애": ["dis_toilet_yn", "elevator_yn", "dis_parking_yn", "slope_yn", "wheelchair_rent_yn"],
-    "휠체어": ["dis_toilet_yn", "elevator_yn", "slope_yn"],
+    "지체장애": ["toilet_yn", "elevator_yn", "parking_yn", "slope_yn", "wheelchair_rent_yn"],
+    "휠체어": ["toilet_yn", "elevator_yn", "slope_yn"],
     "시각장애": ["tactile_map_yn", "audio_guide_yn"],
     "청각장애": ["audio_guide_yn"],
     "영유아동반": ["nursing_room_yn", "stroller_rent_yn"],
 }
-
-TOUR_FIELDS = [
-    "dis_toilet_yn", "elevator_yn", "dis_parking_yn", "slope_yn", "wheelchair_rent_yn",
-    "tactile_map_yn", "audio_guide_yn", "nursing_room_yn", "accessible_room_yn",
-    "stroller_rent_yn",
-]
 
 
 def _is_y(v) -> bool:
@@ -87,20 +88,29 @@ class PoiStore:
         else:
             rows = self._query(
                 """
-                SELECT fclt_id AS poi_id, fclt_name AS name, addr, latitude, longitude,
-                       dis_toilet_yn, elevator_yn, dis_parking_yn, slope_yn,
-                       wheelchair_rent_yn, tactile_map_yn, audio_guide_yn,
-                       nursing_room_yn, accessible_room_yn, stroller_rent_yn
+                SELECT fclt_id AS poi_id,
+                       fclt_name AS name,
+                       COALESCE(addr_road, addr_jibun) AS addr,
+                       latitude, longitude,
+                       toilet_yn, elevator_yn, parking_yn, slope_yn,
+                       subway_yn, bus_stop_yn, wheelchair_rent_yn, tactile_map_yn,
+                       audio_guide_yn, nursing_room_yn, accessible_room_yn, stroller_rent_yn
                   FROM poi_tour_bf_facility
                  WHERE del_yn = 'N'
-                   AND (:sigungu = '' OR addr LIKE '%' || :sigungu || '%')
+                   AND (:sigungu = ''
+                        OR COALESCE(addr_road, '') LIKE '%%' || :sigungu || '%%'
+                        OR COALESCE(addr_jibun, '') LIKE '%%' || :sigungu || '%%'
+                        OR fclt_name LIKE '%%' || :sigungu || '%%')
                  LIMIT :limit
                 """,
                 {"sigungu": sigungu or "", "limit": limit},
             )
         out = [self._normalize_tour(r) for r in rows]
         if sigungu and self.backend == "file":
-            out = [r for r in out if sigungu in (r.get("addr") or "")]
+            out = [
+                r for r in out
+                if sigungu in (r.get("addr") or "") or sigungu in (r.get("name") or "")
+            ]
         if bbox:
             min_lat, min_lng, max_lat, max_lng = bbox
             out = [
@@ -115,11 +125,12 @@ class PoiStore:
     def _normalize_tour(r: dict) -> dict:
         lat = r.get("latitude", r.get("lat"))
         lng = r.get("longitude", r.get("lng"))
+        addr = r.get("addr") or r.get("addr_road") or r.get("addr_jibun")
         return {
             "poi_id": str(r.get("poi_id") or r.get("fclt_id") or r.get("id") or ""),
             "type": "tour",
             "name": r.get("name") or r.get("fclt_name"),
-            "addr": r.get("addr"),
+            "addr": addr,
             "lat": float(lat) if lat is not None else None,
             "lng": float(lng) if lng is not None else None,
             "facilities": {k: _is_y(r.get(k)) for k in TOUR_FIELDS},

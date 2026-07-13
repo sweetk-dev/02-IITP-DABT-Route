@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.3.0 |
+| 02-IITP-DABT-Route | v1.3.1 |
 
 ## 구조
 
@@ -133,7 +133,8 @@ curl -X POST localhost:18100/route/plan -H "Content-Type: application/json" -d '
 |---|---|---|
 | 보행 네트워크 | **OSM 안양 보행망** — 노드 6,750 / 링크 9,712 | 원본(node/link) 수령 시 `--source tabular` 로 재구축 후 `/admin/reload-network` — API 스키마 불변 |
 | 경사 | **5m DEM** — 1:5,000 수치지형도 등고선(주곡선 5m)을 보간해 생성 (`scripts/dem_from_contours.py`) | 공개DEM 90m(`.img`)도 그대로 사용 가능. DEM 이 아예 없으면 `--elevation terrain`(공개 지형 타일, 인증 불필요) |
-| 무장애 관광지·역·정류장 | 01-IITP-DABT-Database (`POI_BACKEND=db`) | 파이프라인 적재 전에는 `file`/`none` 백엔드로 기동 가능 |
+| 무장애 관광지 | 01-IITP-DABT-Database `poi_tour_bf_facility` (`POI_BACKEND=db`) — **안양 13건 적재 완료** | 08 파이프라인(`--ext-sys TOUR_BF_API`)이 수집. 적재 전에는 `file`/`none` 백엔드로 기동 가능 |
+| 역·정류장 | `poi_station_access_status` 등 — **미적재** | 적재 전까지 `/transit/access-points` 는 빈 결과 |
 
 ### 안양 그래프 실측 (v1.3.0)
 
