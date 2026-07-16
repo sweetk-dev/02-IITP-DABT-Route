@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.6.0 |
+| 02-IITP-DABT-Route | v1.7.0 |
 
 ## 구조
 
@@ -58,6 +58,31 @@ python scripts/inspect_network.py --network data/network_anyang.gpickle \
 
 uvicorn route_service.api.main:app --host 0.0.0.0 --port 18100
 ```
+
+### 수치지형도(1:1,000) 속성 보강
+
+OSM 그래프의 보행 링크에 수치지형도 인도 면형의 **실측 폭·재질**을 전이한다
+(휠체어 프로필 `min_width` 를 추정치가 아닌 실측치로 판정).
+
+```bash
+# (a) OSM 횡단보도 확보 (인터넷 필요)
+python scripts/fetch_osm_crossings.py \
+    --place "Anyang-si, Gyeonggi-do, South Korea" --out data/osm_crossings.geojson
+
+# (b) 그래프 속성 보강 (1:1,000 우선, 1:5,000 폴백)
+python scripts/enrich_osm_with_topomap.py \
+    --graph data/network_anyang.gpickle \
+    --src-1k "<1:1,000 도엽 폴더>" --src-5k "<1:5,000 도엽 폴더>" \
+    --out data/network_anyang_enriched.gpickle
+```
+
+안양 실측(2026-07-16): 보행 링크 1,428건에 폭 채움(보도 44% · 횡단보도 76%),
+폭 중앙값 3.0m. road(이면도로) 링크는 차도 보행이라 보강 대상에서 제외.
+
+수치지형도 **단독** node/link 산출도 지원한다 (`scripts/build_pednet_from_topomap.py`,
+`route_service/topomap/` — NGI/NDA 자체 파서 + 면형 중심선화 + 위상 구축).
+단, 수치지형도에는 횡단보도 레이어가 없어(1:1,000·1:5,000 모두 실측 0건)
+단독 그래프는 블록 단위로 끊긴다 — 연결 골격은 OSM, 수치지형도는 속성 원천으로 쓴다.
 
 ### 컨테이너로 실행
 
