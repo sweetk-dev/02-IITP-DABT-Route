@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.7.0 |
+| 02-IITP-DABT-Route | v1.8.0 |
 
 ## 구조
 
@@ -83,6 +83,18 @@ python scripts/enrich_osm_with_topomap.py \
 `route_service/topomap/` — NGI/NDA 자체 파서 + 면형 중심선화 + 위상 구축).
 단, 수치지형도에는 횡단보도 레이어가 없어(1:1,000·1:5,000 모두 실측 0건)
 단독 그래프는 블록 단위로 끊긴다 — 연결 골격은 OSM, 수치지형도는 속성 원천으로 쓴다.
+
+### 통합DB 적재 (mv_pednet_node / mv_pednet_link)
+
+보강 그래프를 node/link 테이블로 산출해 통합DB(iitp_db)에 적재한다
+(스키마: `scripts/sql/pednet_schema.sql`, 명명은 기존 `mv_poi` 의 `mv_` 규약).
+
+```bash
+python scripts/export_graph_tables.py \
+    --graph data/network_anyang_enriched.gpickle \
+    --out-dir data/db_export --version anyang-topo-enrich-2026Q3
+# 이후 psql: schema 적용 -> \copy 로 CSV 적재 (동일 network_version 재적재 시 DELETE 선행)
+```
 
 ### 컨테이너로 실행
 
