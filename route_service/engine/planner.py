@@ -1,0 +1,200 @@
+# -*- coding: utf-8 -*-
+"""경로 탐색.
+
+기존 planning.py 대비 달라진 점
+  1) slope < 4.0 고정 필터 -> 프로필별 하드 필터(경사·회피 링크타입·보도폭)
+  2) weight=length -> 경사·링크타입 가중 비용 (계산만 하고 안 쓰던 weight 를 실제로 사용)
+  3) 경로 없음 시 즉시 실패 -> 제약 단계적 완화 후 재시도(fallback 표기)
+  4) 노드열만 반환 -> 좌표열·구간 속성·요약 지표 반환
+"""
+from __future__ import annotations
+
+import uuid
+
+import networkx as nx
+
+from .geo import haversine_m, path_length_m, point_segment_dist_m
+from .graph import edge_coords
+from .profiles import Profile
+
+
+class NoRouteError(Exception):
+    pass
+
+
+def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
+    if data["link_type"] in profile.avoid:
+        return False
+    if data["slope"] > max_slope_deg:
+        return False
+    w = data.get("width")
+    if profile.min_width_m and w is not None and w < profile.min_width_m:
+        return False
+    if profile.requires_curb_cut and data["link_type"] == "crossing":
+        if data.get("curb_cut") is False:
+            return False
+    return True
+
+
+def edge_cost(data: dict, profile: Profile, penalty: float = 1.0) -> float:
+    length = max(float(data["length"]), 0.1)
+    cost = length * (1.0 + profile.slope_factor * float(data["slope"]))
+    cost *= profile.penalize.get(data["link_type"], 1.0)
+    return cost * penalty
+
+
+def _astar(G, start, goal, profile, max_slope_deg, penalized_edges=None):
+    penalized_edges = penalized_edges or set()
+
+    def weight(u, v, data):
+        if not edge_passable(data, profile, max_slope_deg):
+            return None  # networkx: None = 통행 불가
+        pen = 2.5 if (frozenset((u, v)) in penalized_edges) else 1.0
+        return edge_cost(data, profile, pen)
+
+    def heuristic(u, v):
+        # 최소 비용 하한(직선거리) — 가중치가 length 이상이므로 admissible
+        return haversine_m(
+            G.nodes[u]["lat"], G.nodes[u]["lon"], G.nodes[v]["lat"], G.nodes[v]["lon"]
+        )
+
+    return nx.astar_path(G, start, goal, heuristic=heuristic, weight=weight)
+
+
+def _summarize(G, path, profile, slope_coverage: float = 1.0) -> dict:
+    dist = 0.0
+    slopes = []
+    counts = {"steps": 0, "crossing": 0, "elevator": 0, "ramp": 0}
+    warnings = []
+    for u, v in zip(path[:-1], path[1:]):
+        d = G[u][v]
+        dist += float(d["length"]) or haversine_m(
+            G.nodes[u]["lat"], G.nodes[u]["lon"], G.nodes[v]["lat"], G.nodes[v]["lon"]
+        )
+        slopes.append(float(d["slope"]))
+        lt = d["link_type"]
+        if lt in counts:
+            counts[lt] += 1
+        if lt == "crossing" and d.get("curb_cut") is False:
+            warnings.append("턱낮춤 없는 횡단보도 구간이 있습니다")
+        if float(d["slope"]) > profile.max_slope_deg:
+            warnings.append(
+                "권장 경사(%.1f도)를 넘는 구간이 포함되어 있습니다" % profile.max_slope_deg
+            )
+    mean_slope = sum(slopes) / len(slopes) if slopes else 0.0
+    max_slope = max(slopes) if slopes else 0.0
+    duration = dist / profile.speed_mps if profile.speed_mps else 0.0
+
+    # 접근성 점수: 경사 여유 + 계단/무턱낮춤 감점 (0~1)
+    slope_score = max(0.0, 1.0 - (max_slope / max(profile.max_slope_deg, 0.1)))
+    penalty = 0.3 * counts["steps"] + 0.05 * len(set(warnings))
+    score = max(0.0, min(1.0, 0.6 * slope_score + 0.4 - penalty))
+
+    # 경사 데이터가 없는 네트워크에서 "경사 0 = 만점"은 거짓 안심을 준다.
+    # 점수를 깎고 사실을 경고로 알린다.
+    if slope_coverage < 0.5:
+        warnings.append("경사 데이터가 없어 경사 회피가 적용되지 않았습니다")
+        score = min(score, 0.6)
+
+    return {
+        "total_distance_m": round(dist),
+        "duration_sec": round(duration),
+        "mean_slope_deg": round(mean_slope, 2),
+        "max_slope_deg": round(max_slope, 2),
+        "stairs_cnt": counts["steps"],
+        "crossing_cnt": counts["crossing"],
+        "elevator_cnt": counts["elevator"],
+        "ramp_cnt": counts["ramp"],
+        "accessibility_score": round(score, 2),
+        "warnings": sorted(set(warnings)),
+    }
+
+
+def _geometry(G, path) -> list:
+    coords = []
+    for u, v in zip(path[:-1], path[1:]):
+        seg = edge_coords(G, u, v)
+        if coords and coords[-1] == seg[0]:
+            seg = seg[1:]
+        coords.extend(seg)
+    if not coords and path:
+        n = path[0]
+        coords = [(G.nodes[n]["lat"], G.nodes[n]["lon"])]
+    return [[round(a, 7), round(b, 7)] for a, b in coords]
+
+
+def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
+         relax: bool = True) -> dict:
+    """경로 탐색 + 대안 경로.
+
+    반환: {"routes": [...], "fallback": {...}}
+    """
+    G = store.graph
+    if start_node == goal_node:
+        raise NoRouteError("출발지와 목적지가 같은 지점입니다")
+
+    fallback = {"used": False, "reason": None, "applied_max_slope_deg": profile.max_slope_deg}
+    levels = [profile.max_slope_deg]
+    if relax:
+        levels += [profile.max_slope_deg + 2.0, profile.max_slope_deg + 4.0]
+
+    primary = None
+    for i, lvl in enumerate(levels):
+        try:
+            primary = _astar(G, start_node, goal_node, profile, lvl)
+            if i > 0:
+                fallback = {
+                    "used": True,
+                    "reason": (
+                        "제약(최대 경사 %.1f도)을 만족하는 경로가 없어 %.1f도까지 완화해 탐색했습니다"
+                        % (profile.max_slope_deg, lvl)
+                    ),
+                    "applied_max_slope_deg": lvl,
+                }
+            break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+
+    if primary is None:
+        raise NoRouteError("통행 가능한 경로를 찾지 못했습니다")
+
+    applied = fallback["applied_max_slope_deg"]
+    routes = [primary]
+
+    # 대안 경로: 1안의 링크에 페널티를 주고 재탐색 (중복 경로는 버림)
+    penalized = set()
+    for _ in range(max(0, alternatives - 1)):
+        penalized |= {frozenset((u, v)) for u, v in zip(routes[-1][:-1], routes[-1][1:])}
+        try:
+            alt = _astar(G, start_node, goal_node, profile, applied, penalized)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            break
+        if any(alt == r for r in routes):
+            break
+        routes.append(alt)
+
+    coverage = float(store.meta.get("slope_coverage", 1.0) or 0.0)
+    out = []
+    for path in routes:
+        out.append(
+            {
+                "path": path,
+                "summary": _summarize(G, path, profile, coverage),
+                "geometry": _geometry(G, path),
+            }
+        )
+    return {"routes": out, "fallback": fallback}
+
+
+def off_route_distance_m(geometry, lat: float, lng: float) -> float:
+    """현재 위치와 경로선 사이의 최단거리(m) — 이탈 판정용."""
+    if not geometry:
+        return float("inf")
+    if len(geometry) == 1:
+        return haversine_m(lat, lng, geometry[0][0], geometry[0][1])
+    best = float("inf")
+    for (alat, alon), (blat, blon) in zip(geometry[:-1], geometry[1:]):
+        d = point_segment_dist_m(lat, lng, alat, alon, blat, blon)
+        if d < best:
+            best = d
+    return best
