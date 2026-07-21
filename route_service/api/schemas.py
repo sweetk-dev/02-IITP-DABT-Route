@@ -54,3 +54,7 @@ class RecommendRequest(BaseModel):
     sigungu: str = "안양"
     match_mode: str = Field("all", description="all | any")
     topk: int = Field(10, ge=1, le=50)
+    # 출발지를 주면 거리 오름차순으로 정렬한다(반경 제한 없음). 목록 무한스크롤용.
+    origin_lat: Optional[float] = None
+    origin_lng: Optional[float] = None
+    offset: int = Field(0, ge=0, description="거리순 목록에서 건너뛸 개수")

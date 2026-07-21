@@ -354,9 +354,17 @@ def tour_spot_entrance(poi_id: str, profile: str = Query("wheelchair_manual")):
 @app.post("/tour/recommend", tags=["tour"], dependencies=[Depends(auth)])
 def tour_recommend(req: RecommendRequest):
     items = poi_store.STORE.recommend_tour(
-        req.disabilities, req.sigungu, req.match_mode, req.topk
+        req.disabilities, req.sigungu, req.match_mode, req.topk,
+        origin_lat=req.origin_lat, origin_lng=req.origin_lng, offset=req.offset,
     )
-    return {"source": poi_store.STORE.source, "count": len(items), "items": items}
+    # total 은 클라이언트가 무한스크롤 종료를 판단하는 근거 — offset+topk 로는 알 수 없다.
+    total = len(poi_store.STORE.recommend_tour(
+        req.disabilities, req.sigungu, req.match_mode, 10000,
+        origin_lat=req.origin_lat, origin_lng=req.origin_lng, offset=0,
+    ))
+    return {"source": poi_store.STORE.source, "count": len(items),
+            "total": total, "offset": req.offset,
+            "has_more": req.offset + len(items) < total, "items": items}
 
 
 # ────────────────────────── transit ──────────────────────────

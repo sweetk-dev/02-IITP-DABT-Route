@@ -3,7 +3,7 @@
 
 백엔드 3종 (POI_BACKEND 환경변수)
   db   : 01-IITP-DABT-Database 읽기 전용 조회
-         poi_tour_bf_facility / poi_station_access_status /
+         mv_poi (무장애 관광지 정본) / poi_station_access_status /
          poi_station_wheelchair_lift / poi_facility_accessibility
   file : POI_DATA_DIR 아래 JSON (오프라인·개발·데모용)
   none : 빈 결과 (source="none") — 적재 전에도 서비스가 기동되도록
@@ -24,6 +24,26 @@ TOUR_FIELDS = [
     "wheelchair_rent_yn", "tactile_map_yn", "audio_guide_yn", "nursing_room_yn",
     "accessible_room_yn", "stroller_rent_yn",
 ]
+
+# mv_poi.detail_json.accessible_facilities 의 표기 -> TOUR_FIELDS 매핑 (2026-07-16 전수 실측)
+# 통합DB 는 시설을 한국어 문구로 담고 있어 기존 *_yn 필드 체계로 정규화한다.
+MVPOI_FACILITY_MAP = {
+    "장애인 전용 통로 있음": "toilet_yn",        # 화장실 접근 동선 — 대표 지표로 사용
+    "엘리베이터 있음": "elevator_yn",
+    "장애인 주차장 있음": "parking_yn",
+    "접근로 있음": "slope_yn",
+    "대중교통 이용 가능": "subway_yn",
+    "휠체어 대여 가능": "wheelchair_rent_yn",
+    "점자블록 있음": "tactile_map_yn",
+    "점자 홍보물 있음": "tactile_map_yn",
+    "유도안내설비 있음": "tactile_map_yn",
+    "오디오가이드 있음": "audio_guide_yn",
+    "안내요원 있음": "audio_guide_yn",
+    "수화안내 가능": "audio_guide_yn",
+    "자막 지원 가능": "audio_guide_yn",
+    "장애인 객실 있음": "accessible_room_yn",
+    "지체장애인 관람석 있음": "accessible_room_yn",
+}
 
 # 장애 유형 -> 필요한 편의시설 필드 (10-TripSense 매칭 로직과 동일한 사고)
 DISABILITY_REQUIREMENTS = {
@@ -88,19 +108,20 @@ class PoiStore:
         else:
             rows = self._query(
                 """
-                SELECT fclt_id AS poi_id,
-                       fclt_name AS name,
-                       COALESCE(addr_road, addr_jibun) AS addr,
+                SELECT poi_id,
+                       title AS name,
+                       COALESCE(address_road, address_detail) AS addr,
                        latitude, longitude,
-                       toilet_yn, elevator_yn, parking_yn, slope_yn,
-                       subway_yn, bus_stop_yn, wheelchair_rent_yn, tactile_map_yn,
-                       audio_guide_yn, nursing_room_yn, accessible_room_yn, stroller_rent_yn
-                  FROM poi_tour_bf_facility
-                 WHERE del_yn = 'N'
+                       detail_json->>'accessible_facilities' AS fac_text,
+                       search_filter_json->'search_filter'->>'tourist_type' AS tourist_type
+                  FROM mv_poi
+                 WHERE language_code = 'ko'
+                   AND latitude IS NOT NULL AND longitude IS NOT NULL
+                   AND COALESCE(detail_json->>'accessible_facilities', '') <> ''
                    AND (:sigungu = ''
-                        OR COALESCE(addr_road, '') LIKE '%%' || :sigungu || '%%'
-                        OR COALESCE(addr_jibun, '') LIKE '%%' || :sigungu || '%%'
-                        OR fclt_name LIKE '%%' || :sigungu || '%%')
+                        OR COALESCE(address_road, '') LIKE '%%' || :sigungu || '%%'
+                        OR COALESCE(address_detail, '') LIKE '%%' || :sigungu || '%%'
+                        OR title LIKE '%%' || :sigungu || '%%')
                  LIMIT :limit
                 """,
                 {"sigungu": sigungu or "", "limit": limit},
@@ -122,10 +143,24 @@ class PoiStore:
         return out[:limit]
 
     @staticmethod
+    def _facilities_from_text(text: str) -> dict:
+        """mv_poi 의 한국어 시설 문구 -> *_yn 불리언 맵."""
+        fac = {k: False for k in TOUR_FIELDS}
+        for part in (text or "").split(","):
+            key = MVPOI_FACILITY_MAP.get(part.strip())
+            if key:
+                fac[key] = True
+        return fac
+
+    @staticmethod
     def _normalize_tour(r: dict) -> dict:
         lat = r.get("latitude", r.get("lat"))
         lng = r.get("longitude", r.get("lng"))
         addr = r.get("addr") or r.get("addr_road") or r.get("addr_jibun")
+        if r.get("fac_text") is not None:
+            fac = PoiStore._facilities_from_text(r.get("fac_text"))
+        else:
+            fac = {k: _is_y(r.get(k)) for k in TOUR_FIELDS}
         return {
             "poi_id": str(r.get("poi_id") or r.get("fclt_id") or r.get("id") or ""),
             "type": "tour",
@@ -133,13 +168,27 @@ class PoiStore:
             "addr": addr,
             "lat": float(lat) if lat is not None else None,
             "lng": float(lng) if lng is not None else None,
-            "facilities": {k: _is_y(r.get(k)) for k in TOUR_FIELDS},
+            "facilities": fac,
             "entrance": r.get("entrance"),
         }
 
     def get_tour_spot(self, poi_id: str):
-        for r in self.list_tour_spots(limit=10000):
-            if r["poi_id"] == str(poi_id):
+        """ID 우선, 실패하면 이름으로도 찾는다.
+
+        12번 음성 도구는 사용자가 말한 관광지 '이름'을 그대로 넘기는 경우가 있어
+        ID 전용 조회는 404 를 낸다. 이름 폴백으로 실사용 실패를 막는다.
+        """
+        key = str(poi_id).strip()
+        rows = self.list_tour_spots(limit=10000)
+        for r in rows:
+            if r["poi_id"] == key:
+                return r
+        for r in rows:
+            if (r.get("name") or "").strip() == key:
+                return r
+        norm = key.replace(" ", "")
+        for r in rows:
+            if (r.get("name") or "").replace(" ", "") == norm:
                 return r
         return None
 
@@ -157,7 +206,9 @@ class PoiStore:
         return {"lat": spot["lat"], "lng": spot["lng"], "source": "facility_centroid"}
 
     def recommend_tour(self, disabilities: list, sigungu: str = "안양",
-                       match_mode: str = "all", topk: int = 10) -> list:
+                       match_mode: str = "all", topk: int = 10,
+                       origin_lat: float = None, origin_lng: float = None,
+                       offset: int = 0) -> list:
         """장애 유형별 무장애 관광지 랭킹.
 
         10-TripSense 의 filter_and_rank 와 동일한 판단 기준(요구 편의시설 충족 여부)을
@@ -190,8 +241,24 @@ class PoiStore:
             item["matched"] = [f for f in TOUR_FIELDS if fac.get(f)]
             scored.append(item)
 
-        scored.sort(key=lambda x: (-x["score"], x["name"] or ""))
-        return scored[:topk]
+        # 출발지가 주어지면 거리 오름차순 — 반경 제한 없이 전체를 이어서 페이징한다.
+        # (offset 이 있어도 정렬 기준은 동일하므로 목록 순서가 뒤섞이지 않는다)
+        if origin_lat is not None and origin_lng is not None:
+            for it in scored:
+                if it["lat"] is None or it["lng"] is None:
+                    it["distance_m"] = None
+                    continue
+                it["distance_m"] = round(
+                    haversine_m(origin_lat, origin_lng, it["lat"], it["lng"]), 1
+                )
+            scored.sort(key=lambda x: (x["distance_m"] is None,
+                                       x["distance_m"] if x["distance_m"] is not None else 0,
+                                       x["name"] or ""))
+        else:
+            scored.sort(key=lambda x: (-x["score"], x["name"] or ""))
+
+        start = max(0, int(offset or 0))
+        return scored[start:start + topk]
 
     # ---------- 대중교통 접근점 ----------
     def list_transit_access(self, lat: float, lng: float, radius_m: float = 800,
