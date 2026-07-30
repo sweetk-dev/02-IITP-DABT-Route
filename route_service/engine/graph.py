@@ -43,6 +43,29 @@ EDGE_DEFAULTS = {
     "geometry": None,
 }
 
+# 링크 이름 -> 보행 부적합 시설 재분류 (#27).
+# 차량용 지하차도(예: "일번가지하차도")는 OSM 태그상 highway=road + tunnel 이라
+# 기존 빌드에서 link_type="road" 로 들어와 휠체어 회피(avoid=underpass)를 그대로
+# 통과했다. 이미 배포된 그래프(pickle·DB 산출본)를 재빌드 없이 바로잡기 위해
+# 로드 시점에 이름으로 재분류한다. 재빌드 시점에는 sources/osm.py 의 태그 분류가
+# 같은 결과를 낸다.
+_NAME_RECLASS = (
+    (("지하차도", "지하도", "지하보도"), "underpass"),
+    (("육교", "고가교"), "overpass"),
+)
+# 이름 재분류를 허용하는 기존 타입 — 명시 조사된 타입(crossing·steps 등)은 건드리지 않는다.
+_NAME_RECLASS_FROM = ("road", "sidewalk", "unknown")
+
+
+def _reclass_by_name(link_type: str, link_name) -> str:
+    if link_type not in _NAME_RECLASS_FROM or not link_name:
+        return link_type
+    name = str(link_name)
+    for keywords, new_type in _NAME_RECLASS:
+        if any(k in name for k in keywords):
+            return new_type
+    return link_type
+
 
 def normalize_graph(G: nx.Graph) -> nx.Graph:
     """소스별 편차를 흡수해 표준 스키마로 맞춘다. 기존 인천 gpickle 도 그대로 수용."""
@@ -53,6 +76,7 @@ def normalize_graph(G: nx.Graph) -> nx.Graph:
             data.setdefault(k, default)
         if data["link_type"] not in LINK_TYPES:
             data["link_type"] = "unknown"
+        data["link_type"] = _reclass_by_name(data["link_type"], data.get("link_name"))
         try:
             data["length"] = float(data["length"])
         except (TypeError, ValueError):

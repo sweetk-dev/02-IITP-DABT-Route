@@ -13,13 +13,40 @@ import uuid
 
 import networkx as nx
 
-from .geo import haversine_m, path_length_m, point_segment_dist_m
+from .geo import bearing_deg, haversine_m, path_length_m, point_segment_dist_m, turn_angle
 from .graph import edge_coords
 from .profiles import Profile
+
+# 유턴 판정 각도 — steps.py 의 턴바이턴 유턴 기준(150도)과 동일해야
+# "안내에는 유턴으로 뜨는데 탐색은 못 잡는" 불일치가 안 생긴다.
+UTURN_ANGLE_DEG = 150.0
+UTURN_RETRY = 3
 
 
 class NoRouteError(Exception):
     pass
+
+
+def _uturn_edges(G, path) -> set:
+    """경로에서 유턴(150도 이상 회차)이 발생하는 지점의 앞뒤 링크 집합.
+
+    노드 기반 A* 는 회전 비용을 모른다. 그 결과 지하차도 진입로를 타고 들어갔다가
+    되돌아 나오는 식의 경로(#27, 일번가지하차도 583m + 유턴)가 최단으로 뽑힌다.
+    탐색 후 기하로 유턴을 검출해 해당 링크에 페널티를 주고 재탐색하는 방식으로 억제한다.
+    """
+    edges = set()
+    prev_out = None
+    prev_edge = None
+    for u, v in zip(path[:-1], path[1:]):
+        coords = edge_coords(G, u, v)
+        in_b = bearing_deg(coords[0][0], coords[0][1], coords[1][0], coords[1][1])
+        out_b = bearing_deg(coords[-2][0], coords[-2][1], coords[-1][0], coords[-1][1])
+        if prev_out is not None and abs(turn_angle(prev_out, in_b)) >= UTURN_ANGLE_DEG:
+            edges.add(prev_edge)
+            edges.add(frozenset((u, v)))
+        prev_out = out_b
+        prev_edge = frozenset((u, v))
+    return edges
 
 
 def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
@@ -159,6 +186,25 @@ def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
         raise NoRouteError("통행 가능한 경로를 찾지 못했습니다")
 
     applied = fallback["applied_max_slope_deg"]
+
+    # 유턴 억제 재탐색 — 유턴 없는 경로가 나오면 채택, 끝까지 없으면 유턴 최소 경로.
+    uturn_pen = set()
+    best_n, best_path = len(_uturn_edges(G, primary)), primary
+    for _ in range(UTURN_RETRY):
+        if best_n == 0:
+            break
+        uturn_pen |= _uturn_edges(G, best_path)
+        try:
+            cand = _astar(G, start_node, goal_node, profile, applied, uturn_pen)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            break
+        if cand == best_path:
+            break
+        n = len(_uturn_edges(G, cand))
+        if n < best_n:
+            best_n, best_path = n, cand
+    primary = best_path
+
     routes = [primary]
 
     # 대안 경로: 1안의 링크에 페널티를 주고 재탐색 (중복 경로는 버림)

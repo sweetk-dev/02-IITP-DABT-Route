@@ -59,6 +59,31 @@ def _is_y(v) -> bool:
     return str(v).strip().upper() in ("Y", "TRUE", "1")
 
 
+# 시·군·구 행정단위 접미사. "안양" 처럼 접미사 없이 들어온 지역명은 이 접미사를 붙인
+# 변형("안양시"/"안양군"/"안양구")으로만 주소를 대조한다. 단순 부분일치는 전남 장흥군
+# "안양면" 같은 타지역 주소까지 끌어온다(#26).
+_SIGUNGU_SUFFIXES = ("시", "군", "구")
+
+
+def sigungu_variants(sigungu: str) -> list:
+    """지역명 -> 주소 대조용 행정단위 토큰 목록.
+
+    "안양"   -> ["안양시", "안양군", "안양구"]
+    "안양시" -> ["안양시"]  (이미 행정단위 접미사가 있으면 그대로)
+    """
+    s = (sigungu or "").strip()
+    if not s:
+        return []
+    if s.endswith(_SIGUNGU_SUFFIXES):
+        return [s]
+    return [s + suf for suf in _SIGUNGU_SUFFIXES]
+
+
+def _addr_in_sigungu(addr: str, variants: list) -> bool:
+    a = addr or ""
+    return any(v in a for v in variants)
+
+
 class PoiStore:
     def __init__(self, backend: str = "none", data_dir: str = "", dsn: str = ""):
         self.backend = backend
@@ -103,9 +128,25 @@ class PoiStore:
     def list_tour_spots(self, sigungu: str = "", bbox=None, limit: int = 50) -> list:
         if self.backend == "none":
             return []
+        variants = sigungu_variants(sigungu)
         if self.backend == "file":
             rows = self._load_file("tour_bf.json")
         else:
+            # 지역 필터는 주소의 시·군·구 토큰 정합으로만 판정한다.
+            # LIKE '%안양%' 방식은 주소 전체를 보기 때문에 전남 장흥군 "안양면" 소재
+            # POI(거리 307km)까지 포함시켰다(#26). title 대조도 같은 이유로 지역
+            # 필터에서 제외한다(이름 검색은 get_tour_spot 의 이름 폴백이 담당).
+            sg_clause = ""
+            params = {"limit": limit}
+            if variants:
+                ors = []
+                for i, v in enumerate(variants):
+                    ors.append(
+                        "COALESCE(address_road, '') LIKE '%%' || :sg{0} || '%%'"
+                        " OR COALESCE(address_detail, '') LIKE '%%' || :sg{0} || '%%'".format(i)
+                    )
+                    params["sg%d" % i] = v
+                sg_clause = "AND (%s)" % " OR ".join(ors)
             rows = self._query(
                 """
                 SELECT poi_id,
@@ -118,20 +159,14 @@ class PoiStore:
                  WHERE language_code = 'ko'
                    AND latitude IS NOT NULL AND longitude IS NOT NULL
                    AND COALESCE(detail_json->>'accessible_facilities', '') <> ''
-                   AND (:sigungu = ''
-                        OR COALESCE(address_road, '') LIKE '%%' || :sigungu || '%%'
-                        OR COALESCE(address_detail, '') LIKE '%%' || :sigungu || '%%'
-                        OR title LIKE '%%' || :sigungu || '%%')
+                   {sg}
                  LIMIT :limit
-                """,
-                {"sigungu": sigungu or "", "limit": limit},
+                """.format(sg=sg_clause),
+                params,
             )
         out = [self._normalize_tour(r) for r in rows]
-        if sigungu and self.backend == "file":
-            out = [
-                r for r in out
-                if sigungu in (r.get("addr") or "") or sigungu in (r.get("name") or "")
-            ]
+        if variants and self.backend == "file":
+            out = [r for r in out if _addr_in_sigungu(r.get("addr"), variants)]
         if bbox:
             min_lat, min_lng, max_lat, max_lng = bbox
             out = [
