@@ -52,8 +52,14 @@ class BuildingIndex:
         self.loaded = True
         return len(self.polys)
 
-    def containing(self, lat: float, lng: float):
-        """점을 포함하는 건물. 없으면 25m 이내 최근접 건물."""
+    def containing(self, lat: float, lng: float, near_m: float = 40.0):
+        """점을 포함하는 건물. 없으면 near_m 이내 최근접 건물.
+
+        POI 대표점이 건물 폴리곤 살짝 밖(주차장·마당 쪽)에 찍힌 사례가 많아
+        25m 로는 놓치는 시설이 있었다(#27, resolved_by=facility_centroid).
+        40m 로 완화 — 시설 부지 규모에서 엉뚱한 옆 건물로 붙을 위험은
+        '최근접' 선택이 흡수한다.
+        """
         if not self.loaded:
             return None
         try:
@@ -72,7 +78,7 @@ class BuildingIndex:
         if best is None:
             return None
         # 도 -> m 근사 (위도 37도 기준)
-        if best_d * 88000 <= 25.0:
+        if best_d * 88000 <= near_m:
             return best
         return None
 
