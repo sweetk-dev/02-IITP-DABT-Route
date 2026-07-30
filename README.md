@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.8.0 |
+| 02-IITP-DABT-Route | v1.10.0 |
 
 ## 구조
 
@@ -131,7 +131,7 @@ curl -s localhost:18100/meta/network
 | GET | `/tour/bf-spots` | 무장애 관광지 목록 |
 | GET | `/tour/bf-spots/{id}` | 관광지 상세 (편의시설 Y/N) |
 | GET | `/tour/bf-spots/{id}/entrance` | **무장애 접근 지점** — 실측 출입구 > 건물 접근점 > 시설 대표점 |
-| POST | `/tour/recommend` | 장애 유형별 관광지 추천 랭킹 |
+| POST | `/tour/recommend` | 장애 유형별 관광지 추천 랭킹 — `origin_lat/lng` 지정 시 **거리 오름차순**, `offset` 페이징(`total`/`has_more` 반환) |
 | GET | `/transit/access-points` | 휠체어 접근 가능한 정류장·역 |
 | POST | `/admin/reload-network` | 그래프 무중단 교체 |
 
@@ -230,7 +230,7 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
 |---|---|---|
 | 보행 네트워크 | **OSM 안양 보행망** — 노드 6,750 / 링크 9,712 | 원본(node/link) 수령 시 `--source tabular` 로 재구축 후 `/admin/reload-network` — API 스키마 불변 |
 | 경사 | **5m DEM** — 1:5,000 수치지형도 등고선(주곡선 5m)을 보간해 생성 (`scripts/dem_from_contours.py`) | 공개DEM 90m(`.img`)도 그대로 사용 가능. DEM 이 아예 없으면 `--elevation terrain`(공개 지형 타일, 인증 불필요) |
-| 무장애 관광지 | 01-IITP-DABT-Database `poi_tour_bf_facility` (`POI_BACKEND=db`) — **안양 13건 적재 완료** | 08 파이프라인(`--ext-sys TOUR_BF_API`)이 수집. 적재 전에는 `file`/`none` 백엔드로 기동 가능 |
+| 무장애 관광지 | 01-IITP-DABT-Database `mv_poi` 정본 (`POI_BACKEND=db`) — 한국어 시설 문구를 `*_yn` 체계로 정규화(`MVPOI_FACILITY_MAP`), **안양 31건 실측** | 08 파이프라인이 수집·적재. 적재 전에는 `file`/`none` 백엔드로 기동 가능 |
 | 역·정류장 | `poi_station_access_status` 등 — **미적재** | 적재 전까지 `/transit/access-points` 는 빈 결과 |
 
 ### 안양 그래프 실측 (v1.3.0)

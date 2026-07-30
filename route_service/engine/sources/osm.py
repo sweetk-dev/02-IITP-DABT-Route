@@ -56,6 +56,10 @@ def classify_link(tags: dict) -> str:
             return "underpass"
         return "sidewalk"
     if hw in ("residential", "service", "unclassified", "tertiary", "secondary", "primary"):
+        # 차량 도로의 터널 = 지하차도. 기존에는 "road" 로 분류되어 휠체어 회피
+        # (avoid=underpass)를 통과했다 — 583m 지하차도 경유 안내의 원인(#27).
+        if tunnel and tunnel != "no":
+            return "underpass"
         return "road"
     return "unknown"
 

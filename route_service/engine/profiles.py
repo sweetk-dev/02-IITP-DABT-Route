@@ -49,7 +49,9 @@ PROFILES = {
         speed_mps=0.7,
         slope_factor=0.30,
         avoid=("steps", "overpass", "underpass"),
-        penalize={"crossing": 1.2, "ramp": 1.1},
+        # road 가중: 보도(sidewalk)가 있는 우회로가 있으면 이면도로·차도 통행을
+        # 뒤로 미룬다. 하드 차단이 아니라 가중이므로 보도 미비 구간은 여전히 통행 가능.
+        penalize={"crossing": 1.2, "ramp": 1.1, "road": 1.25, "unknown": 1.1},
         min_width_m=0.9,
         requires_curb_cut=True,
     ),
@@ -60,7 +62,7 @@ PROFILES = {
         speed_mps=1.1,
         slope_factor=0.15,
         avoid=("steps", "overpass", "underpass"),
-        penalize={"crossing": 1.1},
+        penalize={"crossing": 1.1, "road": 1.2, "unknown": 1.1},
         min_width_m=0.9,
         requires_curb_cut=True,
     ),
