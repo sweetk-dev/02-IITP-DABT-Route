@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 
 from ..engine.geo import haversine_m
@@ -305,7 +306,7 @@ class PoiStore:
           로 프론트/클라이언트가 확인해야 한다. 여기서는 위치·노선 정보만 제공한다.
         """
         stations = self._stations()
-        stops = self._stops()
+        stops = self._stops(lat=lat, lng=lng, radius_m=radius_m)
         needs_elevator = profile_id.startswith("wheelchair")
 
         out = []
@@ -336,12 +337,16 @@ class PoiStore:
             d = haversine_m(lat, lng, s["lat"], s["lng"])
             if d > radius_m:
                 continue
+            warnings = ["저상버스 여부는 실시간 도착정보로 확인하세요."]
+            if s.get("center_yn"):
+                # 중앙차로 정류소는 승차장이 도로 한가운데 있어 횡단이 선행된다.
+                warnings.append("중앙차로 정류소입니다. 승차장까지 횡단이 필요합니다.")
             item = dict(s)
             item.update({
                 "type": "transit_stop",
                 "dist_m": round(d),
                 "accessible": True,
-                "warnings": ["저상버스 여부는 실시간 도착정보로 확인하세요."],
+                "warnings": warnings,
             })
             out.append(item)
 
@@ -378,21 +383,65 @@ class PoiStore:
             })
         return norm
 
-    def _stops(self) -> list:
-        """버스 정류장 — 현재 01 DB 에 정류장 좌표 테이블이 없어 file 백엔드만 지원."""
-        if self.backend != "file":
+    def _stops(self, lat=None, lng=None, radius_m=None, poi_id: str = "") -> list:
+        """버스 정류장.
+
+        db 백엔드는 01 의 ``tran_bus_station_info`` / ``tran_bus_route_station`` 을 읽는다
+        (08 이 GBIS 경유정류소 목록조회로 적재). 안양 연관 노선의 전 경유지가 들어와
+        전국 범위가 되므로, 반경이 주어지면 **bbox 로 먼저 좁혀** 전수 로드를 피한다.
+
+        저상버스 정차 여부는 정적 DB 에 없다 — 실시간 도착정보(GBIS lowPlate)로
+        클라이언트가 확인한다. 여기서는 위치·정류소번호·경유노선·중앙차로 여부만 제공한다.
+        """
+        if self.backend == "none":
             return []
-        rows = self._load_file("transit_stops.json")
+        if self.backend == "file":
+            rows = self._load_file("transit_stops.json")
+        else:
+            where = ["COALESCE(s.del_yn, 'N') = 'N'",
+                     "s.latitude IS NOT NULL", "s.longitude IS NOT NULL"]
+            params = {}
+            if poi_id:
+                where.append("s.station_id::text = :poi_id")
+                params["poi_id"] = str(poi_id)
+            elif lat is not None and lng is not None and radius_m:
+                d_lat = float(radius_m) / 111320.0
+                d_lng = d_lat / max(math.cos(math.radians(lat)), 0.01)
+                where.append("s.latitude BETWEEN :min_lat AND :max_lat")
+                where.append("s.longitude BETWEEN :min_lng AND :max_lng")
+                params.update({"min_lat": lat - d_lat, "max_lat": lat + d_lat,
+                               "min_lng": lng - d_lng, "max_lng": lng + d_lng})
+            rows = self._query(
+                """
+                SELECT s.station_id AS poi_id, s.station_name AS name,
+                       s.latitude, s.longitude, s.mobile_no, s.center_yn,
+                       (SELECT string_agg(DISTINCT r.route_name, ',')
+                          FROM tran_bus_route_station rs
+                          JOIN tran_bus_route_info r ON r.route_id = rs.route_id
+                         WHERE rs.station_id = s.station_id
+                           AND COALESCE(rs.del_yn, 'N') = 'N'
+                           AND COALESCE(r.del_yn, 'N') = 'N') AS route_names
+                  FROM tran_bus_station_info s
+                 WHERE """ + " AND ".join(where),
+                params,
+            )
         norm = []
         for r in rows:
-            lat = r.get("lat", r.get("latitude"))
-            lng = r.get("lng", r.get("longitude"))
+            lat_v = r.get("lat", r.get("latitude"))
+            lng_v = r.get("lng", r.get("longitude"))
+            routes = r.get("routes")
+            if routes is None:
+                raw = str(r.get("route_names") or "")
+                routes = sorted({x for x in raw.split(",") if x})
+            mobile_no = r.get("mobile_no")
             norm.append({
                 "poi_id": str(r.get("poi_id") or r.get("station_id") or ""),
                 "name": r.get("name") or r.get("station_name"),
-                "lat": float(lat) if lat is not None else None,
-                "lng": float(lng) if lng is not None else None,
-                "routes": r.get("routes") or [],
+                "lat": float(lat_v) if lat_v is not None else None,
+                "lng": float(lng_v) if lng_v is not None else None,
+                "mobile_no": (str(mobile_no).strip() or None) if mobile_no else None,
+                "center_yn": _is_y(r.get("center_yn")),
+                "routes": routes,
             })
         return norm
 
@@ -400,7 +449,8 @@ class PoiStore:
         """목적지 유형별 좌표 해석. tour 는 무장애 출입구 우선."""
         if dest_type == "tour":
             return self.get_entrance(poi_id)
-        pool = self._stations() if dest_type == "transit_station" else self._stops()
+        pool = (self._stations() if dest_type == "transit_station"
+                else self._stops(poi_id=poi_id))
         for s in pool:
             if s["poi_id"] == str(poi_id) and s["lat"] is not None:
                 return {"lat": s["lat"], "lng": s["lng"], "source": dest_type}
