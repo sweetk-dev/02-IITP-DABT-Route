@@ -66,6 +66,72 @@ def _is_y(v) -> bool:
 _SIGUNGU_SUFFIXES = ("시", "군", "구")
 
 
+def _normalize_routes(file_routes, db_routes) -> list:
+    """경유 노선을 ``{route_id, name, type, end_station, station_seq}`` 로 정규화한다.
+
+    노선번호만으로는 노선을 특정할 수 없다 — 안양 연관 117개 노선 중 **번호가
+    겹치는 것이 12쌍**이다(실측). 예를 들어 "2" 는 일반형시내버스 213000017 과
+    마을버스 241253001 둘 다이며, 김중업 건축박물관을 지나는 것은 후자뿐이다.
+    번호만 노출하면 정류장에서 다른 버스를 타는 사고로 이어지므로 유형을 함께 준다.
+
+    ``end_station`` 은 노선의 종점명이다. 이용자가 정류장 안내판에서 바로 대조할
+    수 있는 방면 정보이며, 아래 ``station_seq`` 산술 없이도 방향을 가늠하게 한다.
+
+    ``station_seq`` 는 그 노선이 이 정류장을 몇 번째로 지나는지다. 회차 노선은 한
+    정류장을 두 번 지나므로 값이 여러 개일 수 있다(예: 마을버스 2번은 안양역을
+    순번 10 과 34 에서 지난다). 승차·하차 정류장의 순번을 비교하면 진행 방향을
+    판정할 수 있다 — 이름이 같은 양방향 정류장에서 반대편 차를 타는 것을 막는다.
+
+    다만 순번 비교에는 한계가 있다. 순환 노선은 승차 순번이 하차 순번보다 클 수
+    있고(종점을 지나 계속 운행), 양쪽 값이 여럿이면 조합이 여러 개 나온다. 소비
+    측은 배열을 그대로 비교하지 말고 각 조합을 검토해야 하며, 확정이 어려우면
+    ``end_station`` 을 함께 안내해 이용자가 현장에서 대조하도록 해야 한다.
+
+    file 백엔드는 문자열 목록(``["2", "11"]``)도 허용한다 — 이 경우 유형은 None.
+    """
+    rows = db_routes if db_routes is not None else file_routes
+    if not rows:
+        return []
+    if isinstance(rows, str):
+        # 드라이버가 json 을 디코드하지 않고 문자열로 넘기는 경우를 방어한다.
+        text = rows.strip()
+        if text.startswith("["):
+            try:
+                rows = json.loads(text)
+            except ValueError:
+                rows = []
+        else:
+            rows = [x for x in text.split(",") if x]
+    out = []
+    for r in rows:
+        if isinstance(r, dict):
+            name = r.get("name") or r.get("route_name")
+            if not name:
+                continue
+            seq = r.get("station_seq")
+            if seq is None:
+                seq = []
+            elif not isinstance(seq, list):
+                seq = [seq]
+            out.append({"route_id": r.get("route_id"), "name": str(name),
+                        "type": r.get("type") or r.get("route_type_name"),
+                        "end_station": (r.get("end_station")
+                                        or r.get("end_station_name")),
+                        "station_seq": [x for x in seq if x is not None]})
+        else:
+            out.append({"route_id": None, "name": str(r), "type": None,
+                        "end_station": None, "station_seq": []})
+    seen, uniq = set(), []
+    for r in out:
+        key = (r["route_id"], r["name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r)
+    uniq.sort(key=lambda x: (x["name"], x["route_id"] or 0))
+    return uniq
+
+
 def sigungu_variants(sigungu: str) -> list:
     """지역명 -> 주소 대조용 행정단위 토큰 목록.
 
@@ -328,7 +394,9 @@ class PoiStore:
                     )
             item = dict(s)
             item.update({"type": "transit_station", "dist_m": round(d),
-                         "accessible": accessible, "warnings": warnings})
+                         "accessible": accessible,
+                         "accessible_status": "yes" if accessible else "no",
+                         "warnings": warnings})
             out.append(item)
 
         for s in stops:
@@ -337,7 +405,8 @@ class PoiStore:
             d = haversine_m(lat, lng, s["lat"], s["lng"])
             if d > radius_m:
                 continue
-            warnings = ["저상버스 여부는 실시간 도착정보로 확인하세요."]
+            warnings = ["저상버스 정차 여부가 확인되지 않았습니다. "
+                        "실시간 도착정보로 확인하세요."]
             if s.get("center_yn"):
                 # 중앙차로 정류소는 승차장이 도로 한가운데 있어 횡단이 선행된다.
                 warnings.append("중앙차로 정류소입니다. 승차장까지 횡단이 필요합니다.")
@@ -345,7 +414,12 @@ class PoiStore:
             item.update({
                 "type": "transit_stop",
                 "dist_m": round(d),
-                "accessible": True,
+                # 저상버스 정차 여부를 알 수 없어 접근 가능으로 단정하지 않는다.
+                # 역은 승강설비로 판정하지만 정류장은 판정 근거가 없어 None(미판정)이다.
+                # None 은 "접근 불가"가 아니다. 소비 측이 falsy 로 뭉뚱그려 불가로
+                # 표시하지 않도록, 판정 상태를 accessible_status 로 따로 준다.
+                "accessible": None,
+                "accessible_status": "unknown",
                 "warnings": warnings,
             })
             out.append(item)
@@ -415,12 +489,26 @@ class PoiStore:
                 """
                 SELECT s.station_id AS poi_id, s.station_name AS name,
                        s.latitude, s.longitude, s.mobile_no, s.center_yn,
-                       (SELECT string_agg(DISTINCT r.route_name, ',')
-                          FROM tran_bus_route_station rs
-                          JOIN tran_bus_route_info r ON r.route_id = rs.route_id
-                         WHERE rs.station_id = s.station_id
-                           AND COALESCE(rs.del_yn, 'N') = 'N'
-                           AND COALESCE(r.del_yn, 'N') = 'N') AS route_names
+                       (SELECT json_agg(json_build_object(
+                                   'route_id', t.route_id,
+                                   'name', t.route_name,
+                                   'type', t.route_type_name,
+                                   'end_station', t.end_station_name,
+                                   'station_seq', t.seqs)
+                                 ORDER BY t.route_name, t.route_id)
+                          FROM (SELECT r.route_id, r.route_name, r.route_type_name,
+                                       r.end_station_name,
+                                       array_agg(rs.station_seq
+                                                 ORDER BY rs.station_seq) AS seqs
+                                  FROM tran_bus_route_station rs
+                                  JOIN tran_bus_route_info r
+                                    ON r.route_id = rs.route_id
+                                 WHERE rs.station_id = s.station_id
+                                   AND COALESCE(rs.del_yn, 'N') = 'N'
+                                   AND COALESCE(r.del_yn, 'N') = 'N'
+                                 GROUP BY r.route_id, r.route_name,
+                                          r.route_type_name,
+                                          r.end_station_name) t) AS route_list
                   FROM tran_bus_station_info s
                  WHERE """ + " AND ".join(where),
                 params,
@@ -429,10 +517,7 @@ class PoiStore:
         for r in rows:
             lat_v = r.get("lat", r.get("latitude"))
             lng_v = r.get("lng", r.get("longitude"))
-            routes = r.get("routes")
-            if routes is None:
-                raw = str(r.get("route_names") or "")
-                routes = sorted({x for x in raw.split(",") if x})
+            routes = _normalize_routes(r.get("routes"), r.get("route_list"))
             mobile_no = r.get("mobile_no")
             norm.append({
                 "poi_id": str(r.get("poi_id") or r.get("station_id") or ""),
