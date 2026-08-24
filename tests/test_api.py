@@ -179,6 +179,18 @@ def test_tour_list_and_recommend(client):
     assert rec["items"][0]["score"] > 0
 
 
+def test_transit_station_keeps_boolean_accessible(client):
+    """역은 승강설비로 판정 가능하므로 accessible 이 계속 bool 이어야 한다."""
+    body = client.get(
+        "/transit/access-points",
+        params={"lat": 37.3900, "lng": 126.9500, "radius_m": 800},
+    ).json()
+    by_id = {i["poi_id"]: i for i in body["items"]}
+    assert by_id["S1"]["accessible"] is True
+    assert by_id["S1"]["accessible_status"] == "yes"
+    assert isinstance(by_id["S2"]["accessible"], bool)
+
+
 def test_transit_access_points_flag_lift_only_station(client):
     body = client.get(
         "/transit/access-points",
@@ -202,7 +214,12 @@ def test_transit_access_points_include_bus_stops(client):
     stop = by_id["B1"]
     assert stop["type"] == "transit_stop"
     assert stop["mobile_no"] == "09999"
-    assert stop["routes"] == ["2", "11"]
+    assert [r["name"] for r in stop["routes"]] == ["11", "2"]
+    assert all("station_seq" in r for r in stop["routes"])
+    # 정류장은 저상버스 여부를 알 수 없으므로 접근 가능으로 단정하지 않는다.
+    # None 은 미판정이며 "접근 불가"가 아니다 — 상태를 별도 필드로 명시한다.
+    assert stop["accessible"] is None
+    assert stop["accessible_status"] == "unknown"
     assert any("저상버스" in w for w in stop["warnings"])
 
 
