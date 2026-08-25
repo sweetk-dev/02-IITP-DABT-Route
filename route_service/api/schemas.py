@@ -33,6 +33,8 @@ class PlanRequest(BaseModel):
     profile: str = "wheelchair_manual"
     constraints: Optional[Constraints] = None
     alternatives: int = Field(1, ge=1, le=3)
+    # walk(기존, 기본) | walk_bus(직결 버스 허용) | walk_bus_subway(버스+안양 관내 지하철 허용)
+    mode: str = Field("walk", description="walk | walk_bus | walk_bus_subway")
 
 
 class RerouteRequest(BaseModel):
