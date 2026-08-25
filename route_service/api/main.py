@@ -412,7 +412,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     # 근사 스코어 순 상위 후보를 전부 실계산해 비교한다 — 도보 근사(직선×배율)와
     # 실제 휠체어 경로(계단·경사·단절 우회)의 괴리로 1순위가 최악일 수 있다(리뷰 #2).
     built_cands, last_err = [], None
-    for cand in cands[:4]:
+    for cand in cands[:8]:      # 근사-실계산 괴리 보정 폭 — 도보 leg 계산은 저렴하다
         try:
             built = []
             for part in cand["parts"]:
