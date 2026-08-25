@@ -74,10 +74,13 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("POI_DATA_DIR", str(poi_dir))
     monkeypatch.setenv("ROUTE_API_TOKEN", "")
 
-    import route_service.config as cfg
-
-    cfg._settings = None
     import importlib
+
+    import route_service.config as cfg
+    # Settings 는 dataclass 기본값을 클래스 정의 시점의 env 로 고정한다 —
+    # 모듈 자체를 reload 해야 monkeypatch 된 env 가 반영된다.
+    importlib.reload(cfg)
+    cfg._settings = None
 
     import route_service.api.main as m
 

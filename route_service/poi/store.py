@@ -530,6 +530,55 @@ class PoiStore:
             })
         return norm
 
+    # ---------- 멀티모달 플래너 지원 (#36) ----------
+    def stops_near(self, lat: float, lng: float, radius_m: float) -> list:
+        """반경 내 버스 정류장(경유 노선 포함). bbox 선필터는 _stops 가 수행."""
+        return [s for s in self._stops(lat=lat, lng=lng, radius_m=radius_m)
+                if s["lat"] is not None]
+
+    def stations(self) -> list:
+        """안양 관내 지하철역(승강설비 포함)."""
+        return [s for s in self._stations() if s["lat"] is not None]
+
+    def route_stop_path(self, route_id, seq_from: int, seq_to: int) -> list:
+        """노선의 구간 경유 정류장(순번 오름차순) — 버스 leg geometry·하차 카운트다운용."""
+        if self.backend == "none":
+            return []
+        if self.backend == "file":
+            rows = [r for r in self._load_file("transit_route_paths.json")
+                    if str(r.get("route_id")) == str(route_id)
+                    and seq_from <= int(r.get("station_seq", -1)) <= seq_to]
+            rows.sort(key=lambda r: int(r["station_seq"]))
+        else:
+            rows = self._query(
+                """
+                SELECT rs.station_seq, s.station_name AS name, s.mobile_no,
+                       s.latitude, s.longitude
+                  FROM tran_bus_route_station rs
+                  JOIN tran_bus_station_info s ON s.station_id = rs.station_id
+                 WHERE rs.route_id = :route_id
+                   AND rs.station_seq BETWEEN :seq_from AND :seq_to
+                   AND COALESCE(rs.del_yn, 'N') = 'N'
+                   AND COALESCE(s.del_yn, 'N') = 'N'
+                 ORDER BY rs.station_seq
+                """,
+                {"route_id": route_id, "seq_from": seq_from, "seq_to": seq_to},
+            )
+        out = []
+        for r in rows:
+            lat_v = r.get("lat", r.get("latitude"))
+            lng_v = r.get("lng", r.get("longitude"))
+            if lat_v is None:
+                continue
+            mob = r.get("mobile_no")
+            out.append({
+                "station_seq": int(r["station_seq"]),
+                "name": r.get("name"),
+                "mobile_no": (str(mob).strip() or None) if mob else None,
+                "lat": float(lat_v), "lng": float(lng_v),
+            })
+        return out
+
     def resolve_destination(self, dest_type: str, poi_id: str):
         """목적지 유형별 좌표 해석. tour 는 무장애 출입구 우선."""
         if dest_type == "tour":
