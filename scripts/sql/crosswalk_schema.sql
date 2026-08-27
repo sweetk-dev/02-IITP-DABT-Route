@@ -59,3 +59,19 @@ ALTER TABLE mv_pednet_node ADD COLUMN IF NOT EXISTS crosswalk_cnt  SMALLINT NOT 
 ALTER TABLE mv_pednet_node ADD COLUMN IF NOT EXISTS cw_mgmt_nos    TEXT;          -- 쉼표구분 관리번호 목록
 
 COMMENT ON COLUMN mv_pednet_node.crosswalk_cnt IS '이 노드에 부착된 안양시 횡단보도 개수 (안내 문구 생성용)';
+
+
+-- ################################################
+-- ## mv_crosswalk 확장 — 접속 보도 유효폭 (v1.14.0)
+-- ################################################
+-- 원천 width_m 은 도색 띠 폭(횡단보도 자체 폭)이고, 법정 판정(유효폭 1.2m)에 필요한 것은
+-- 접속 보도의 유효폭이다. 수치지형도 1:1,000 보도 중심선 폭원 속성에서 반경 25m 내
+-- 최근접 폭 기재 보도 링크의 폭을 전이한다 (scripts/fill_crosswalk_widths.py).
+-- 커버리지 95.3% (2,600/2,728) · p10/p50/p90 = 1.80/3.00/5.20m · 1.2m 미만 9건(0.3%).
+ALTER TABLE mv_crosswalk ADD COLUMN IF NOT EXISTS approach_width_m      NUMERIC(5,2);
+ALTER TABLE mv_crosswalk ADD COLUMN IF NOT EXISTS approach_width_dist_m NUMERIC(5,2);
+ALTER TABLE mv_crosswalk ADD COLUMN IF NOT EXISTS approach_width_src    VARCHAR(10);
+
+COMMENT ON COLUMN mv_crosswalk.approach_width_m      IS '접속 보도 유효폭(m) — 수치지형도 폭원 전이값. NULL = 반경 내 폭 기재 보도 없음(4.7%)';
+COMMENT ON COLUMN mv_crosswalk.approach_width_dist_m IS '전이 원천 보도 링크까지의 거리(m)';
+COMMENT ON COLUMN mv_crosswalk.approach_width_src    IS '전이 출처 (topo1k = 수치지형도 1:1,000). 실측값 아님';

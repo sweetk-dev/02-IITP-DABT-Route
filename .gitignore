@@ -35,6 +35,10 @@ WORKSPACE.md
 
 # 네트워크 그래프 · POI 데이터 · 결과물 (대용량/실데이터 — 커밋 금지)
 data/*.gpickle
+data/*.csv
+data/*.geojson
+data/*.pkl
+data/db_export/
 data/dem/
 data/terrain/
 data/poi/*.json
