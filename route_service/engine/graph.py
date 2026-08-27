@@ -6,16 +6,26 @@
 node attrs:
     lat, lon            : WGS84
     node_type           : intersection | crossing | entrance | stop | station | unknown
+    -- 이하 안양시 횡단보도 지점 부착 (apply_city_crosswalks.py [3]단계, 없으면 미부착) --
+    crosswalk_cnt       (int)        : 이 노드에 부착된 횡단보도 개수 (안내 전용 계층)
+    cw_mgmt_nos         (list[str])  : 부착분 관리번호 목록 (mv_crosswalk.mgmt_no)
+    cw_curb_cut         (bool|None)  : 부착분 턱낮춤 AND 집계. **None = 미상(없음 아님)**
+    cw_tactile_paving   (bool|None)  : 부착분 점자블록 AND 집계. None = 미상
 
 edge attrs:
     length      (float) : 링크 연장(m)
     slope       (float) : 평균 종단경사(도). DEM 미적용 시 0.0
     link_type   (str)   : sidewalk | road | crossing | steps | overpass | underpass | ramp | elevator | unknown
     width       (float|None) : 유효 보도폭(m)
-    curb_cut    (bool|None)  : 턱낮춤 여부(횡단보도 접속부)
+    curb_cut    (bool|None)  : 턱낮춤 여부(횡단보도 접속부). **None = 미상 — False 일 때만 차단**
+    tactile_paving (bool|None) : 점자블록 유무. None = 미상
     surface     (str|None)
     link_name   (str|None)
     geometry    (list[(lat, lon)]|None) : 실제 선형. 없으면 노드 직선으로 대체
+    -- 이하 안양시 횡단보도 원천 전이 (apply_city_crosswalks.py [1]·[2]단계, 선택) --
+    cw_length_m (float) : 횡단보도길이(횡단 거리) 원천값
+    cw_mgmt_no  (str)   : 매칭된 관리번호 (mv_crosswalk.mgmt_no)
+    attr_source (str)   : 속성 출처 (city_cw2026 | topo1k | ...)
 """
 from __future__ import annotations
 
@@ -38,6 +48,7 @@ EDGE_DEFAULTS = {
     "link_type": "unknown",
     "width": None,
     "curb_cut": None,
+    "tactile_paving": None,
     "surface": None,
     "link_name": None,
     "geometry": None,
