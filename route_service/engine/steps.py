@@ -63,6 +63,7 @@ def _edge_warnings(data: dict, profile: Profile) -> list:
     w = data.get("width")
     if profile.min_width_m and w is not None and w < profile.min_width_m:
         out.append("보도 폭 %.1fm (좁음)" % w)
+    out.extend(data.get("report_warnings") or [])   # 이용자 제보 경고 (engine.overrides)
     return out
 
 

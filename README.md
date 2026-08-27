@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.15.0 |
+| 02-IITP-DABT-Route | v1.16.0 |
 
 ## 구조
 

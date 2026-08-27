@@ -50,6 +50,9 @@ def _uturn_edges(G, path) -> set:
 
 
 def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
+    if data.get("blocked"):
+        # 제보·실측 오버라이드(passable=false, engine.overrides) — 승인제로만 설정된다
+        return False
     if data["link_type"] in profile.avoid:
         return False
     if data["slope"] > max_slope_deg:
@@ -104,6 +107,7 @@ def _summarize(G, path, profile, slope_coverage: float = 1.0) -> dict:
             counts[lt] += 1
         if lt == "crossing" and d.get("curb_cut") is False:
             warnings.append("턱낮춤 없는 횡단보도 구간이 있습니다")
+        warnings.extend(d.get("report_warnings") or [])   # 이용자 제보 경고 (overrides)
         if float(d["slope"]) > profile.max_slope_deg:
             warnings.append(
                 "권장 경사(%.1f도)를 넘는 구간이 포함되어 있습니다" % profile.max_slope_deg
