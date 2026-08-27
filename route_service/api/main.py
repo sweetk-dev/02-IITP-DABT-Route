@@ -485,6 +485,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
         "max_slope_deg": max((l["summary"]["max_slope_deg"] for l in walk_legs), default=0),
         "stairs_cnt": sum(l["summary"]["stairs_cnt"] for l in walk_legs),
         "crossing_cnt": sum(l["summary"]["crossing_cnt"] for l in walk_legs),
+        "crossing_point_cnt": sum(l["summary"].get("crossing_point_cnt", 0) for l in walk_legs),
         "transit": {
             "bus_cnt": sum(1 for l in transit_legs if l["kind"] == "bus"),
             "subway_cnt": sum(1 for l in transit_legs if l["kind"] == "subway"),

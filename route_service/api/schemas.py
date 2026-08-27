@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""요청·응답 스키마."""
+"""요청·응답 스키마.
+
+응답 본문은 main.py 에서 dict 로 조립한다. v1.13.0 추가 필드(하위 호환, 추가 전용):
+  - routes[].summary.crossing_point_cnt : 경로 노드에 지점 부착된 횡단보도 수
+    (기존 crossing_cnt = crossing 링크 수 — 의미 불변)
+  - routes[].steps[].maneuver == "crossing_point" : 노드 부착 횡단보도 안내 스텝
+    (distance_m 0, crosswalk_cnt 포함. 턱낮춤 False=경고 / None="턱낮춤 미상")
+"""
 from __future__ import annotations
 
 from typing import List, Optional
