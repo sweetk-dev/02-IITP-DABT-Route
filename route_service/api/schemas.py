@@ -58,6 +58,54 @@ class SnapRequest(BaseModel):
     max_dist_m: Optional[float] = None
 
 
+class TrackPoint(BaseModel):
+    seq: int = Field(..., ge=0)
+    lat: float = Field(..., ge=-90, le=90)
+    lng: float = Field(..., ge=-180, le=180)
+    ts: Optional[str] = None            # ISO8601 (클라이언트 시각)
+    acc: Optional[float] = Field(None, ge=0, description="GPS 정확도(m)")
+
+
+class TrackMeta(BaseModel):
+    profile: Optional[str] = None
+    network_version: Optional[str] = None
+    planned_dist_m: Optional[int] = None
+    geometry: Optional[List[List[float]]] = None   # 안내 경로선 [[lat,lng],...]
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    outcome: Optional[str] = Field(None, description="arrived | canceled | unknown")
+
+
+class TrackLogRequest(BaseModel):
+    """주행 GPS 트랙 배치 업로드 — 참여자 식별자는 받지 않는다(route_id 익명)."""
+
+    route_id: str = Field(..., min_length=1, max_length=20)
+    points: List[TrackPoint] = Field(default_factory=list)
+    meta: Optional[TrackMeta] = None
+
+
+class AccessReportRequest(BaseModel):
+    """접근성 오류 제보 (안내 화면 원터치 버튼)."""
+
+    lat: float = Field(..., ge=-90, le=90)
+    lng: float = Field(..., ge=-180, le=180)
+    reason: str = Field(..., description="curb | no_sidewalk | no_crossing | steep | blocked | etc")
+    detail: Optional[str] = Field(None, max_length=500)
+    route_id: Optional[str] = Field(None, max_length=20)
+    photo_base64: Optional[str] = Field(None, description="사진 1장 (base64, 2MB 이하)")
+    photo_mime: Optional[str] = Field(None, max_length=40)
+
+
+class ReportReviewRequest(BaseModel):
+    """관리자 검토 — confirm(확인) / reject(기각) / apply(속성 반영, 승인제)."""
+
+    action: str = Field(..., description="confirm | reject | apply")
+    attr: Optional[str] = Field(None, description="apply 시: curb_cut | tactile_paving | width | passable")
+    value: Optional[str] = Field(None, description="apply 시: 'false' / '1.1' 등")
+    note: Optional[str] = Field(None, max_length=300)
+    radius_m: float = Field(20.0, ge=1, le=100)
+
+
 class RecommendRequest(BaseModel):
     disabilities: List[str] = Field(default_factory=list)
     sigungu: str = "안양"

@@ -24,22 +24,39 @@ from ..engine.graph import STORE as NET
 from ..engine.planner import NoRouteError, off_route_distance_m, plan
 from ..engine.snap import SnapError, snap
 from ..engine.steps import build_steps
+from ..collect import store as collect_store
+from ..engine.overrides import apply_overrides
 from ..poi import store as poi_store
 from ..transit import planner as transit
 from .schemas import (
+    AccessReportRequest,
     Destination,
     PlanRequest,
     RecommendRequest,
+    ReportReviewRequest,
     RerouteRequest,
     SnapRequest,
+    TrackLogRequest,
 )
 
 logger = logging.getLogger("route_api")
 settings = get_settings()
 
+def _apply_overrides_safe() -> dict:
+    """수집 저장소의 활성 오버라이드를 그래프에 적용 — 실패해도 서비스는 계속."""
+    try:
+        stat = apply_overrides(NET.graph, collect_store.STORE.active_overrides())
+        logger.info("오버라이드 적용: %s", stat)
+        return stat
+    except Exception as e:            # DB 미가용 등 — 오버라이드 없이 운행
+        logger.warning("오버라이드 적용 실패(%s) — 보정 없이 운행", e)
+        return {"error": str(e)}
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     poi_store.configure(settings)
+    collect_store.configure(settings)
     global BUILDINGS, ENTRANCES
     BUILDINGS = BuildingIndex(settings.buildings_path)
     ENTRANCES = ManualEntrances(settings.entrances_path)
@@ -51,6 +68,7 @@ async def lifespan(_app: FastAPI):
             "네트워크 로드 완료: %s nodes=%s edges=%s",
             settings.network_path, meta["node_cnt"], meta["edge_cnt"],
         )
+        _apply_overrides_safe()
     except Exception as e:
         logger.warning("네트워크 로드 실패(%s) — /meta/network 로 상태 확인", e)
     yield
@@ -651,10 +669,89 @@ def transit_access_points(
     return {"source": poi_store.STORE.source, "count": len(items), "items": items}
 
 
+# ────────────────────────── collect (수집 장치화) ──────────────────────────
+# 실증 자체가 수집 장치다: 안내 세션의 GPS 트랙과 원터치 오류 제보가
+# 서비스 이용의 부산물로 쌓인다. 참여자 식별자는 받지도 저장하지도 않는다.
+
+
+@app.post("/track/log", tags=["collect"], dependencies=[Depends(auth)])
+def track_log(req: TrackLogRequest):
+    """주행 GPS 트랙 배치 업로드 (안내 세션 종료 시 1회 권장, 중복 seq 는 무시)."""
+    if len(req.points) > collect_store.MAX_POINTS_PER_CALL:
+        raise HTTPException(status_code=422,
+                            detail="한 번에 %d점 이하로 나눠 올려주세요"
+                                   % collect_store.MAX_POINTS_PER_CALL)
+    try:
+        stored = collect_store.STORE.log_track(
+            req.route_id,
+            [p.model_dump() for p in req.points],
+            req.meta.model_dump() if req.meta else None,
+        )
+    except Exception as e:
+        logger.warning("트랙 저장 실패: %s", e)
+        raise HTTPException(status_code=503, detail="트랙 저장소를 사용할 수 없습니다")
+    return {"route_id": req.route_id, "stored_points": stored}
+
+
+@app.post("/report/accessibility", tags=["collect"], dependencies=[Depends(auth)])
+def report_accessibility(req: AccessReportRequest):
+    """접근성 오류 제보 — 접수 즉시 해당 지점 링크에 '이용자 제보(미확인)' 경고가 붙는다."""
+    try:
+        out = collect_store.STORE.add_report(
+            req.lat, req.lng, req.reason, req.detail, req.route_id,
+            req.photo_base64, req.photo_mime,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.warning("제보 저장 실패: %s", e)
+        raise HTTPException(status_code=503, detail="제보 저장소를 사용할 수 없습니다")
+    if NET.loaded:
+        _apply_overrides_safe()       # 수위 1: 경고는 즉시 안내에 반영
+    return {**out, "message": "제보가 접수되었습니다. 확인 후 경로 안내에 반영됩니다."}
+
+
+@app.get("/report/accessibility", tags=["collect"], dependencies=[Depends(auth)])
+def list_accessibility_reports(
+    status: str = Query(None, description="new | confirmed | rejected | applied"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """제보 목록 (관리 콘솔용, 사진은 별도 엔드포인트)."""
+    items = collect_store.STORE.list_reports(status, limit, offset)
+    return {"count": len(items), "items": items,
+            "reasons": collect_store.REASONS}
+
+
+@app.get("/report/accessibility/{report_id}/photo", tags=["collect"],
+         dependencies=[Depends(auth)])
+def report_photo(report_id: int):
+    photo, mime = collect_store.STORE.get_report_photo(report_id)
+    if photo is None:
+        raise HTTPException(status_code=404, detail="사진이 없습니다")
+    from fastapi.responses import Response
+    return Response(content=bytes(photo), media_type=mime or "image/jpeg")
+
+
+@app.patch("/report/accessibility/{report_id}", tags=["collect"],
+           dependencies=[Depends(auth)])
+def review_accessibility_report(report_id: int, req: ReportReviewRequest):
+    """관리자 검토 — confirm(경고 확정) / reject(경고 철회) / apply(속성 반영, 승인제)."""
+    try:
+        out = collect_store.STORE.review_report(
+            report_id, req.action, req.attr, req.value, req.note, req.radius_m)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    stat = _apply_overrides_safe() if NET.loaded else {}
+    return {**out, "overrides": stat}
+
+
 # ────────────────────────── admin ──────────────────────────
 @app.post("/admin/reload-network", tags=["admin"], dependencies=[Depends(auth)])
 def reload_network(path: str = Query(None), version: str = Query(None)):
-    """그래프 교체(융기원 원본 도착 시 무중단 반영)."""
+    """그래프 교체(융기원 원본 도착 시 무중단 반영). 오버라이드도 재적용된다."""
     try:
         meta = NET.load(
             path or settings.network_path,
@@ -663,4 +760,13 @@ def reload_network(path: str = Query(None), version: str = Query(None)):
         )
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="네트워크 파일을 찾을 수 없습니다")
+    meta["overrides"] = _apply_overrides_safe()
     return meta
+
+
+@app.post("/admin/reload-overrides", tags=["admin"], dependencies=[Depends(auth)])
+def reload_overrides():
+    """오버라이드만 재적용 (그래프 로드 없이). 콘솔에서 일괄 검토 후 호출."""
+    if not NET.loaded:
+        raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
+    return _apply_overrides_safe()
