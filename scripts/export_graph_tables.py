@@ -32,10 +32,14 @@ def main():
 
     with open(node_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["node_id", "lat", "lon", "node_type", "network_version"])
+        w.writerow(["node_id", "lat", "lon", "node_type",
+                    "crosswalk_cnt", "cw_mgmt_nos", "network_version"])
         for n, d in G.nodes(data=True):
             w.writerow([n, d.get("lat"), d.get("lon"),
-                        d.get("node_type") or "unknown", args.version])
+                        d.get("node_type") or "unknown",
+                        int(d.get("crosswalk_cnt") or 0),
+                        ",".join(d.get("cw_mgmt_nos") or []),
+                        args.version])
 
     def _b(v):
         return {True: "true", False: "false"}.get(v, "")
@@ -43,8 +47,9 @@ def main():
     with open(link_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["f_node", "t_node", "length_m", "link_type", "width_m",
-                    "slope_pct", "surface", "curb_cut", "link_name",
-                    "topo_source", "network_version"])
+                    "slope_pct", "surface", "curb_cut", "tactile_paving",
+                    "link_name", "topo_source", "cw_mgmt_no", "attr_source",
+                    "network_version"])
         for u, v, d in G.edges(data=True):
             w.writerow([
                 u, v, round(float(d.get("length") or 0), 2),
@@ -53,8 +58,11 @@ def main():
                 d.get("slope") if d.get("slope") is not None else "",
                 d.get("surface") or "",
                 _b(d.get("curb_cut")),
+                _b(d.get("tactile_paving")),
                 d.get("link_name") or "",
                 d.get("topo_source") or "",
+                d.get("cw_mgmt_no") or "",
+                d.get("attr_source") or "",
                 args.version,
             ])
 

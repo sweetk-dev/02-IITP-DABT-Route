@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.10.0 |
+| 02-IITP-DABT-Route | v1.17.0 |
 
 ## 구조
 
@@ -133,6 +133,12 @@ curl -s localhost:18100/meta/network
 | GET | `/tour/bf-spots/{id}/entrance` | **무장애 접근 지점** — 실측 출입구 > 건물 접근점 > 시설 대표점 |
 | POST | `/tour/recommend` | 장애 유형별 관광지 추천 랭킹 — `origin_lat/lng` 지정 시 **거리 오름차순**, `offset` 페이징(`total`/`has_more` 반환) |
 | GET | `/transit/access-points` | 휠체어 접근 가능한 정류장·역 |
+| POST | `/track/log` | 주행 GPS 트랙 적재 (참여자 식별자 없음 — `route_id` 익명) |
+| POST | `/report/accessibility` | 접근성 오류 제보 — 접수 즉시 '이용자 제보(미확인)' 경고 부착 |
+| GET | `/report/accessibility` | 제보 목록 (관리 콘솔용) |
+| GET | `/report/accessibility/{id}/photo` | 제보 사진 |
+| PATCH | `/report/accessibility/{id}` | 검토 — confirm(확정) / reject(기각) / apply(속성 반영, 승인제) |
+| DELETE | `/report/accessibility/{id}` | **제보 삭제** — 오검·중복·시험 제보 정리. 파생 오버라이드도 함께 사라진다 |
 | POST | `/admin/reload-network` | 그래프 무중단 교체 |
 
 ### 경로 탐색 예시
@@ -223,6 +229,39 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
 - 목적지 유형 `transit_station`: 지하철역 — 승강설비(엘리베이터/리프트) 보유 여부로 접근성 판정
 - 목적지 유형 `transit_stop`: 버스 정류장 — 저상버스 정차 여부는 정적 데이터에 없으므로
   실시간 도착정보(GBIS `lowPlate`)로 확인해야 한다
+
+### 접근성 판정은 3상태다
+
+`accessible` 은 `true` / `false` / `null` 셋을 가지며, **`null` 은 "접근 불가"가 아니라
+"판정 근거 없음"** 이다. 역은 승강설비 데이터로 판정하지만 정류장은 근거가 없어 `null` 이다.
+소비 측이 falsy 로 뭉뚱그려 "이용 불가"로 표시하는 사고를 막기 위해 판정 상태를 별도 필드로
+같이 준다 — `accessible_status` 는 `"yes"` / `"no"` / `"unknown"` 문자열이다.
+
+`unknown` 인 정류장은 불가로 표시하지 말고, `warnings` 의 안내대로 실시간 도착정보를
+확인하도록 유도해야 한다. 노선의 저상버스 운영 여부(`tran_bus_route_info.low_bus_yn`)를
+확보하면 `unknown` 을 좁힐 수 있다.
+
+### 정류장 경유 노선 (`routes`)
+
+노선번호만으로는 노선이 특정되지 않는다 — 안양 연관 117개 노선 중 **번호가 겹치는 것이
+12쌍**이다. 번호 `2` 는 일반형시내버스 `213000017` 과 마을버스 `241253001` 둘 다이고,
+김중업건축박물관을 지나는 것은 후자뿐이다. 번호만 안내하면 다른 버스에 타게 된다.
+
+```json
+"routes": [
+  {"route_id": 241253001, "name": "2", "type": "마을버스",
+   "end_station": "안양역", "station_seq": [10, 34]}
+]
+```
+
+- `end_station` — 종점명. 이용자가 정류장 안내판에서 그대로 대조할 수 있는 방면 정보다.
+- `station_seq` — 그 노선이 이 정류장을 지나는 순번. 회차 노선은 한 정류장을 두 번 지나므로
+  값이 여럿일 수 있다. 승차·하차 정류장의 순번을 비교하면 진행 방향을 판정할 수 있어,
+  이름이 같은 양방향 정류장(예: 안양역 `09213`/`09145`)에서 반대편 차를 타는 것을 막는다.
+
+순번 비교에는 한계가 있다. 순환 노선은 승차 순번이 하차 순번보다 클 수 있고(종점을 지나
+계속 운행), 양쪽 값이 여럿이면 조합이 여러 개 나온다. 배열끼리 직접 비교하지 말고 조합을
+검토하되, 확정이 어려우면 `end_station` 을 함께 안내해 현장에서 대조하게 해야 한다.
 
 ## 데이터
 

@@ -26,6 +26,7 @@ MANEUVER_LABEL = {
     "sharp_right": "급우회전",
     "uturn": "유턴",
     "crossing": "횡단보도",
+    "crossing_point": "횡단보도",
     "elevator": "승강기",
     "ramp": "경사로",
     "steps": "계단",
@@ -62,7 +63,58 @@ def _edge_warnings(data: dict, profile: Profile) -> list:
     w = data.get("width")
     if profile.min_width_m and w is not None and w < profile.min_width_m:
         out.append("보도 폭 %.1fm (좁음)" % w)
+    out.extend(data.get("report_warnings") or [])   # 이용자 제보 경고 (engine.overrides)
     return out
+
+
+def _node_crosswalk_step(G, node, position: str = "mid") -> dict | None:
+    """노드에 지점 부착된 횡단보도의 안내 스텝(안내 전용 계층).
+
+    안양시 원천 횡단보도 2,728건 중 다수는 crossing 링크가 아니라 최근접 노드에
+    지점 메타로 부착돼 있다(apply_city_crosswalks.py [3]단계 -> 노드 crosswalk_cnt).
+    경로가 그 노드를 지나면 횡단 안내를 내보낸다. 위상(경로·거리·비용)에는 일절
+    관여하지 않으므로 경로 회귀 위험이 없다.
+
+    position: mid(경로 중간 — 횡단 지시) | start·end(출발·도착 지점 — 정보형 안내.
+    실제 횡단 여부를 단정할 수 없어 지시형 대신 존재를 알린다).
+
+    cw_curb_cut / cw_tactile_paving 의 None 은 "없음"이 아니라 **미상**이다
+    (원천 기재율 4.4%). False 일 때만 "없음" 경고, None 은 "턱낮춤 미상" 표기.
+    """
+    attrs = G.nodes[node]
+    cnt = int(attrs.get("crosswalk_cnt") or 0)
+    if cnt <= 0:
+        return None
+    warnings = []
+    curb = attrs.get("cw_curb_cut")
+    if curb is False:
+        warnings.append("턱낮춤 없음")
+    elif curb is None:
+        warnings.append("턱낮춤 미상")
+    if attrs.get("cw_tactile_paving") is False:
+        warnings.append("점자블록 없음")
+    many = "" if cnt == 1 else " %d개" % cnt
+    if position == "start":
+        base = "출발 지점에 횡단보도%s가 있습니다." % many
+    elif position == "end":
+        base = "도착 지점에 횡단보도%s가 있습니다." % many
+    elif cnt == 1:
+        base = "횡단보도가 있습니다. 횡단보도를 건너세요."
+    else:
+        base = "횡단보도 %d개가 있는 지점입니다. 횡단보도를 건너세요." % cnt
+    if warnings:
+        base += " (%s)" % ", ".join(warnings)
+    return {
+        "maneuver": "crossing_point",
+        "instruction": base,
+        "distance_m": 0,
+        "duration_sec": 0,
+        "coord": [round(float(attrs["lat"]), 7), round(float(attrs["lon"]), 7)],
+        "link_type": None,
+        "link_name": None,
+        "warnings": warnings,
+        "crosswalk_cnt": cnt,
+    }
 
 
 def _josa(word: str, with_batchim: str, without_batchim: str) -> str:
@@ -144,6 +196,15 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
             maneuver = _maneuver_from_angle(turn_angle(prev_out, seg["in_bearing"]))
         special = lt in ("crossing", "elevator", "ramp", "steps")
 
+        # 노드 부착 횡단보도 안내 — 경로 중간 노드(seg 시작점).
+        # 앞뒤 어느 한쪽이 crossing 링크면 링크 스텝이 이미 횡단을 안내하므로 생략(중복 방지).
+        if i > 0 and lt != "crossing" and raw[i - 1]["data"]["link_type"] != "crossing":
+            cw = _node_crosswalk_step(G, seg["u"])
+            if cw is not None:
+                cw.update({"idx": len(steps), "_cw_point": True,
+                           "_link_type": None, "_maneuver_special": True})
+                steps.append(cw)
+
         merge_ok = (
             steps
             and maneuver == "straight"
@@ -176,10 +237,22 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
                     "_end_node": seg["v"],
                 }
             )
+
+        # 출발 지점 부착분 — depart 스텝 뒤에 정보형으로 안내 (2-노드 경로 등에서
+        # 부착 노드가 출발점이면 중간 노드 안내만으로는 통째로 침묵하게 된다).
+        if i == 0 and lt != "crossing":
+            cw = _node_crosswalk_step(G, seg["u"], position="start")
+            if cw is not None:
+                cw.update({"idx": len(steps), "_cw_point": True,
+                           "_link_type": None, "_maneuver_special": True})
+                steps.append(cw)
         prev_out = seg["out_bearing"]
 
     out = []
     for s in steps:
+        if s.get("_cw_point"):
+            out.append({k: v for k, v in s.items() if not k.startswith("_")})
+            continue
         dist = s["distance_m"]
         instruction = _sentence(
             s["maneuver"] if s["maneuver"] in MANEUVER_LABEL else "straight",
@@ -201,6 +274,13 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
                 "warnings": s["_warnings"],
             }
         )
+
+    # 도착 지점 부착분 — arrive 직전에 정보형으로 안내.
+    if raw[-1]["data"]["link_type"] != "crossing":
+        cw = _node_crosswalk_step(G, raw[-1]["v"], position="end")
+        if cw is not None:
+            cw["idx"] = len(out)
+            out.append(cw)
 
     last_coord = raw[-1]["coords"][-1]
     out.append(

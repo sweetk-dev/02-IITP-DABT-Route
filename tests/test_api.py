@@ -55,16 +55,32 @@ def client(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
+    (poi_dir / "transit_stops.json").write_text(
+        json.dumps(
+            [
+                {"poi_id": "B1", "name": "테스트정류장", "lat": 37.3901,
+                 "lng": 126.9503, "mobile_no": "09999", "routes": ["2", "11"]},
+                {"poi_id": "B2", "name": "중앙차로정류장", "lat": 37.3902,
+                 "lng": 126.9504, "mobile_no": "09998", "center_yn": "Y", "routes": ["1"]},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
     monkeypatch.setenv("NETWORK_PATH", str(net))
     monkeypatch.setenv("NETWORK_VERSION", "test-1")
     monkeypatch.setenv("POI_BACKEND", "file")
     monkeypatch.setenv("POI_DATA_DIR", str(poi_dir))
     monkeypatch.setenv("ROUTE_API_TOKEN", "")
 
-    import route_service.config as cfg
-
-    cfg._settings = None
     import importlib
+
+    import route_service.config as cfg
+    # Settings 는 dataclass 기본값을 클래스 정의 시점의 env 로 고정한다 —
+    # 모듈 자체를 reload 해야 monkeypatch 된 env 가 반영된다.
+    importlib.reload(cfg)
+    cfg._settings = None
 
     import route_service.api.main as m
 
@@ -166,6 +182,18 @@ def test_tour_list_and_recommend(client):
     assert rec["items"][0]["score"] > 0
 
 
+def test_transit_station_keeps_boolean_accessible(client):
+    """역은 승강설비로 판정 가능하므로 accessible 이 계속 bool 이어야 한다."""
+    body = client.get(
+        "/transit/access-points",
+        params={"lat": 37.3900, "lng": 126.9500, "radius_m": 800},
+    ).json()
+    by_id = {i["poi_id"]: i for i in body["items"]}
+    assert by_id["S1"]["accessible"] is True
+    assert by_id["S1"]["accessible_status"] == "yes"
+    assert isinstance(by_id["S2"]["accessible"], bool)
+
+
 def test_transit_access_points_flag_lift_only_station(client):
     body = client.get(
         "/transit/access-points",
@@ -175,6 +203,56 @@ def test_transit_access_points_flag_lift_only_station(client):
     by_id = {i["poi_id"]: i for i in body["items"]}
     assert by_id["S1"]["warnings"] == []            # 엘리베이터 보유
     assert by_id["S2"]["warnings"]                  # 리프트만 -> 경고
+
+
+def test_transit_access_points_include_bus_stops(client):
+    """버스 정류장도 접근점으로 반환되어야 한다(실증 버스 구간 안내의 전제)."""
+    body = client.get(
+        "/transit/access-points",
+        params={"lat": 37.3900, "lng": 126.9500, "radius_m": 800,
+                "profile": "wheelchair_manual"},
+    ).json()
+    by_id = {i["poi_id"]: i for i in body["items"]}
+    assert {"S1", "S2", "B1", "B2"} <= set(by_id)
+    stop = by_id["B1"]
+    assert stop["type"] == "transit_stop"
+    assert stop["mobile_no"] == "09999"
+    assert [r["name"] for r in stop["routes"]] == ["11", "2"]
+    assert all("station_seq" in r for r in stop["routes"])
+    # 정류장은 저상버스 여부를 알 수 없으므로 접근 가능으로 단정하지 않는다.
+    # None 은 미판정이며 "접근 불가"가 아니다 — 상태를 별도 필드로 명시한다.
+    assert stop["accessible"] is None
+    assert stop["accessible_status"] == "unknown"
+    assert any("저상버스" in w for w in stop["warnings"])
+
+
+def test_transit_access_points_warn_center_lane_stop(client):
+    """중앙차로 정류소는 승차장까지 횡단이 선행되므로 별도 경고가 필요하다."""
+    body = client.get(
+        "/transit/access-points",
+        params={"lat": 37.3900, "lng": 126.9500, "radius_m": 800},
+    ).json()
+    by_id = {i["poi_id"]: i for i in body["items"]}
+    assert by_id["B2"]["center_yn"] is True
+    assert any("횡단" in w for w in by_id["B2"]["warnings"])
+    assert by_id["B1"]["center_yn"] is False
+    assert not any("횡단" in w for w in by_id["B1"]["warnings"])
+
+
+def test_transit_access_points_respect_radius(client):
+    """반경 밖 정류장·역은 제외되어야 한다."""
+    far = client.get(
+        "/transit/access-points",
+        params={"lat": 37.5000, "lng": 127.1000, "radius_m": 800},
+    ).json()
+    assert far["count"] == 0
+
+    near = client.get(
+        "/transit/access-points",
+        params={"lat": 37.3900, "lng": 126.9500, "radius_m": 800},
+    ).json()
+    assert near["count"] == 4
+    assert all(i["dist_m"] <= 800 for i in near["items"])
 
 
 def test_entrance_endpoint_reports_source(client):

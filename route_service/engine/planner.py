@@ -50,6 +50,9 @@ def _uturn_edges(G, path) -> set:
 
 
 def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
+    if data.get("blocked"):
+        # 제보·실측 오버라이드(passable=false, engine.overrides) — 승인제로만 설정된다
+        return False
     if data["link_type"] in profile.avoid:
         return False
     if data["slope"] > max_slope_deg:
@@ -104,10 +107,21 @@ def _summarize(G, path, profile, slope_coverage: float = 1.0) -> dict:
             counts[lt] += 1
         if lt == "crossing" and d.get("curb_cut") is False:
             warnings.append("턱낮춤 없는 횡단보도 구간이 있습니다")
+        warnings.extend(d.get("report_warnings") or [])   # 이용자 제보 경고 (overrides)
         if float(d["slope"]) > profile.max_slope_deg:
             warnings.append(
                 "권장 경사(%.1f도)를 넘는 구간이 포함되어 있습니다" % profile.max_slope_deg
             )
+    # 노드 지점 부착 횡단보도(안내 전용 계층) — crossing 링크와 별개로 집계한다.
+    # 기존 crossing_cnt(= crossing 링크 수)는 클라이언트 계약이 있으므로 의미를 바꾸지 않는다.
+    cw_points = 0
+    for n in path:
+        c = int(G.nodes[n].get("crosswalk_cnt") or 0)
+        if c:
+            cw_points += c
+            if G.nodes[n].get("cw_curb_cut") is False:
+                warnings.append("턱낮춤 없는 횡단보도 구간이 있습니다")
+
     mean_slope = sum(slopes) / len(slopes) if slopes else 0.0
     max_slope = max(slopes) if slopes else 0.0
     duration = dist / profile.speed_mps if profile.speed_mps else 0.0
@@ -130,6 +144,7 @@ def _summarize(G, path, profile, slope_coverage: float = 1.0) -> dict:
         "max_slope_deg": round(max_slope, 2),
         "stairs_cnt": counts["steps"],
         "crossing_cnt": counts["crossing"],
+        "crossing_point_cnt": cw_points,
         "elevator_cnt": counts["elevator"],
         "ramp_cnt": counts["ramp"],
         "accessibility_score": round(score, 2),
