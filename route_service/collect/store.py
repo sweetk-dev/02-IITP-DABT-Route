@@ -234,6 +234,34 @@ class CollectStore:
             raise ValueError("action 은 confirm | reject | apply")
         return {"report_id": report_id, "action": action}
 
+    def delete_report(self, report_id: int) -> dict:
+        """제보 완전 삭제 (v1.17.0) — 오검·중복·시험 제보를 콘솔에서 지우기 위한 것.
+
+        검토(reject)와 다르다. reject 는 '봤고 사실이 아니다'라는 기록을 남기지만,
+        삭제는 기록 자체를 없앤다. 제보에서 파생된 오버라이드도 함께 지운다 —
+        남겨 두면 출처 없는 경고가 그래프에 떠도는 데다, FK 때문에 삭제도 되지 않는다.
+        """
+        rep = self._get_report(report_id)
+        if rep is None:
+            raise KeyError("제보 %s 없음" % report_id)
+
+        if self.backend == "memory":
+            with self._lock:
+                removed = [oid for oid, ov in self._overrides.items()
+                           if ov.get("report_id") == report_id]
+                for oid in removed:
+                    del self._overrides[oid]
+                self._reports.pop(report_id, None)
+            return {"report_id": report_id, "deleted": True,
+                    "deleted_overrides": len(removed)}
+
+        rows = self._exec(
+            "DELETE FROM mv_access_override WHERE report_id = :id RETURNING override_id",
+            {"id": report_id}, fetch=True)
+        self._exec("DELETE FROM mv_access_report WHERE report_id = :id", {"id": report_id})
+        return {"report_id": report_id, "deleted": True,
+                "deleted_overrides": len(rows or [])}
+
     def _get_report(self, report_id: int):
         if self.backend == "memory":
             return self._reports.get(report_id)

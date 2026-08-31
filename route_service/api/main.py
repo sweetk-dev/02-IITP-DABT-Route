@@ -748,6 +748,25 @@ def review_accessibility_report(report_id: int, req: ReportReviewRequest):
     return {**out, "overrides": stat}
 
 
+@app.delete("/report/accessibility/{report_id}", tags=["collect"],
+            dependencies=[Depends(auth)])
+def delete_accessibility_report(report_id: int):
+    """제보 삭제 — 오검·중복·시험 제보 정리용. 파생 오버라이드도 함께 사라진다.
+
+    검토(PATCH reject)는 '확인했고 사실이 아님'을 남기는 기록이고, 이쪽은 기록 자체를
+    지운다. 삭제 즉시 오버라이드를 재적용해 그래프에서 경고를 걷어낸다.
+    """
+    try:
+        out = collect_store.STORE.delete_report(report_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.warning("제보 삭제 실패: %s", e)
+        raise HTTPException(status_code=503, detail="제보 저장소를 사용할 수 없습니다")
+    stat = _apply_overrides_safe() if NET.loaded else {}
+    return {**out, "overrides": stat}
+
+
 # ────────────────────────── admin ──────────────────────────
 @app.post("/admin/reload-network", tags=["admin"], dependencies=[Depends(auth)])
 def reload_network(path: str = Query(None), version: str = Query(None)):

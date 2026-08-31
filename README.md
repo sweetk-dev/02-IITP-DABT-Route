@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.16.0 |
+| 02-IITP-DABT-Route | v1.17.0 |
 
 ## 구조
 
@@ -133,6 +133,12 @@ curl -s localhost:18100/meta/network
 | GET | `/tour/bf-spots/{id}/entrance` | **무장애 접근 지점** — 실측 출입구 > 건물 접근점 > 시설 대표점 |
 | POST | `/tour/recommend` | 장애 유형별 관광지 추천 랭킹 — `origin_lat/lng` 지정 시 **거리 오름차순**, `offset` 페이징(`total`/`has_more` 반환) |
 | GET | `/transit/access-points` | 휠체어 접근 가능한 정류장·역 |
+| POST | `/track/log` | 주행 GPS 트랙 적재 (참여자 식별자 없음 — `route_id` 익명) |
+| POST | `/report/accessibility` | 접근성 오류 제보 — 접수 즉시 '이용자 제보(미확인)' 경고 부착 |
+| GET | `/report/accessibility` | 제보 목록 (관리 콘솔용) |
+| GET | `/report/accessibility/{id}/photo` | 제보 사진 |
+| PATCH | `/report/accessibility/{id}` | 검토 — confirm(확정) / reject(기각) / apply(속성 반영, 승인제) |
+| DELETE | `/report/accessibility/{id}` | **제보 삭제** — 오검·중복·시험 제보 정리. 파생 오버라이드도 함께 사라진다 |
 | POST | `/admin/reload-network` | 그래프 무중단 교체 |
 
 ### 경로 탐색 예시
