@@ -79,6 +79,45 @@ def test_apply_is_approval_only_and_creates_attr_override():
     assert cs.list_reports()[0]["status"] == "applied"
 
 
+def test_delete_report_removes_record_and_its_overrides():
+    cs = CollectStore()
+    rid = cs.add_report(37.39, 126.9505, "curb", None, None, None, None)["report_id"]
+    assert len(cs.active_overrides()) == 1
+
+    out = cs.delete_report(rid)
+    assert out["deleted"] is True and out["deleted_overrides"] == 1
+    assert cs.list_reports() == []
+    # 기각과 달리 흔적이 남지 않는다 — retired 도 아니고 아예 없다
+    assert cs._overrides == {}
+
+
+def test_delete_report_after_apply_also_drops_attr_override():
+    cs = CollectStore()
+    rid = cs.add_report(37.39, 126.9505, "curb", None, None, None, None)["report_id"]
+    cs.review_report(rid, "apply", attr="curb_cut", value="false")
+    assert len(cs.active_overrides()) == 1
+
+    cs.delete_report(rid)
+    assert cs.active_overrides() == []
+    assert cs.list_reports() == []
+
+
+def test_delete_unknown_report_raises():
+    cs = CollectStore()
+    with pytest.raises(KeyError):
+        cs.delete_report(999)
+
+
+def test_delete_leaves_other_reports_untouched():
+    cs = CollectStore()
+    keep = cs.add_report(37.39, 126.9505, "curb", None, None, None, None)["report_id"]
+    drop = cs.add_report(37.3902, 126.9507, "steep", None, None, None, None)["report_id"]
+    cs.delete_report(drop)
+    ids = [r["report_id"] for r in cs.list_reports()]
+    assert ids == [keep]
+    assert len(cs.active_overrides()) == 1
+
+
 def test_track_log_dedupes_by_seq():
     cs = CollectStore()
     pts = [{"seq": 0, "lat": 37.39, "lng": 126.95},
@@ -207,6 +246,30 @@ def test_collect_api_end_to_end(tmp_path, monkeypatch):
             "profile": "wheelchair_manual"})
         warns = res.json()["routes"][0]["summary"]["warnings"]
         assert not any("이용자 제보" in w for w in warns)
+
+        # 삭제 → 목록에서 사라지고, 남은 오버라이드도 없다 (v1.17.0)
+        res = client.post("/report/accessibility",
+                          json={"lat": 37.3900, "lng": 126.9505, "reason": "blocked"})
+        rid2 = res.json()["report_id"]
+        res = client.post("/route/plan", json={
+            "origin": {"lat": 37.3900, "lng": 126.9500},
+            "destination": {"type": "coord", "lat": 37.3909, "lng": 126.9511},
+            "profile": "wheelchair_manual"})
+        assert any("이용자 제보" in w for w in res.json()["routes"][0]["summary"]["warnings"])
+
+        res = client.delete("/report/accessibility/%d" % rid2)
+        assert res.status_code == 200 and res.json()["deleted"] is True
+        assert all(r["report_id"] != rid2
+                   for r in client.get("/report/accessibility").json()["items"])
+        res = client.post("/route/plan", json={
+            "origin": {"lat": 37.3900, "lng": 126.9500},
+            "destination": {"type": "coord", "lat": 37.3909, "lng": 126.9511},
+            "profile": "wheelchair_manual"})
+        assert not any("이용자 제보" in w
+                       for w in res.json()["routes"][0]["summary"]["warnings"])
+
+        # 없는 제보 삭제는 404
+        assert client.delete("/report/accessibility/99999").status_code == 404
 
         # 트랙 업로드
         res = client.post("/track/log", json={
