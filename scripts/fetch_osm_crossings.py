@@ -2,7 +2,7 @@
 """OSM 횡단보도 추출 -> GeoJSON.
 
 수치지형도에 횡단보도 레이어가 없어 OSM 기존 데이터로 보완한다.
-인터넷 접근이 필요하므로 로컬 venv 에서 실행한다 (샌드박스는 overpass 차단).
+인터넷 접근이 필요하므로 로컬 venv 에서 실행한다 (외부 네트워크가 제한된 환경에서는 overpass 조회가 불가).
 
   python scripts/fetch_osm_crossings.py \
       --place "Anyang-si, Gyeonggi-do, South Korea" --out data/osm_crossings.geojson

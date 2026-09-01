@@ -10,8 +10,8 @@
 대신 보도 **중심선 위의 최근접 지점**으로 투영해 T자 접합을 만들고,
 분할·스냅은 topology.build_topology 가 처리하게 한다.
 
-샌드박스는 overpass 접근이 차단되므로 scripts/fetch_osm_crossings.py 로
-로컬(Windows venv)에서 미리 받아 GeoJSON 으로 넘긴다.
+외부 네트워크 접근이 제한된 환경에서는 scripts/fetch_osm_crossings.py 로
+로컬 실행 환경에서 미리 받아 GeoJSON 으로 넘긴다.
 """
 from __future__ import annotations
 
