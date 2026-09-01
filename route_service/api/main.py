@@ -158,6 +158,16 @@ def _resolve_destination(dest: Destination, profile, allowed=None) -> dict:
             raise HTTPException(status_code=400, detail="목적지 좌표가 없습니다")
         return {"lat": dest.lat, "lng": dest.lng, "source": "coord"}
 
+    if dest.type == "building":
+        # 이름으로 찾은 일반 시설 — 좌표가 건물 대표점이므로 출입구 해석을 거친다.
+        # coord 와 달리 "이용자가 지도에서 콕 집은 점"이 아니라 "시설"이기 때문이다.
+        if dest.lat is None or dest.lng is None:
+            raise HTTPException(status_code=400, detail="목적지 좌표가 없습니다")
+        return resolve_access_point(
+            NET, dest.lat, dest.lng, profile, BUILDINGS,
+            max_walk_m=settings.entrance_max_walk_m, allowed=allowed,
+        )
+
     if not dest.poi_id:
         raise HTTPException(status_code=400, detail="poi_id 가 필요합니다")
 
@@ -587,6 +597,90 @@ def route_get(route_id: str):
     if payload is None:
         raise HTTPException(status_code=404, detail="경로를 찾을 수 없습니다(만료되었을 수 있음)")
     return payload
+
+
+# ────────────────────────── poi 검색 ──────────────────────────
+def _in_bbox(lat, lng) -> bool:
+    """서비스 네트워크 bbox 안인지. 네트워크가 없으면 판정하지 않는다(True)."""
+    if not NET.loaded:
+        return True
+    bb = (NET.meta or {}).get("bbox") or {}
+    if bb.get("min_lat") is None:
+        return True
+    return (bb["min_lat"] <= lat <= bb["max_lat"]
+            and bb["min_lng"] <= lng <= bb["max_lng"])
+
+
+_SEARCH_TYPE_ORDER = {"tour": 0, "transit_station": 1, "building": 2}
+
+
+@app.get("/poi/search", tags=["poi"], dependencies=[Depends(auth)])
+def poi_search(
+    q: str = Query(..., min_length=1, description="장소 이름. 예: '안양시청', '노인종합복지관'"),
+    sigungu: str = Query("안양", description="관광 POI 주소 필터"),
+    limit: int = Query(8, ge=1, le=30),
+    include_outside: bool = Query(
+        False, description="서비스 범위 밖 결과도 in_service_area=false 로 함께 준다"),
+):
+    """이름으로 장소를 찾아 좌표를 돌려준다 (v1.18.0).
+
+    관광지·지하철역만으로는 이용자가 말하는 목적지(시청·복지관·도서관·학교·병원)를
+    좌표로 바꿀 수 없어, 서비스 지역 안의 장소가 "지역 밖"으로 잘못 안내됐다.
+    건물 폴리곤 이름(OSM)을 세 번째 출처로 더해 그 공백을 메운다.
+
+    ``type`` 별 목적지 지정 방법:
+      - ``tour``            -> ``{"type": "tour", "poi_id": ...}``
+      - ``transit_station`` -> ``{"type": "transit_station", "poi_id": ...}``
+      - ``building``        -> ``{"type": "building", "lat": ..., "lng": ...}``
+        (건물 접근점 해석을 거치므로 좌표를 그대로 쓰는 ``coord`` 보다 낫다)
+    """
+    items = []
+    try:
+        items.extend(poi_store.STORE.search_tour_by_name(q, sigungu=sigungu, limit=limit))
+    except Exception as e:                       # POI DB 미가용 — 나머지 출처로 계속
+        logger.warning("관광 POI 이름 검색 실패(%s) — 건물·역 결과만 제공", e)
+    try:
+        items.extend(poi_store.STORE.search_stations_by_name(q, limit=limit))
+    except Exception as e:
+        logger.warning("역 이름 검색 실패(%s)", e)
+    items.extend(BUILDINGS.search_by_name(q, limit=limit))
+
+    out, seen = [], set()
+    for it in items:
+        lat, lng = it.get("lat"), it.get("lng")
+        if lat is None or lng is None:
+            continue
+        inside = _in_bbox(lat, lng)
+        # 범위 밖 결과를 그냥 버리면 소비 측은 "찾지 못했다"와 "범위 밖이다"를 구분할 수
+        # 없다. 둘은 이용자에게 다르게 들려야 하는 사유이므로 표시해서 돌려준다.
+        if not inside and not include_outside:
+            continue
+        key = (it.get("type"), str(it.get("poi_id") or ""), round(lat, 5), round(lng, 5))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "type": it.get("type") or "tour",
+            "poi_id": it.get("poi_id"),
+            "name": it.get("name"),
+            "addr": it.get("addr"),
+            "lat": lat, "lng": lng,
+            "facilities": it.get("facilities"),
+            "in_service_area": inside,
+            "match_rank": it.get("match_rank", 9),
+        })
+    # 범위 안 결과를 항상 앞세운다 — 밖의 결과는 "왜 안 되는지" 를 말하기 위한 근거일 뿐이다
+    out.sort(key=lambda x: (not x["in_service_area"], x["match_rank"],
+                            _SEARCH_TYPE_ORDER.get(x["type"], 9),
+                            len(x["name"] or ""), x["name"] or ""))
+    return {
+        "query": q,
+        "region": (NET.meta or {}).get("region") if NET.loaded else settings.region_name,
+        "source": poi_store.STORE.source,
+        "buildings_loaded": bool(BUILDINGS.loaded),
+        "count": len(out[:limit]),
+        "items": out[:limit],
+    }
 
 
 # ────────────────────────── tour ──────────────────────────
