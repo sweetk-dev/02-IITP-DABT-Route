@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 
 from ..engine.geo import haversine_m
 
@@ -151,6 +152,27 @@ def _addr_in_sigungu(addr: str, variants: list) -> bool:
     return any(v in a for v in variants)
 
 
+def _norm_name(s: str) -> str:
+    """이름 대조용 정규화 — 공백·가운뎃점·괄호류 제거."""
+    return re.sub(r"[\s\-_·.,()]+", "", str(s or ""))
+
+
+def _name_match_rank(nq: str, name: str):
+    """완전일치 0 / 접두 1 / 부분 2 / 역방향 3 — 매칭 실패는 None."""
+    nn = _norm_name(name)
+    if not nn or not nq:
+        return None
+    if nn == nq:
+        return 0
+    if nn.startswith(nq):
+        return 1
+    if nq in nn:
+        return 2
+    if len(nn) >= 3 and nn in nq:
+        return 3
+    return None
+
+
 class PoiStore:
     def __init__(self, backend: str = "none", data_dir: str = "", dsn: str = ""):
         self.backend = backend
@@ -273,6 +295,83 @@ class PoiStore:
             "facilities": fac,
             "entrance": r.get("entrance"),
         }
+
+    def search_tour_by_name(self, q: str, sigungu: str = "", limit: int = 10) -> list:
+        """이름으로 관광 POI 를 찾는다 (v1.18.0).
+
+        ``list_tour_spots`` 는 ``accessible_facilities`` 가 채워진 행만 본다 — 무장애
+        관광지 목록이라는 용도에는 맞지만, 이용자가 말한 목적지를 좌표로 바꾸는
+        용도로는 지나치게 좁다. 이름 검색은 그 필터 없이 전체 mv_poi 를 대상으로 하되
+        지역(시·군·구) 조건은 그대로 지킨다(#26 의 "안양면" 오탐 방지).
+        """
+        key = _norm_name(q)
+        if len(key) < 2:
+            return []
+        if self.backend == "none":
+            return []
+        if self.backend == "file":
+            rows = self._load_file("tour_bf.json")
+        else:
+            variants = sigungu_variants(sigungu)
+            params = {"limit": max(limit * 20, 100), "q": "%%%s%%" % q.strip()}
+            sg_clause = ""
+            if variants:
+                ors = []
+                for i, v in enumerate(variants):
+                    ors.append(
+                        "COALESCE(address_road, '') LIKE '%%' || :sg{0} || '%%'"
+                        " OR COALESCE(address_detail, '') LIKE '%%' || :sg{0} || '%%'".format(i)
+                    )
+                    params["sg%d" % i] = v
+                sg_clause = "AND (%s)" % " OR ".join(ors)
+            rows = self._query(
+                """
+                SELECT poi_id,
+                       title AS name,
+                       COALESCE(address_road, address_detail) AS addr,
+                       latitude, longitude,
+                       detail_json->>'accessible_facilities' AS fac_text,
+                       search_filter_json->'search_filter'->>'tourist_type' AS tourist_type
+                  FROM mv_poi
+                 WHERE language_code = 'ko'
+                   AND latitude IS NOT NULL AND longitude IS NOT NULL
+                   AND title ILIKE :q
+                   {sg}
+                 LIMIT :limit
+                """.format(sg=sg_clause),
+                params,
+            )
+        out = []
+        for r in rows:
+            item = self._normalize_tour(r)
+            if item["lat"] is None:
+                continue
+            rank = _name_match_rank(key, item.get("name"))
+            if rank is None:
+                continue
+            item["match_rank"] = rank
+            out.append(item)
+        out.sort(key=lambda x: (x["match_rank"], len(x.get("name") or ""), x.get("name") or ""))
+        return out[:limit]
+
+    def search_stations_by_name(self, q: str, limit: int = 5) -> list:
+        """이름으로 지하철역을 찾는다 — "안양역", "범계" 모두 매칭."""
+        key = _norm_name(q)
+        if len(key) < 1:
+            return []
+        key = key[:-1] if key.endswith("역") and len(key) > 1 else key
+        out = []
+        for st in self._stations():
+            if st["lat"] is None:
+                continue
+            rank = _name_match_rank(key, st.get("name"))
+            if rank is None:
+                continue
+            item = dict(st)
+            item.update({"type": "transit_station", "match_rank": rank})
+            out.append(item)
+        out.sort(key=lambda x: (x["match_rank"], x.get("name") or ""))
+        return out[:limit]
 
     def get_tour_spot(self, poi_id: str):
         """ID 우선, 실패하면 이름으로도 찾는다.

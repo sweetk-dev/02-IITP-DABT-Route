@@ -20,9 +20,13 @@ class Coord(BaseModel):
 
 
 class Destination(BaseModel):
-    """좌표 직접 지정 또는 POI 지정(무장애 관광지 / 대중교통 접근점)."""
+    """좌표 직접 지정 또는 POI 지정(무장애 관광지 / 대중교통 접근점 / 이름으로 찾은 건물).
 
-    type: str = Field("coord", description="coord | tour | transit_stop | transit_station")
+    ``coord`` 는 이용자가 지도에서 직접 집은 점이라 그대로 쓰고, ``building`` 은
+    ``/poi/search`` 가 돌려준 건물 대표점이라 출입구 접근점 해석을 거친다.
+    """
+
+    type: str = Field("coord", description="coord | tour | building | transit_stop | transit_station")
     poi_id: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
