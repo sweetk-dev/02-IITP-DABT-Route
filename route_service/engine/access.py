@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import pickle
+import re
 
 from .geo import haversine_m
 from .snap import snap
@@ -38,6 +39,7 @@ class BuildingIndex:
     def __init__(self, path: str = ""):
         self.polys = []          # [(shapely Polygon, name)]
         self.loaded = False
+        self._names = None       # 이름 검색 인덱스 (지연 생성)
         if path and os.path.exists(path):
             try:
                 self.load(path)
@@ -51,6 +53,65 @@ class BuildingIndex:
             self.polys = pickle.load(f)
         self.loaded = True
         return len(self.polys)
+
+    # ── 이름으로 장소 찾기 (v1.18.0) ──
+    # 건물 폴리곤에는 OSM 이름이 함께 들어 있다(안양 9,563동 중 2,032동이 이름 보유).
+    # 관광지·역이 아닌 일반 시설 — 시청·구청·복지관·도서관·학교·병원 — 은 이 이름이
+    # 유일한 좌표 출처다. 이 인덱스가 없으면 이용자가 말한 목적지를 좌표로 바꿀 방법이
+    # 없어 "서비스 지역 밖"으로 잘못 안내된다(12번 실사용 결함).
+    @staticmethod
+    def _norm(s: str) -> str:
+        return re.sub(r"[\s\-_·.,()]+", "", str(s or ""))
+
+    def _name_index(self) -> list:
+        """[(name, norm_name, lat, lng)] — 대표점은 폴리곤 내부가 보장되는 점을 쓴다."""
+        if self._names is not None:
+            return self._names
+        idx = []
+        if self.loaded:
+            seen = set()
+            for poly, name in self.polys:
+                if not name or not str(name).strip():
+                    continue
+                try:
+                    pt = poly.representative_point()
+                except Exception:
+                    continue
+                lat, lng = round(pt.y, 7), round(pt.x, 7)
+                key = (self._norm(name), round(lat, 4), round(lng, 4))
+                if key in seen:          # 같은 시설의 분할 폴리곤 중복 제거
+                    continue
+                seen.add(key)
+                idx.append((str(name).strip(), self._norm(name), lat, lng))
+        self._names = idx
+        return idx
+
+    def search_by_name(self, q: str, limit: int = 8) -> list:
+        """이름으로 건물을 찾는다 — 완전일치 > 접두 > 부분일치 순.
+
+        질의가 이름을 포함하는 역방향 일치("안양시청 민원실" -> "안양시청")도 허용하되,
+        두 글자 이하 이름은 오탐이 많아(예: "역") 역방향 대상에서 제외한다.
+        """
+        nq = self._norm(q)
+        if len(nq) < 2:
+            return []
+        hits = []
+        for name, nname, lat, lng in self._name_index():
+            if nname == nq:
+                rank = 0
+            elif nname.startswith(nq):
+                rank = 1
+            elif nq in nname:
+                rank = 2
+            elif len(nname) >= 3 and nname in nq:
+                rank = 3
+            else:
+                continue
+            hits.append((rank, len(nname), name, lat, lng))
+        hits.sort(key=lambda x: (x[0], x[1], x[2]))
+        return [{"type": "building", "poi_id": None, "name": nm,
+                 "lat": la, "lng": ln, "match_rank": rk}
+                for rk, _l, nm, la, ln in hits[:limit]]
 
     def containing(self, lat: float, lng: float, near_m: float = 40.0):
         """점을 포함하는 건물. 없으면 near_m 이내 최근접 건물.
