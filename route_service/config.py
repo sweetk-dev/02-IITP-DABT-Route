@@ -35,6 +35,12 @@ class Settings:
         )
     )
 
+    # 실시간 버스(GBIS, 공공데이터포털 인증키 하나로 도착·위치 API 모두 호출)
+    gbis_api_key: str = os.environ.get("DATA_GO_KR_API_KEY", os.environ.get("GBIS_API_KEY", ""))
+    gbis_base_url: str = os.environ.get("GBIS_BASE_URL", "https://apis.data.go.kr/6410000")
+    gbis_timeout_sec: float = float(os.environ.get("GBIS_TIMEOUT_SEC", "3"))
+    gbis_cache_ttl_sec: float = float(os.environ.get("GBIS_CACHE_TTL_SEC", "20"))
+
     # 탐색 파라미터
     snap_max_dist_m: float = float(os.environ.get("SNAP_MAX_DIST_M", "300"))
     max_alternatives: int = int(os.environ.get("MAX_ALTERNATIVES", "2"))

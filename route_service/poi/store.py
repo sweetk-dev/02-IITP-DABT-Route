@@ -14,11 +14,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
 
 from ..engine.geo import haversine_m
+
+logger = logging.getLogger("route_api.poi")
 
 # 01-IITP-DABT-Database `poi_tour_bf_facility` 실제 컬럼 (2026-07-13 실측)
 TOUR_FIELDS = [
@@ -55,6 +58,18 @@ DISABILITY_REQUIREMENTS = {
     "청각장애": ["audio_guide_yn"],
     "영유아동반": ["nursing_room_yn", "stroller_rent_yn"],
 }
+
+
+def _yn3(v) -> str:
+    """Y/N/NULL 을 yes/no/unknown 으로. NULL 은 "없음"이 아니라 "자료 없음"이다."""
+    if v is None:
+        return "unknown"
+    t = str(v).strip().upper()
+    if t in ("Y", "YES", "TRUE", "1"):
+        return "yes"
+    if t in ("N", "NO", "FALSE", "0"):
+        return "no"
+    return "unknown"
 
 
 def _is_y(v) -> bool:
@@ -534,10 +549,17 @@ class PoiStore:
         else:
             rows = self._query(
                 """
-                SELECT stn_cd AS poi_id, stn_name AS name, latitude, longitude,
-                       elevator_cnt, wheelchair_lift_cnt, dis_toilet_yn, dis_slope_yn
-                  FROM poi_station_access_status
-                 WHERE del_yn = 'N' AND anyang_yn = 'Y'
+                SELECT s.stn_cd AS poi_id, s.stn_name AS name, s.line_name, s.latitude, s.longitude,
+                       s.elevator_cnt, s.wheelchair_lift_cnt, s.dis_slope_yn,
+                       -- 코레일 API 가 응답하지 않는 역(NULL)은 설비 단위 화장실 자료로 보완한다
+                       COALESCE(s.dis_toilet_yn,
+                                CASE WHEN EXISTS (SELECT 1 FROM poi_station_toilet_unit t
+                                                   WHERE t.stn_name = s.stn_name AND t.disabled_yn = 'Y'
+                                                     AND COALESCE(t.del_yn, 'N') = 'N'
+                                                     AND (s.line_name IS NULL OR t.line_name = s.line_name))
+                                     THEN 'Y' END) AS dis_toilet_yn
+                  FROM poi_station_access_status s
+                 WHERE s.del_yn = 'N' AND s.anyang_yn = 'Y'
                 """,
                 {},
             )
@@ -553,6 +575,10 @@ class PoiStore:
                 "elevator_cnt": int(r.get("elevator_cnt") or 0),
                 "wheelchair_lift_cnt": int(r.get("wheelchair_lift_cnt") or 0),
                 "dis_toilet_yn": _is_y(r.get("dis_toilet_yn")),
+                # NULL(자료 없음)과 N(없음)은 다르다 — 6역은 코레일 API 가 응답하지 않아 NULL 이다
+                "dis_toilet_status": _yn3(r.get("dis_toilet_yn")),
+                "dis_slope_status": _yn3(r.get("dis_slope_yn")),
+                "line": r.get("line_name") or r.get("line"),
             })
         return norm
 
@@ -675,6 +701,186 @@ class PoiStore:
                 "name": r.get("name"),
                 "mobile_no": (str(mob).strip() or None) if mob else None,
                 "lat": float(lat_v), "lng": float(lng_v),
+            })
+        return out
+
+    # ---------- 역 편의시설 (설비 단위, v1.19.0) ----------
+    _FACILITY_UNIT_TABLES = {
+        # 키: (테이블, 정렬 컬럼, 반환 컬럼)
+        "elevators": ("poi_station_elevator_unit", "unit_seq",
+                      "exit_no, detail_loc, capacity_person, capacity_kg"),
+        "lifts": ("poi_station_wheelchair_lift", "mng_no",
+                  "mng_no, exit_no, detail_loc, length_mm, width_mm, start_floor, end_floor"),
+        "toilets": ("poi_station_toilet_unit", "unit_seq",
+                    "gate_inout, exit_no, detail_loc, toilet_kind, disabled_yn, floor_no, ground_dv"),
+        "platforms": ("poi_station_platform", "platform_no",
+                      "platform_no, updown, ground_dv, floor_no, platform_connect_yn, "
+                      "screen_door_yn, safety_plate_yn, gap_min_cm, gap_max_cm, gap_avg_cm, door_cnt"),
+    }
+
+    def station_facilities(self, stn_cd: str = "", name: str = ""):
+        """역 하나의 편의시설 — 개수·유무(poi_station_access_status)에 설비 단위
+        상세(엘리베이터·리프트·화장실·승강장)를 붙인다.
+
+        개수만으로는 "어느 출입구 엘리베이터를 타라"를 말할 수 없다. 설비 단위 자료가
+        DB 에 없으면 목록이 비어 오고, 그때는 개수·유무만으로 안내한다.
+        유무 필드는 3상태(yes/no/unknown)다 — 코레일 API 가 응답하지 않는 역은 NULL 이라
+        "없음"으로 말하면 틀린다.
+        """
+        if self.backend == "none":
+            return None
+        key = _norm_name(name or "")
+        key = key[:-1] if key.endswith("역") and len(key) > 1 else key
+        if self.backend == "file":
+            for r in self._load_file("station_facilities.json"):
+                if (stn_cd and str(r.get("stn_cd")) == str(stn_cd)) or \
+                        (key and _norm_name(r.get("name") or r.get("stn_name") or "") == key):
+                    return self._norm_facilities(r)
+            return None
+        params = {"cd": stn_cd or "", "name": key or ""}
+        rows = self._query(
+            """
+            SELECT stn_cd, stn_name, line_name, latitude, longitude, anyang_yn, base_dt,
+                   elevator_cnt, escalator_cnt, wheelchair_lift_cnt,
+                   dis_slope_yn, dis_toilet_yn, gen_toilet_yn, nursing_room_yn, info_center_yn
+              FROM poi_station_access_status
+             WHERE del_yn = 'N'
+               AND ((:cd <> '' AND stn_cd = :cd) OR (:name <> '' AND stn_name = :name))
+             ORDER BY anyang_yn DESC, stn_cd
+             LIMIT 1
+            """, params)
+        if not rows:
+            return None
+        base = dict(rows[0])
+        line = base.get("line_name")
+        for k, (table, order_col, cols) in self._FACILITY_UNIT_TABLES.items():
+            sql = ("SELECT %s FROM %s WHERE del_yn = 'N' AND stn_name = :name"
+                   % (cols, table))
+            p = {"name": base["stn_name"]}
+            if line:
+                sql += " AND line_name = :line"
+                p["line"] = line
+            sql += " ORDER BY %s" % order_col
+            try:
+                base[k] = self._query(sql, p)
+            except Exception as e:          # 테이블 미생성(적재 전) — 목록만 비운다
+                logger.warning("역 설비 조회 실패 %s: %s", table, e)
+                base[k] = []
+        return self._norm_facilities(base)
+
+    @staticmethod
+    def _norm_facilities(r: dict) -> dict:
+        def _i(v):
+            return None if v is None or v == "" else int(v)
+
+        def _f(v):
+            return None if v is None or v == "" else round(float(v), 1)
+
+        def _s(v):
+            return None if v is None else (str(v).strip() or None)
+
+        elevators = [{"exit_no": _s(e.get("exit_no")), "detail_loc": _s(e.get("detail_loc")),
+                      "capacity_person": _i(e.get("capacity_person")),
+                      "capacity_kg": _i(e.get("capacity_kg"))}
+                     for e in (r.get("elevators") or [])]
+        lifts = [{"mng_no": _s(l.get("mng_no")), "exit_no": _s(l.get("exit_no")),
+                  "detail_loc": _s(l.get("detail_loc")),
+                  "length_mm": _i(l.get("length_mm")), "width_mm": _i(l.get("width_mm")),
+                  "start_floor": _s(l.get("start_floor")), "end_floor": _s(l.get("end_floor"))}
+                 for l in (r.get("lifts") or [])]
+        toilets = [{"gate_inout": _s(t.get("gate_inout")), "exit_no": _s(t.get("exit_no")),
+                    "detail_loc": _s(t.get("detail_loc")), "kind": _s(t.get("toilet_kind") or t.get("kind")),
+                    "disabled": _is_y(t.get("disabled_yn", t.get("disabled"))),
+                    "floor": _s(t.get("floor_no") or t.get("floor")),
+                    "ground": _s(t.get("ground_dv") or t.get("ground"))}
+                   for t in (r.get("toilets") or [])]
+        platforms = [{"platform_no": _s(p.get("platform_no")), "updown": _s(p.get("updown")),
+                      "ground": _s(p.get("ground_dv") or p.get("ground")),
+                      "floor": _s(p.get("floor_no") or p.get("floor")),
+                      "platform_connect": _yn3(p.get("platform_connect_yn")),
+                      "screen_door": _yn3(p.get("screen_door_yn")),
+                      "safety_plate": _yn3(p.get("safety_plate_yn")),
+                      "gap_min_cm": _f(p.get("gap_min_cm")), "gap_max_cm": _f(p.get("gap_max_cm")),
+                      "gap_avg_cm": _f(p.get("gap_avg_cm")), "door_cnt": _i(p.get("door_cnt"))}
+                     for p in (r.get("platforms") or [])]
+        lat = r.get("latitude", r.get("lat"))
+        lng = r.get("longitude", r.get("lng"))
+        ev_cnt = _i(r.get("elevator_cnt"))
+        lift_cnt = _i(r.get("wheelchair_lift_cnt"))
+        return {
+            "poi_id": str(r.get("stn_cd") or r.get("poi_id") or ""),
+            "name": r.get("stn_name") or r.get("name"),
+            "line": r.get("line_name") or r.get("line"),
+            "lat": float(lat) if lat is not None else None,
+            "lng": float(lng) if lng is not None else None,
+            "anyang": _is_y(r.get("anyang_yn", "Y")),
+            "base_dt": str(r.get("base_dt")) if r.get("base_dt") else None,
+            "counts": {
+                "elevator": ev_cnt if ev_cnt is not None else len(elevators) or None,
+                "escalator": _i(r.get("escalator_cnt")),
+                "wheelchair_lift": lift_cnt if lift_cnt is not None else len(lifts) or None,
+            },
+            "status": {
+                "dis_slope": _yn3(r.get("dis_slope_yn")),
+                "dis_toilet": ("yes" if any(t["disabled"] for t in toilets)
+                               else _yn3(r.get("dis_toilet_yn"))),
+                "gen_toilet": ("yes" if any(not t["disabled"] for t in toilets)
+                               else _yn3(r.get("gen_toilet_yn"))),
+                "nursing_room": _yn3(r.get("nursing_room_yn")),
+                "info_center": _yn3(r.get("info_center_yn")),
+                "safety_plate": ("yes" if any(p["safety_plate"] == "yes" for p in platforms)
+                                 else ("no" if platforms and all(p["safety_plate"] == "no" for p in platforms)
+                                       else "unknown")),
+            },
+            "elevators": elevators,
+            "lifts": lifts,
+            "toilets": toilets,
+            "platforms": platforms,
+        }
+
+    def stop_route_meta(self, station_id) -> dict:
+        """정류장을 지나는 노선의 정적 메타 {route_id: {name,type,end_station}} —
+        실시간 도착정보에 노선 유형·종점명을 덧입히는 데 쓴다."""
+        out = {}
+        for s in self._stops(poi_id=str(station_id)):
+            for r in s.get("routes") or []:
+                if isinstance(r, dict) and r.get("route_id") is not None:
+                    out[str(r["route_id"])] = {"name": r.get("name"), "type": r.get("type"),
+                                               "end_station": r.get("end_station")}
+        return out
+
+    def route_stops(self, route_id) -> list:
+        """노선의 전 경유 정류장(순번 오름차순, station_id 포함) — 차량 위치를 정류장에 붙인다."""
+        if self.backend == "none":
+            return []
+        if self.backend == "file":
+            rows = [r for r in self._load_file("transit_route_paths.json")
+                    if str(r.get("route_id")) == str(route_id)]
+            rows.sort(key=lambda r: int(r.get("station_seq", 0)))
+        else:
+            rows = self._query(
+                """
+                SELECT rs.station_seq, rs.station_id, s.station_name AS name, s.mobile_no,
+                       s.latitude, s.longitude
+                  FROM tran_bus_route_station rs
+                  JOIN tran_bus_station_info s ON s.station_id = rs.station_id
+                 WHERE rs.route_id = :route_id
+                   AND COALESCE(rs.del_yn, 'N') = 'N'
+                   AND COALESCE(s.del_yn, 'N') = 'N'
+                 ORDER BY rs.station_seq
+                """, {"route_id": route_id})
+        out = []
+        for r in rows:
+            lat_v = r.get("lat", r.get("latitude"))
+            lng_v = r.get("lng", r.get("longitude"))
+            mob = r.get("mobile_no")
+            out.append({
+                "station_id": str(r.get("station_id") or r.get("poi_id") or ""),
+                "station_seq": int(r.get("station_seq") or 0),
+                "name": r.get("name"),
+                "mobile_no": (str(mob).strip() or None) if mob else None,
+                "lat": float(lat_v) if lat_v is not None else None,
+                "lng": float(lng_v) if lng_v is not None else None,
             })
         return out
 

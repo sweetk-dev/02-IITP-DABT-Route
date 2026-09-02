@@ -27,6 +27,7 @@ from ..engine.steps import build_steps
 from ..collect import store as collect_store
 from ..engine.overrides import apply_overrides
 from ..poi import store as poi_store
+from ..transit import gbis_live
 from ..transit import planner as transit
 from .schemas import (
     AccessReportRequest,
@@ -57,6 +58,8 @@ def _apply_overrides_safe() -> dict:
 async def lifespan(_app: FastAPI):
     poi_store.configure(settings)
     collect_store.configure(settings)
+    gbis_live.LIVE = gbis_live.configure(settings)
+    logger.info("GBIS 실시간: %s", "사용" if gbis_live.LIVE.enabled else "인증키 없음(비활성)")
     global BUILDINGS, ENTRANCES
     BUILDINGS = BuildingIndex(settings.buildings_path)
     ENTRANCES = ManualEntrances(settings.entrances_path)
@@ -124,6 +127,7 @@ def health():
         "version": __version__,
         "graph_loaded": NET.loaded,
         "poi_backend": poi_store.STORE.source,
+        "bus_realtime": gbis_live.LIVE.enabled,
     }
 
 
@@ -342,7 +346,7 @@ def _bus_leg(part):
                 "center_yn": bool(s.get("center_yn"))}
     return {
         "kind": "bus",
-        "route": {"route_id": route["route_id"], "name": route.get("name"),
+        "route": {"route_id": str(route["route_id"]), "name": route.get("name"),
                   "type": route.get("type"), "end_station": route.get("end_station")},
         "board": _stop(part["board"], part["seq_from"]),
         "alight": _stop(part["alight"], part["seq_to"]),
@@ -409,16 +413,85 @@ def _transit_step(leg, boarding: bool) -> dict:
             instruction = "%s역에서 하차합니다" % leg["alight"]["name"]
             coord = [leg["alight"]["lat"], leg["alight"]["lng"]]
             maneuver = "subway_alight"
+    leg_ref = {"kind": leg["kind"]}
+    if leg["kind"] == "bus":
+        leg_ref.update({"route_id": str(leg["route"]["route_id"]),
+                        "route_name": leg["route"].get("name"),
+                        "board_station_id": str(leg["board"]["poi_id"]),
+                        "board_name": leg["board"]["name"],
+                        "alight_station_id": str(leg["alight"]["poi_id"])})
+    else:
+        leg_ref.update({"line": leg.get("line"),
+                        "board_station_id": str(leg["board"]["poi_id"]),
+                        "alight_station_id": str(leg["alight"]["poi_id"])})
     return {"maneuver": maneuver, "instruction": instruction,
             "distance_m": 0 if not boarding else leg["est_distance_m"],
             "duration_sec": 0 if not boarding else leg["est_duration_sec"],
             "coord": [round(coord[0], 7), round(coord[1], 7)],
             "link_type": leg["kind"], "link_name": None,
+            "leg_ref": leg_ref,
             "warnings": leg["warnings"] if boarding else []}
 
 
+def _station_brief(poi_id: str, name: str) -> dict:
+    """지하철 leg 승·하차 역의 설비 요약 — 승강기 출입구·리프트·장애인화장실(3상태)."""
+    try:
+        fac = poi_store.STORE.station_facilities(stn_cd=poi_id, name=name)
+    except Exception as e:
+        logger.warning("역 설비 조회 실패 %s: %s", name, e)
+        fac = None
+    if not fac:
+        return {}
+    return {
+        "elevators": [{"exit_no": e["exit_no"], "detail_loc": e["detail_loc"]}
+                      for e in fac["elevators"][:6]],
+        "lifts": [{"exit_no": l["exit_no"], "detail_loc": l["detail_loc"]} for l in fac["lifts"][:4]],
+        "dis_toilet": fac["status"]["dis_toilet"],
+        "safety_plate": fac["status"]["safety_plate"],
+        "elevator_cnt": fac["counts"]["elevator"],
+        "wheelchair_lift_cnt": fac["counts"]["wheelchair_lift"],
+    }
+
+
+def _attach_realtime(legs: list, realtime: bool) -> None:
+    """최종 선택된 legs 에 실시간·설비 정보를 붙인다.
+
+    - 버스: realtime=true 면 승차 정류장 도착정보(해당 노선만) — 저상 차량이 확인되면
+      고정 경고(LOW_BUS_WARNING)를 실측 문구로 바꾼다. 실패하면 경고를 그대로 둔다.
+    - 지하철: 승·하차 역 설비 요약(정적) — 항상 붙인다(자료 없으면 빈 dict).
+    """
+    for leg in legs:
+        if leg["kind"] == "bus":
+            if not realtime:
+                continue
+            board = leg["board"]
+            rid = leg["route"]["route_id"]
+            try:
+                meta = poi_store.STORE.stop_route_meta(board["poi_id"])
+            except Exception:
+                meta = {}
+            live = gbis_live.LIVE.arrivals(board["poi_id"], route_id=rid, route_meta=meta)
+            leg["realtime"] = live
+            nlf = live.get("next_low_floor")
+            if live.get("status") == "success":
+                if nlf:
+                    leg["warnings"] = [w for w in leg["warnings"] if w != LOW_BUS_WARNING]
+                    leg["warnings"].insert(0, "저상버스 %s번이 약 %d분 뒤 도착 예정입니다(%s 정거장 전) — "
+                                              "실시간 정보라 변동될 수 있습니다"
+                                           % (nlf.get("route_name") or rid, nlf["predict_min"],
+                                              nlf.get("stops_away") if nlf.get("stops_away") is not None else "?"))
+                elif live.get("items"):
+                    leg["warnings"] = [w for w in leg["warnings"] if w != LOW_BUS_WARNING]
+                    leg["warnings"].insert(0, "지금 오는 차량은 저상버스가 아닙니다 — "
+                                              "다음 저상 차량은 도착정보에서 다시 확인하세요")
+        elif leg["kind"] == "subway":
+            for key in ("board", "alight"):
+                st = leg[key]
+                st["facilities"] = _station_brief(st["poi_id"], st["name"])
+
+
 def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
-                     mode: str, constraints=None) -> dict:
+                     mode: str, constraints=None, realtime: bool = False) -> dict:
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
     profile = _profile_or_400(profile_id)
@@ -469,6 +542,8 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             status_code=422,
             detail="대중교통 접근 도보 경로를 만들 수 없습니다 (%s)" % last_err,
         )
+
+    _attach_realtime(legs, realtime)
 
     # ── 통합 요약·geometry·steps ──
     walk_legs = [l for l in legs if l["kind"] == "walk"]
@@ -554,7 +629,7 @@ def route_plan(req: PlanRequest):
     if req.mode in ("walk_bus", "walk_bus_subway"):
         return _plan_multimodal(
             req.origin.lat, req.origin.lng, req.destination,
-            req.profile, req.mode, req.constraints,
+            req.profile, req.mode, req.constraints, realtime=req.realtime,
         )
     if req.mode not in ("", "walk", None):
         raise HTTPException(status_code=400,
@@ -761,6 +836,69 @@ def transit_access_points(
     _profile_or_400(profile)
     items = poi_store.STORE.list_transit_access(lat, lng, radius_m, profile, limit)
     return {"source": poi_store.STORE.source, "count": len(items), "items": items}
+
+
+@app.get("/transit/bus/arrivals", tags=["transit"], dependencies=[Depends(auth)])
+def transit_bus_arrivals(
+    station_id: str = Query(..., description="GBIS 정류소 ID (tran_bus_station_info.station_id)"),
+    route_id: str = Query("", description="지정 시 그 노선만 남긴다(경로 안내 중 승차 노선 확인)"),
+):
+    """정류장 실시간 도착정보 — 노선별 1·2번째 차량의 도착 예정(분)·정거장 수·**저상 여부**.
+
+    `next_low_floor` 가 가장 빨리 오는 저상 차량이다. 없으면 null — "저상버스가 없다"가
+    아니라 "지금 도착정보에 잡힌 두 대 안에는 없다"는 뜻이다(3번째 이후는 위치정보로 본다).
+    실시간 조회에 실패하면 `status: unavailable` 로 답하고 경로 안내 자체는 막지 않는다.
+    """
+    try:
+        meta = poi_store.STORE.stop_route_meta(station_id)
+    except Exception as e:
+        logger.warning("정류장 노선 메타 조회 실패 %s: %s", station_id, e)
+        meta = {}
+    out = gbis_live.LIVE.arrivals(station_id, route_id=route_id or None, route_meta=meta)
+    out["source"] = "gbis"
+    return out
+
+
+@app.get("/transit/bus/locations", tags=["transit"], dependencies=[Depends(auth)])
+def transit_bus_locations(
+    route_id: str = Query(..., description="GBIS 노선 ID (tran_bus_route_info.route_id)"),
+):
+    """노선 실시간 차량 위치 — 운행 중인 전 차량의 현재 정류장(순번·이름·좌표)과 저상 여부.
+
+    도착정보가 2대까지만 보여 주므로, 그 뒤에 오는 저상 차량을 찾거나 지도에 버스 아이콘을
+    그릴 때 쓴다. 정류장 좌표는 정적 DB 의 경유정류소를 순번으로 조인한다.
+    """
+    try:
+        idx = {s["station_id"]: s for s in poi_store.STORE.route_stops(route_id)}
+    except Exception as e:
+        logger.warning("노선 경유 정류장 조회 실패 %s: %s", route_id, e)
+        idx = {}
+    out = gbis_live.LIVE.locations(route_id, stop_index=idx)
+    out["source"] = "gbis"
+    return out
+
+
+@app.get("/transit/station/facilities", tags=["transit"], dependencies=[Depends(auth)])
+def transit_station_facilities(
+    stn_cd: str = Query("", description="역 코드(poi_station_access_status.stn_cd)"),
+    name: str = Query("", description="역 이름 — '범계역', '범계' 모두 가능"),
+):
+    """역 편의시설 — 승강기·리프트(출입구·상세위치), 화장실(게이트 안/밖·출구), 승강장
+    (안전발판·스크린도어·열차 이격거리). 유무는 3상태(yes/no/unknown)다.
+
+    개수만 있던 `poi_station_access_status` 에 설비 단위 자료(국가철도공단 파일)를 붙였다.
+    "엘리베이터 3대"가 아니라 "1번 출구 옆 엘리베이터로 올라가 승강장 4-3 출입문 앞
+    엘리베이터를 타라"를 말하기 위한 자료다. 실시간 가동 여부는 제공기관 API 가 없어
+    싣지 않는다.
+    """
+    if not stn_cd and not name.strip():
+        raise HTTPException(status_code=400, detail="stn_cd 또는 name 이 필요합니다")
+    fac = poi_store.STORE.station_facilities(stn_cd=stn_cd, name=name)
+    if fac is None:
+        raise HTTPException(status_code=404, detail="역을 찾을 수 없습니다 (poi_backend=%s)"
+                            % poi_store.STORE.source)
+    fac["source"] = poi_store.STORE.source
+    return fac
 
 
 # ────────────────────────── collect (수집 장치화) ──────────────────────────
