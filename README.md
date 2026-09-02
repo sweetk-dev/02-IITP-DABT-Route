@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.18.0 |
+| 02-IITP-DABT-Route | v1.19.0 |
 
 ## 구조
 
@@ -132,7 +132,10 @@ curl -s localhost:18100/meta/network
 | GET | `/tour/bf-spots/{id}` | 관광지 상세 (편의시설 Y/N) |
 | GET | `/tour/bf-spots/{id}/entrance` | **무장애 접근 지점** — 실측 출입구 > 건물 접근점 > 시설 대표점 |
 | POST | `/tour/recommend` | 장애 유형별 관광지 추천 랭킹 — `origin_lat/lng` 지정 시 **거리 오름차순**, `offset` 페이징(`total`/`has_more` 반환) |
-| GET | `/transit/access-points` | 휠체어 접근 가능한 정류장·역 |
+| GET | `/transit/access-points` | 휠체어 접근 가능한 정류장·역 (역 화장실·경사로 유무는 3상태) |
+| GET | `/transit/bus/arrivals` | **정류장 실시간 도착정보** — 노선별 1·2번째 차량의 도착 예정·정거장 수·**저상 여부**, `next_low_floor` |
+| GET | `/transit/bus/locations` | **노선 실시간 차량 위치** — 운행 차량의 현재 정류장(좌표 조인)·저상 여부 |
+| GET | `/transit/station/facilities` | **역 편의시설(설비 단위)** — 승강기·리프트 출입구/상세위치, 화장실(게이트 안/밖), 승강장(안전발판·이격거리) |
 | POST | `/track/log` | 주행 GPS 트랙 적재 (참여자 식별자 없음 — `route_id` 익명) |
 | POST | `/report/accessibility` | 접근성 오류 제보 — 접수 즉시 '이용자 제보(미확인)' 경고 부착 |
 | GET | `/report/accessibility` | 제보 목록 (관리 콘솔용) |
@@ -227,8 +230,33 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
 보행 경로를 제공한다.
 
 - 목적지 유형 `transit_station`: 지하철역 — 승강설비(엘리베이터/리프트) 보유 여부로 접근성 판정
-- 목적지 유형 `transit_stop`: 버스 정류장 — 저상버스 정차 여부는 정적 데이터에 없으므로
-  실시간 도착정보(GBIS `lowPlate`)로 확인해야 한다
+- 목적지 유형 `transit_stop`: 버스 정류장 — 저상버스 정차 여부는 정적 데이터에 없다.
+  **v1.19.0 부터 실시간 도착정보(GBIS `lowPlate`)를 서비스가 직접 조회한다** — 아래 "실시간 버스" 참고
+
+### 실시간 버스 (v1.19.0)
+
+경기버스정보(GBIS) 공공데이터포털 API 두 종을 `DATA_GO_KR_API_KEY` 하나로 호출한다.
+
+| 엔드포인트 | 원천 | 쓰임 |
+|---|---|---|
+| `GET /transit/bus/arrivals?station_id=&route_id=` | 버스도착정보 조회(`getBusArrivalListv2`) | 승차 정류장에 오는 노선별 1·2번째 차량의 도착 예정(분)·몇 정거장 전·**저상 여부**. `next_low_floor` = 가장 빨리 오는 저상 차량 |
+| `GET /transit/bus/locations?route_id=` | 버스위치정보 조회(`getBusLocationListv2`) | 노선 전 차량의 현재 정류장 순번·저상 여부. 정적 경유정류소와 조인해 좌표를 붙인다 |
+| `POST /route/plan` + `realtime: true` | 위 도착정보 | 버스 leg 의 승차 정류장 도착정보를 `legs[].realtime` 에 싣고, 저상 차량이 확인되면 고정 경고를 실측 문구로 바꾼다 |
+
+- 실시간 조회 실패는 `status: unavailable` 로 답하고 **경로 안내는 막지 않는다**(고정 경고 유지).
+- 같은 정류장·노선의 반복 폴링은 20초 TTL 캐시로 흡수한다(`GBIS_CACHE_TTL_SEC`). 개발계정 도착정보 한도는 1,000회/일이다.
+- `next_low_floor` 가 `null` 인 것은 "저상버스가 없다"가 아니라 "도착정보에 잡힌 두 대 안에는 없다"는 뜻이다. 3번째 이후 차량은 위치정보로 본다.
+- 스텝(`bus_board`/`bus_alight`)에 `leg_ref{route_id, board_station_id, alight_station_id}` 가 실린다 — 클라이언트가 안내 중 폴링할 키다.
+
+### 역 편의시설 — 설비 단위 (v1.19.0)
+
+`poi_station_access_status` 는 역별 **개수·유무**뿐이었다. 국가철도공단 파일(01 v1.3.0 테이블 3종
+`poi_station_elevator_unit` / `poi_station_toilet_unit` / `poi_station_platform` + 기존 `poi_station_wheelchair_lift`)을
+붙여 `GET /transit/station/facilities?name=범계역` 이 **어느 출입구의 엘리베이터인지, 장애인화장실이 게이트 안인지 밖인지,
+승강장에 안전발판이 있는지, 열차와의 이격거리가 몇 cm 인지**까지 답한다. 지하철 leg 의 `board`/`alight` 에도 요약(`facilities`)이 붙는다.
+
+유무 필드는 **3상태**(`yes` / `no` / `unknown`)다. 코레일 편의시설 API 는 안양역만 응답하고 나머지 6역은 `NULL` 이라,
+`unknown` 을 "없음"으로 말하면 틀린다. 실시간 승강기 가동 여부는 코레일이 제공하지 않아 싣지 않는다.
 
 ### 접근성 판정은 3상태다
 
@@ -270,7 +298,7 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
 | 보행 네트워크 | **OSM 안양 보행망** — 노드 6,750 / 링크 9,712 | 원본(node/link) 수령 시 `--source tabular` 로 재구축 후 `/admin/reload-network` — API 스키마 불변 |
 | 경사 | **5m DEM** — 1:5,000 수치지형도 등고선(주곡선 5m)을 보간해 생성 (`scripts/dem_from_contours.py`) | 공개DEM 90m(`.img`)도 그대로 사용 가능. DEM 이 아예 없으면 `--elevation terrain`(공개 지형 타일, 인증 불필요) |
 | 무장애 관광지 | 01-IITP-DABT-Database `mv_poi` 정본 (`POI_BACKEND=db`) — 한국어 시설 문구를 `*_yn` 체계로 정규화(`MVPOI_FACILITY_MAP`), **안양 31건 실측** | 08 파이프라인이 수집·적재. 적재 전에는 `file`/`none` 백엔드로 기동 가능 |
-| 역·정류장 | `poi_station_access_status` 등 — **미적재** | 적재 전까지 `/transit/access-points` 는 빈 결과 |
+| 역·정류장 | `poi_station_access_status` 412역(안양 7역) + `tran_bus_station_info` 3,496 + 설비 단위 3종(v1.19.0) | 실시간 저상 여부는 GBIS 도착·위치 API |
 
 ### 안양 그래프 실측 (v1.3.0)
 
