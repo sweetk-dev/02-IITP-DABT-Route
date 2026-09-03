@@ -221,7 +221,7 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
     # 실제로는 갈 수 있는 목적지가 "경로 없음" 이 되므로, 스냅 후보를 최대 연결요소로 제한한다.
     # 제약 완화(폴백) 범위까지 고려해 여유 경사를 더한 기준으로 계산한다.
     relax_margin = 4.0 if (constraints is None or constraints.relax_if_no_route) else 0.0
-    allowed = NET.reachable_nodes(profile, profile.max_slope_deg + relax_margin)
+    allowed = NET.reachable_nodes(profile, profile.hard_slope() + relax_margin)   # 하드 상한 기준 (v1.20.0)
 
     target = _resolve_destination(dest, profile, allowed)
 
@@ -331,9 +331,19 @@ def _walk_leg(frm, to, profile, allowed, label_from, label_to):
 def _bus_leg(part):
     route = part["route"]
     path = poi_store.STORE.route_stop_path(route["route_id"], part["seq_from"], part["seq_to"])
-    geometry = [[round(s["lat"], 7), round(s["lng"], 7)] for s in path]
+    stop_geom = [[round(s["lat"], 7), round(s["lng"], 7)] for s in path]
+    # 지도선은 GBIS 노선형상(실제 차로)을 승·하차 정류장 사이로 잘라 쓴다 (v1.20.0).
+    # 형상을 못 받거나 정류장이 형상에 붙지 않으면 종전대로 정류장 직선.
+    geometry, geometry_source = stop_geom, "stops"
+    try:
+        line = gbis_live.LIVE.route_line(route["route_id"]) if gbis_live.LIVE.enabled else []
+        seg = gbis_live.LIVE.slice_line(line, part["board"], part["alight"]) if line else []
+        if len(seg) >= 2:
+            geometry, geometry_source = [[round(a, 7), round(b, 7)] for a, b in seg], "gbis_line"
+    except Exception as e:                       # 지도선은 부가 정보 — 경로 안내를 막지 않는다
+        logger.warning("노선형상 적용 실패 route_id=%s — %s", route["route_id"], e)
     dist = 0.0
-    for a, b in zip(geometry[:-1], geometry[1:]):
+    for a, b in zip(stop_geom[:-1], stop_geom[1:]):
         dist += transit.haversine_m(a[0], a[1], b[0], b[1])
     warnings = [LOW_BUS_WARNING]
     for key, s in (("board", part["board"]), ("alight", part["alight"])):
@@ -354,6 +364,7 @@ def _bus_leg(part):
         "stops": [{"name": s["name"], "mobile_no": s["mobile_no"], "lat": s["lat"],
                    "lng": s["lng"], "station_seq": s["station_seq"]} for s in path],
         "geometry": geometry,
+        "geometry_source": geometry_source,
         "est_distance_m": round(dist),
         "est_duration_sec": part["stop_cnt"] * transit.BUS_SEC_PER_STOP,
         "warnings": warnings,
@@ -496,7 +507,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
     profile = _profile_or_400(profile_id)
     relax_margin = 4.0
-    allowed = NET.reachable_nodes(profile, profile.max_slope_deg + relax_margin)
+    allowed = NET.reachable_nodes(profile, profile.hard_slope() + relax_margin)
     target = _resolve_destination(dest, profile, allowed)
 
     cands = transit.search(
@@ -658,7 +669,7 @@ def route_snap(req: SnapRequest):
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
     profile = _profile_or_400(req.profile) if req.profile else None
-    allowed = NET.reachable_nodes(profile, profile.max_slope_deg + 4.0) if profile else None
+    allowed = NET.reachable_nodes(profile, profile.hard_slope() + 4.0) if profile else None
     try:
         return snap(NET, req.lat, req.lng, profile,
                     req.max_dist_m or settings.snap_max_dist_m, allowed=allowed)
@@ -801,7 +812,7 @@ def tour_spot_entrance(poi_id: str, profile: str = Query("wheelchair_manual")):
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
 
-    allowed = NET.reachable_nodes(p, p.max_slope_deg + 4.0)
+    allowed = NET.reachable_nodes(p, p.hard_slope() + 4.0)
     acc = resolve_access_point(NET, spot["lat"], spot["lng"], p, BUILDINGS,
                                max_walk_m=settings.entrance_max_walk_m, allowed=allowed)
     acc["note"] = _entrance_note(acc)

@@ -10,6 +10,15 @@ from .geo import bearing_deg, haversine_m, turn_angle
 from .graph import edge_coords
 from .profiles import Profile
 
+# 짧은 링크의 DEM 경사는 추정치로만 안내한다 (planner.SHORT_LINK_M 과 동일, v1.20.0)
+SHORT_LINK_M = 15.0
+# 점자블록 안내가 의미 있는 프로필 — 휠체어 안내에 '점자블록 없음'이 붙던 결함 수정 (v1.20.0)
+TACTILE_PROFILES = ("visual",)
+
+
+def tactile_for(profile) -> bool:
+    return bool(profile) and getattr(profile, "id", None) in TACTILE_PROFILES
+
 # 회전 임계각(도)
 SLIGHT = 20.0
 TURN = 45.0
@@ -52,9 +61,13 @@ def _maneuver_from_angle(angle: float) -> str:
 def _edge_warnings(data: dict, profile: Profile) -> list:
     out = []
     slope = float(data["slope"])
+    short = float(data.get("length") or 0.0) < SHORT_LINK_M
     if slope > profile.max_slope_deg:
-        out.append("경사 %.1f도 (권장 %.1f도 초과)" % (slope, profile.max_slope_deg))
-    elif slope >= profile.max_slope_deg * 0.75 and slope > 0:
+        if short:
+            out.append("짧은 구간 경사 추정 %.1f도" % slope)   # 격자 보간 오차 가능 — 확정 표현을 피한다 (v1.20.0)
+        else:
+            out.append("경사 %.1f도 (권장 %.1f도 초과)" % (slope, profile.max_slope_deg))
+    elif slope >= profile.max_slope_deg * 0.75 and slope > 0 and not short:
         out.append("경사 %.1f도 구간" % slope)
     if data["link_type"] == "crossing" and data.get("curb_cut") is False:
         out.append("턱낮춤 없음")
@@ -67,7 +80,7 @@ def _edge_warnings(data: dict, profile: Profile) -> list:
     return out
 
 
-def _node_crosswalk_step(G, node, position: str = "mid") -> dict | None:
+def _node_crosswalk_step(G, node, position: str = "mid", profile=None) -> dict | None:
     """노드에 지점 부착된 횡단보도의 안내 스텝(안내 전용 계층).
 
     안양시 원천 횡단보도 2,728건 중 다수는 crossing 링크가 아니라 최근접 노드에
@@ -91,8 +104,8 @@ def _node_crosswalk_step(G, node, position: str = "mid") -> dict | None:
         warnings.append("턱낮춤 없음")
     elif curb is None:
         warnings.append("턱낮춤 미상")
-    if attrs.get("cw_tactile_paving") is False:
-        warnings.append("점자블록 없음")
+    if attrs.get("cw_tactile_paving") is False and tactile_for(profile):
+        warnings.append("점자블록 없음")   # 시각장애 프로필에서만 (v1.20.0)
     many = "" if cnt == 1 else " %d개" % cnt
     if position == "start":
         base = "출발 지점에 횡단보도%s가 있습니다." % many
@@ -199,7 +212,7 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
         # 노드 부착 횡단보도 안내 — 경로 중간 노드(seg 시작점).
         # 앞뒤 어느 한쪽이 crossing 링크면 링크 스텝이 이미 횡단을 안내하므로 생략(중복 방지).
         if i > 0 and lt != "crossing" and raw[i - 1]["data"]["link_type"] != "crossing":
-            cw = _node_crosswalk_step(G, seg["u"])
+            cw = _node_crosswalk_step(G, seg["u"], profile=profile)
             if cw is not None:
                 cw.update({"idx": len(steps), "_cw_point": True,
                            "_link_type": None, "_maneuver_special": True})
@@ -241,7 +254,7 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
         # 출발 지점 부착분 — depart 스텝 뒤에 정보형으로 안내 (2-노드 경로 등에서
         # 부착 노드가 출발점이면 중간 노드 안내만으로는 통째로 침묵하게 된다).
         if i == 0 and lt != "crossing":
-            cw = _node_crosswalk_step(G, seg["u"], position="start")
+            cw = _node_crosswalk_step(G, seg["u"], position="start", profile=profile)
             if cw is not None:
                 cw.update({"idx": len(steps), "_cw_point": True,
                            "_link_type": None, "_maneuver_special": True})
@@ -277,7 +290,7 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
 
     # 도착 지점 부착분 — arrive 직전에 정보형으로 안내.
     if raw[-1]["data"]["link_type"] != "crossing":
-        cw = _node_crosswalk_step(G, raw[-1]["v"], position="end")
+        cw = _node_crosswalk_step(G, raw[-1]["v"], position="end", profile=profile)
         if cw is not None:
             cw["idx"] = len(out)
             out.append(cw)

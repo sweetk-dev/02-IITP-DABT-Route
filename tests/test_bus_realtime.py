@@ -284,7 +284,8 @@ def test_plan_without_realtime_keeps_fixed_warning(client):
     bus = [l for l in r.json()["routes"][0]["legs"] if l["kind"] == "bus"][0]
     assert "realtime" not in bus
     assert any("보장되지 않습니다" in w for w in bus["warnings"])
-    assert client.live.calls == [], "realtime 미요청이면 외부 호출이 없어야 한다"
+    # 노선형상(정적, 지도선용)은 realtime 과 무관하게 조회한다 (v1.20.0) — 도착정보 호출만 없어야 한다
+    assert [c for c in client.live.calls if "busarrivalservice" in c] == [], "realtime 미요청이면 도착정보 호출이 없어야 한다"
 
 
 def test_plan_realtime_failure_keeps_fixed_warning(client):
@@ -310,3 +311,36 @@ def test_subway_leg_carries_station_facilities(client):
     assert subs, "지하철 leg 없음"
     b = subs[0]["board"]["facilities"]
     assert b["elevators"] and b["dis_toilet"] in ("yes", "no", "unknown")
+
+
+# ── v1.20.0 노선형상 — 버스 구간 지도선 ──────────────────────────
+LINE_OK = {"response": {"msgHeader": {"resultCode": 0},
+                        "msgBody": {"busRouteLineList": [
+                            {"lineSeq": 3, "x": "126.9532", "y": "37.3922"},
+                            {"lineSeq": 1, "x": "126.9500", "y": "37.3900"},
+                            {"lineSeq": 2, "x": "126.9515", "y": "37.3912"}]}}}
+
+
+def test_route_line_sorted_by_seq_and_cached():
+    live = _live({"getBusRouteLineListv2": LINE_OK})
+    line = live.route_line("208000096")
+    assert line == [[37.39, 126.95], [37.3912, 126.9515], [37.3922, 126.9532]]
+    live.route_line("208000096")
+    assert len(live.calls) == 1, "형상은 캐시돼야 한다"
+
+
+def test_route_line_unavailable_is_empty():
+    live = _live({"getBusRouteLineListv2": TimeoutError("t")})
+    assert live.route_line("208000096") == []
+
+
+def test_slice_line_between_stops_and_fallback_conditions():
+    line = [[37.3900, 126.9500], [37.3912, 126.9515], [37.3922, 126.9532], [37.3930, 126.9545]]
+    board = {"lat": 37.3901, "lng": 126.9501}
+    alight = {"lat": 37.3921, "lng": 126.9531}
+    seg = gbis_live.GbisLive.slice_line(line, board, alight)
+    assert seg[0] == [37.3901, 126.9501] and seg[-1] == [37.3921, 126.9531]
+    assert [37.3912, 126.9515] in seg
+    assert gbis_live.GbisLive.slice_line(line, alight, board) == [], "역방향(편도 형상)은 폴백"
+    assert gbis_live.GbisLive.slice_line(line, {"lat": 37.40, "lng": 126.99}, alight) == [], "형상에서 먼 정류장은 폴백"
+    assert gbis_live.GbisLive.slice_line([], board, alight) == []

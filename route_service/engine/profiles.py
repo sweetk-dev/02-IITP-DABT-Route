@@ -5,7 +5,10 @@
 이용자 특성에 따라 통행 가능 경사·회피 대상·최소 보도폭·보행 속도가 달라지므로
 프로필로 분리한다.
 
-- max_slope_deg : 이 값을 넘는 링크는 통행 불가로 간주(1차 필터)
+- max_slope_deg : 권장 경사 상한. 넘는 링크는 비용을 가중(slope_over_penalty)하고 경고를 붙인다
+- hard_slope_deg: 이 값을 넘는 링크는 통행 불가(하드 필터). 0 이면 max_slope_deg 와 같다.
+  v1.20.0 — 종전에는 max_slope_deg 가 하드 필터였다. 등고선 기반 5m DEM 은 짧은 링크에서 경사가 튀어
+  실제로는 평탄한 직행로(안양문화원→안양세무서 정류장 205m)가 잘리고 649m 우회가 나왔다(실증 2026-09-03).
 - avoid         : 통행 불가 link_type (계단·육교 등)
 - penalize      : 통행은 가능하나 비용을 가중하는 link_type -> 가중치 배수
 - min_width_m   : 유효 보도폭 하한(데이터에 width 가 있을 때만 적용)
@@ -28,12 +31,19 @@ class Profile:
     penalize: dict = field(default_factory=dict)
     min_width_m: float = 0.0
     requires_curb_cut: bool = False
+    hard_slope_deg: float = 0.0          # 0 = max_slope_deg 와 동일 (v1.20.0)
+    slope_over_penalty: float = 1.0      # 권장 초과 1도당 비용 가중 배수 증가분 (v1.20.0)
+
+    def hard_slope(self) -> float:
+        """통행 불가 경사 상한 — 권장 상한보다 낮게는 잡히지 않는다(제약으로 max 를 올리면 같이 올라간다)."""
+        return max(float(self.hard_slope_deg or 0.0), float(self.max_slope_deg))
 
     def to_dict(self) -> dict:
         return {
             "id": self.id,
             "label": self.label,
             "max_slope_deg": self.max_slope_deg,
+            "hard_slope_deg": self.hard_slope(),
             "speed_mps": self.speed_mps,
             "avoid": list(self.avoid),
             "min_width_m": self.min_width_m,
@@ -54,6 +64,8 @@ PROFILES = {
         penalize={"crossing": 1.2, "ramp": 1.1, "road": 1.25, "unknown": 1.1},
         min_width_m=0.9,
         requires_curb_cut=True,
+        hard_slope_deg=8.0,
+        slope_over_penalty=1.0,
     ),
     "wheelchair_electric": Profile(
         id="wheelchair_electric",
@@ -65,6 +77,8 @@ PROFILES = {
         penalize={"crossing": 1.1, "road": 1.2, "unknown": 1.1},
         min_width_m=0.9,
         requires_curb_cut=True,
+        hard_slope_deg=10.0,
+        slope_over_penalty=0.6,
     ),
     "crutch": Profile(
         id="crutch",

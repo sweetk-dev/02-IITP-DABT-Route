@@ -21,6 +21,9 @@ from .profiles import Profile
 # "안내에는 유턴으로 뜨는데 탐색은 못 잡는" 불일치가 안 생긴다.
 UTURN_ANGLE_DEG = 150.0
 UTURN_RETRY = 3
+# 짧은 링크(횡단보도 8m 등)의 DEM 경사는 5m 격자 보간 오차가 그대로 각도로 튄다(8m 링크 1.1m 차이 = 7.8°).
+# 이 길이 미만은 경사로 통행을 막지 않고 비용 가중만 한다 (v1.20.0).
+SHORT_LINK_M = 15.0
 
 
 class NoRouteError(Exception):
@@ -55,7 +58,8 @@ def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
         return False
     if data["link_type"] in profile.avoid:
         return False
-    if data["slope"] > max_slope_deg:
+    # max_slope_deg 는 하드 상한(profile.hard_slope() 또는 완화 단계). 짧은 링크는 경사로 막지 않는다 (v1.20.0)
+    if data["slope"] > max_slope_deg and float(data.get("length") or 0.0) >= SHORT_LINK_M:
         return False
     w = data.get("width")
     if profile.min_width_m and w is not None and w < profile.min_width_m:
@@ -68,7 +72,12 @@ def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
 
 def edge_cost(data: dict, profile: Profile, penalty: float = 1.0) -> float:
     length = max(float(data["length"]), 0.1)
-    cost = length * (1.0 + profile.slope_factor * float(data["slope"]))
+    slope = float(data["slope"])
+    cost = length * (1.0 + profile.slope_factor * slope)
+    over = slope - float(profile.max_slope_deg)
+    if over > 0:
+        # 권장 초과 구간은 우회로가 있으면 피하되, 우회가 몇 배로 길어지면 그냥 지난다 (v1.20.0)
+        cost *= 1.0 + float(getattr(profile, "slope_over_penalty", 1.0)) * over
     cost *= profile.penalize.get(data["link_type"], 1.0)
     return cost * penalty
 
@@ -108,7 +117,7 @@ def _summarize(G, path, profile, slope_coverage: float = 1.0) -> dict:
         if lt == "crossing" and d.get("curb_cut") is False:
             warnings.append("턱낮춤 없는 횡단보도 구간이 있습니다")
         warnings.extend(d.get("report_warnings") or [])   # 이용자 제보 경고 (overrides)
-        if float(d["slope"]) > profile.max_slope_deg:
+        if float(d["slope"]) > profile.max_slope_deg and float(d.get("length") or 0.0) >= SHORT_LINK_M:
             warnings.append(
                 "권장 경사(%.1f도)를 넘는 구간이 포함되어 있습니다" % profile.max_slope_deg
             )
@@ -175,10 +184,11 @@ def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
     if start_node == goal_node:
         raise NoRouteError("출발지와 목적지가 같은 지점입니다")
 
-    fallback = {"used": False, "reason": None, "applied_max_slope_deg": profile.max_slope_deg}
-    levels = [profile.max_slope_deg]
+    hard = profile.hard_slope()   # 하드 상한 (v1.20.0) — 권장 상한(max_slope_deg) 초과는 가중으로 처리한다
+    fallback = {"used": False, "reason": None, "applied_max_slope_deg": hard}
+    levels = [hard]
     if relax:
-        levels += [profile.max_slope_deg + 2.0, profile.max_slope_deg + 4.0]
+        levels += [hard + 2.0, hard + 4.0]
 
     primary = None
     for i, lvl in enumerate(levels):
@@ -189,7 +199,7 @@ def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
                     "used": True,
                     "reason": (
                         "제약(최대 경사 %.1f도)을 만족하는 경로가 없어 %.1f도까지 완화해 탐색했습니다"
-                        % (profile.max_slope_deg, lvl)
+                        % (hard, lvl)
                     ),
                     "applied_max_slope_deg": lvl,
                 }
