@@ -30,6 +30,9 @@ logger = logging.getLogger("route_api.gbis")
 
 ARRIVAL_PATH = "/busarrivalservice/v2/getBusArrivalListv2"
 LOCATION_PATH = "/buslocationservice/v2/getBusLocationListv2"
+# 노선형상(노선이 지나는 도로 좌표열, lineSeq 순) — 버스 구간 지도선용 (v1.20.0)
+ROUTE_LINE_PATH = "/busrouteservice/v2/getBusRouteLineListv2"
+ROUTE_LINE_TTL_SEC = 24 * 3600.0   # 형상은 하루 단위로 바뀌지 않는다
 
 # lowPlate: 0 일반 / 1 저상 / 2 2층 등 특수차량 — 휠체어 승차 기준으로는 1 만 '저상'이다
 LOW_FLOOR_CODE = 1
@@ -55,6 +58,16 @@ def _str(v):
         return None
     s = str(v).strip()
     return s or None
+
+
+def _dist_m(lat1, lon1, lat2, lon2) -> float:
+    import math
+    r = 6371008.8
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
 
 class GbisLive:
@@ -86,13 +99,14 @@ class GbisLive:
         q.update({k: v for k, v in params.items() if v not in (None, "")})
         return "%s%s?%s" % (self.base_url, path, urllib.parse.urlencode(q))
 
-    def _get(self, key: tuple, path: str, **params):
+    def _get(self, key: tuple, path: str, ttl_sec: float = None, **params):
         """캐시 → 호출. 반환: (msg_body dict | None, error str | None)."""
         now = time.time()
         with self._lock:
             hit = self._cache.get(key)
             if hit and hit[0] > now:
                 return hit[1], hit[2]
+        ttl_ok = self.cache_ttl_sec if ttl_sec is None else float(ttl_sec)
         if not self.enabled:
             return None, "인증키가 설정되지 않았습니다(DATA_GO_KR_API_KEY)"
         body, err = None, None
@@ -115,11 +129,67 @@ class GbisLive:
             logger.warning("GBIS 호출 실패 %s %s — %s", path, params, err)
         with self._lock:
             # 실패도 짧게 캐시한다 — 장애 중 폴링이 외부 API 를 두드리지 않게
-            ttl = self.cache_ttl_sec if not err else min(self.cache_ttl_sec, 10.0)
+            ttl = ttl_ok if not err else min(self.cache_ttl_sec, 10.0)
             self._cache[key] = (now + ttl, body, err)
             if len(self._cache) > 500:
                 self._cache.clear()
         return body, err
+
+    # ---------- 노선형상 ----------
+    def route_line(self, route_id) -> list:
+        """노선이 지나는 도로 좌표열 [[lat, lng], ...] (lineSeq 오름차순). 실패·미설정이면 [].
+
+        정적 DB 에는 경유 정류장 좌표만 있어 버스 구간 지도선이 정류장끼리 직선으로 이어져
+        건물을 뚫고 지나갔다(실증 2026-09-03). 형상은 하루 캐시한다."""
+        body, err = self._get(("line", str(route_id)), ROUTE_LINE_PATH, ttl_sec=ROUTE_LINE_TTL_SEC,
+                              routeId=route_id)
+        if err or not body:
+            return []
+        raw = body.get("busRouteLineList") or []
+        if isinstance(raw, dict):
+            raw = [raw]
+        pts = []
+        for it in raw:
+            try:
+                x = float(it.get("x")); y = float(it.get("y"))
+            except (TypeError, ValueError):
+                continue
+            if not (124.0 <= x <= 132.0 and 33.0 <= y <= 39.0):   # x=경도, y=위도 (뒤바뀐 항목 방어)
+                if 124.0 <= y <= 132.0 and 33.0 <= x <= 39.0:
+                    x, y = y, x
+                else:
+                    continue
+            pts.append((_int(it.get("lineSeq"), len(pts)), y, x))
+        pts.sort(key=lambda p: p[0])
+        return [[round(p[1], 7), round(p[2], 7)] for p in pts]
+
+    @staticmethod
+    def slice_line(line: list, board: dict, alight: dict, max_snap_m: float = 120.0) -> list:
+        """형상에서 승차→하차 정류장 사이 구간만 잘라낸다. 정류장이 형상에서 max_snap_m 보다 멀거나
+        순서가 뒤집히면(형상이 편도만 있는 경우 등) [] — 호출 쪽이 정류장 직선으로 폴백한다."""
+        if not line or len(line) < 2:
+            return []
+
+        def near_idx(lat, lng):
+            # 형상이 순환·왕복이면 같은 정류장 근처를 두 번 지난다 — 후보를 전부 모아 승차<하차 인 가장 짧은 쌍을 고른다
+            out = []
+            for i, (a, b) in enumerate(line):
+                d = _dist_m(lat, lng, a, b)
+                if d <= max_snap_m:
+                    out.append((i, d))
+            return out
+
+        pair = None
+        for i0, _d0 in near_idx(float(board["lat"]), float(board["lng"])):
+            for i1, _d1 in near_idx(float(alight["lat"]), float(alight["lng"])):
+                if i1 > i0 and (pair is None or (i1 - i0) < (pair[1] - pair[0])):
+                    pair = (i0, i1)
+        if pair is None:
+            return []
+        i0, i1 = pair
+        seg = [[float(board["lat"]), float(board["lng"])]] + [list(p) for p in line[i0:i1 + 1]] \
+            + [[float(alight["lat"]), float(alight["lng"])]]
+        return seg
 
     # ---------- 도착정보 ----------
     @staticmethod
