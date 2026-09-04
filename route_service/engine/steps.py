@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from .geo import bearing_deg, haversine_m, turn_angle
+from .geo import haversine_m, lead_bearing, trail_bearing, turn_angle
 from .graph import edge_coords
 from .profiles import Profile
 
@@ -23,6 +23,15 @@ def tactile_for(profile) -> bool:
 SLIGHT = 20.0
 TURN = 45.0
 SHARP = 120.0
+
+# 방위각을 재는 구간 길이(m) — 링크 끝단 미세 절점의 방위각 튐을 없앤다 (v1.21.0)
+BEARING_SPAN_M = 10.0
+# 이 길이 미만 링크에서는 회전을 안내하지 않고 각도를 다음 스텝으로 이월한다 (v1.21.0).
+# 6m 짜리 모퉁이 절점 하나 때문에 "급좌회전 후 6m" 같은 지시가 나오던 것을 막는다.
+# 이월된 각은 다음 회전각과 합산되므로 좌->우로 되꺾이는 지그재그는 서로 상쇄된다.
+TURN_MIN_M = 12.0
+# 이 길이 미만이면 링크 종류가 달라도 앞 스텝에 흡수한다 (v1.21.0).
+SHORT_ABSORB_M = 8.0
 
 MANEUVER_LABEL = {
     "depart": "출발",
@@ -80,7 +89,8 @@ def _edge_warnings(data: dict, profile: Profile) -> list:
     return out
 
 
-def _node_crosswalk_step(G, node, position: str = "mid", profile=None) -> dict | None:
+def _node_crosswalk_step(G, node, position: str = "mid", profile=None,
+                         turning: bool = False) -> dict | None:
     """노드에 지점 부착된 횡단보도의 안내 스텝(안내 전용 계층).
 
     안양시 원천 횡단보도 2,728건 중 다수는 crossing 링크가 아니라 최근접 노드에
@@ -88,8 +98,20 @@ def _node_crosswalk_step(G, node, position: str = "mid", profile=None) -> dict |
     경로가 그 노드를 지나면 횡단 안내를 내보낸다. 위상(경로·거리·비용)에는 일절
     관여하지 않으므로 경로 회귀 위험이 없다.
 
-    position: mid(경로 중간 — 횡단 지시) | start·end(출발·도착 지점 — 정보형 안내.
-    실제 횡단 여부를 단정할 수 없어 지시형 대신 존재를 알린다).
+    position: mid(경로 중간) | start·end(출발·도착 지점).
+
+    ⚠️ 지시형("건너세요") 금지 — v1.21.0
+    노드 부착 횡단보도는 **그 지점에 횡단보도가 있다**는 사실일 뿐, 경로가 그것을
+    건넌다는 뜻이 아니다(위상에 관여하지 않는 안내 전용 계층이므로 실제 횡단은
+    link_type='crossing' 링크뿐이다). 그런데 종전에는 경로 중간 노드마다
+    "횡단보도를 건너세요"라고 지시했고, 안양아트센터→안양문화원 1.4km 경로에서
+    **안양로를 직진하는 동안에만 6번** 그 지시가 나왔다(실측 2026-09-04).
+    이용자는 "건너세요"를 들으면 횡단보도를 지나치는 게 아니라 실제로 길 건너편으로
+    넘어가므로 경로를 이탈한다. 그래서
+      · 경로가 그 노드를 **직진 통과**하면 안내하지 않는다(시각 프로필만 정보형 유지 —
+        차도 접근 신호로서 값이 있다)
+      · 꺾이는 지점이면 정보형("횡단보도가 있는 지점입니다")으로만 알린다
+    지시형은 crossing 링크 스텝(_sentence)에서만 쓴다.
 
     cw_curb_cut / cw_tactile_paving 의 None 은 "없음"이 아니라 **미상**이다
     (원천 기재율 4.4%). False 일 때만 "없음" 경고, None 은 "턱낮춤 미상" 표기.
@@ -97,6 +119,8 @@ def _node_crosswalk_step(G, node, position: str = "mid", profile=None) -> dict |
     attrs = G.nodes[node]
     cnt = int(attrs.get("crosswalk_cnt") or 0)
     if cnt <= 0:
+        return None
+    if position == "mid" and not turning and not tactile_for(profile):
         return None
     warnings = []
     curb = attrs.get("cw_curb_cut")
@@ -112,9 +136,9 @@ def _node_crosswalk_step(G, node, position: str = "mid", profile=None) -> dict |
     elif position == "end":
         base = "도착 지점에 횡단보도%s가 있습니다." % many
     elif cnt == 1:
-        base = "횡단보도가 있습니다. 횡단보도를 건너세요."
+        base = "횡단보도가 있는 지점입니다."
     else:
-        base = "횡단보도 %d개가 있는 지점입니다. 횡단보도를 건너세요." % cnt
+        base = "횡단보도 %d개가 있는 지점입니다." % cnt
     if warnings:
         base += " (%s)" % ", ".join(warnings)
     return {
@@ -191,28 +215,42 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
                 "data": data,
                 "coords": coords,
                 "length": seg_len,
-                "in_bearing": bearing_deg(coords[0][0], coords[0][1], coords[1][0], coords[1][1]),
-                "out_bearing": bearing_deg(
-                    coords[-2][0], coords[-2][1], coords[-1][0], coords[-1][1]
-                ),
+                "in_bearing": lead_bearing(coords, BEARING_SPAN_M),
+                "out_bearing": trail_bearing(coords, BEARING_SPAN_M),
             }
         )
 
     steps = []
     prev_out = None
+    pending_angle = 0.0     # 짧은 링크에서 안내를 미루고 이월 중인 회전각 (v1.21.0)
     for i, seg in enumerate(raw):
         data = seg["data"]
         lt = data["link_type"]
+        special = lt in ("crossing", "elevator", "ramp", "steps")
         if prev_out is None:
             maneuver = "depart"
+            pending_angle = 0.0
+            turn_here = 0.0
         else:
-            maneuver = _maneuver_from_angle(turn_angle(prev_out, seg["in_bearing"]))
-        special = lt in ("crossing", "elevator", "ramp", "steps")
+            turn_here = turn_angle(prev_out, seg["in_bearing"])
+            pending_angle += turn_here
+            if special:
+                # 특수 링크는 링크 종류로 안내한다(종전과 동일). 이월각은 여기서 정리한다.
+                maneuver = "straight"
+                pending_angle = 0.0
+            elif seg["length"] < TURN_MIN_M:
+                # 짧은 링크의 회전은 안내하지 않고 다음으로 이월 — 아래 merge 로 앞 스텝에 흡수된다.
+                maneuver = "straight"
+            else:
+                maneuver = _maneuver_from_angle(pending_angle)
+                pending_angle = 0.0
 
         # 노드 부착 횡단보도 안내 — 경로 중간 노드(seg 시작점).
         # 앞뒤 어느 한쪽이 crossing 링크면 링크 스텝이 이미 횡단을 안내하므로 생략(중복 방지).
         if i > 0 and lt != "crossing" and raw[i - 1]["data"]["link_type"] != "crossing":
-            cw = _node_crosswalk_step(G, seg["u"], profile=profile)
+            # 직진 통과면 알리지 않는다 — 위 _node_crosswalk_step 주석 참고 (v1.21.0)
+            cw = _node_crosswalk_step(G, seg["u"], profile=profile,
+                                      turning=abs(turn_here) >= SLIGHT)
             if cw is not None:
                 cw.update({"idx": len(steps), "_cw_point": True,
                            "_link_type": None, "_maneuver_special": True})
@@ -222,7 +260,10 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
             steps
             and maneuver == "straight"
             and not special
-            and steps[-1]["_link_type"] == lt
+            # 링크 종류가 같거나, 특수 링크 사이에 낀 아주 짧은 연결부이거나 (v1.21.0).
+            # 횡단보도 두 개를 연달아 건너는 교차로에서 그 사이 4m 보도가
+            # "4m 직진합니다" 라는 독립 지시로 나오던 것을 앞 스텝에 흡수한다.
+            and (steps[-1]["_link_type"] == lt or seg["length"] < SHORT_ABSORB_M)
             and (seg["length"] < merge_m or steps[-1]["_maneuver_special"] is False)
         )
         warnings = _edge_warnings(data, profile)

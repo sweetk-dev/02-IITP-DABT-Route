@@ -31,6 +31,39 @@ def turn_angle(prev_bearing: float, next_bearing: float) -> float:
     return d
 
 
+def lead_bearing(coords, span_m: float = 10.0) -> float:
+    """링크 진입 방위각 — 시작점에서 span_m 진행한 지점까지로 잰다 (v1.21.0).
+
+    종전에는 coords[0]->coords[1] 두 점만 썼다. 수치지형도 인도 면형을 중심선화하면
+    교차로 모서리에 1~2m 짜리 미세 절점이 흔히 생기는데, 그 조각의 방위각은 실제
+    진행 방향과 무관하게 크게 튄다. 그 값으로 회전을 판정하니 평범한 모퉁이가
+    급좌회전·유턴으로 승격됐다(실증 2026-09-03, 안양문화원 앞 -137.7도).
+    링크가 span_m 보다 짧으면 링크 전체로 잰다.
+    """
+    if len(coords) < 2:
+        return 0.0
+    a = coords[0]
+    acc = 0.0
+    for i in range(1, len(coords)):
+        acc += haversine_m(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1])
+        if acc >= span_m:
+            return bearing_deg(a[0], a[1], coords[i][0], coords[i][1])
+    return bearing_deg(a[0], a[1], coords[-1][0], coords[-1][1])
+
+
+def trail_bearing(coords, span_m: float = 10.0) -> float:
+    """링크 이탈 방위각 — 끝점 직전 span_m 구간으로 잰다. lead_bearing 의 역방향."""
+    if len(coords) < 2:
+        return 0.0
+    b = coords[-1]
+    acc = 0.0
+    for i in range(len(coords) - 2, -1, -1):
+        acc += haversine_m(coords[i][0], coords[i][1], coords[i + 1][0], coords[i + 1][1])
+        if acc >= span_m:
+            return bearing_deg(coords[i][0], coords[i][1], b[0], b[1])
+    return bearing_deg(coords[0][0], coords[0][1], b[0], b[1])
+
+
 def path_length_m(coords) -> float:
     total = 0.0
     for (a_lat, a_lon), (b_lat, b_lon) in zip(coords[:-1], coords[1:]):
