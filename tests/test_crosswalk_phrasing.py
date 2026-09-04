@@ -83,3 +83,32 @@ def test_real_crossing_link_still_gives_the_order():
     texts = " ".join(x["instruction"] for x in build_steps(s.graph, ["A", "B"],
                                                           get_profile("wheelchair_manual")))
     assert "횡단보도를 건너" in texts
+
+
+def test_short_link_after_crosswalk_step_does_not_crash():
+    """노드 부착 횡단보도 스텝 뒤에 짧은 링크가 오면 병합 대상이 되어선 안 된다.
+
+    회귀: v1.21.0 의 짧은 연결부 흡수 조건이 _link_type 비교를 우회해
+    안내 전용 스텝(_coords 없음)에 병합을 시도하며 KeyError 로 죽었다.
+    """
+    import networkx as nx3
+    G = nx3.Graph()
+    # A -(50m, sidewalk)- B(꺾임 + 횡단보도 부착) -(5m, road)- C -(50m, road)- D
+    G.add_node("A", lat=LAT, lon=LON, node_type="sidewalk", crosswalk_cnt=0)
+    G.add_node("B", lat=LAT, lon=LON + D50, node_type="crossing", crosswalk_cnt=1,
+               cw_curb_cut=None, cw_tactile_paving=None)
+    G.add_node("C", lat=LAT + 5.0 / 110_540.0, lon=LON + D50, node_type="sidewalk",
+               crosswalk_cnt=0)
+    G.add_node("D", lat=LAT + 55.0 / 110_540.0, lon=LON + D50, node_type="sidewalk",
+               crosswalk_cnt=0)
+    G.add_edge("A", "B", length=50.0, slope=0.5, link_type="sidewalk", width=2.0,
+               curb_cut=True, surface="asphalt", link_name="가로", geometry=None)
+    G.add_edge("B", "C", length=5.0, slope=0.5, link_type="road", width=2.0,
+               curb_cut=True, surface="asphalt", link_name="세로", geometry=None)
+    G.add_edge("C", "D", length=50.0, slope=0.5, link_type="road", width=2.0,
+               curb_cut=True, surface="asphalt", link_name="세로", geometry=None)
+    s = NetworkStore()
+    s.load_graph_object(G, version="test-cwcrash", region="테스트")
+    steps = build_steps(s.graph, ["A", "B", "C", "D"], get_profile("wheelchair_manual"))
+    assert steps and steps[-1]["maneuver"] == "arrive"
+    assert all(x["instruction"] for x in steps)

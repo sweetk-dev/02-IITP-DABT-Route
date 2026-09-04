@@ -260,6 +260,11 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
             steps
             and maneuver == "straight"
             and not special
+            # 노드 부착 횡단보도 스텝(_cw_point)은 링크가 아니라 안내 전용이라
+            # _coords·_warnings 를 갖지 않는다. 여기에 병합하면 KeyError 로 죽는다.
+            # 종전에는 _link_type 이 None 이라 아래 종류 비교에서 자연히 걸러졌는데,
+            # v1.21.0 의 짧은 연결부 흡수 조건이 그 비교를 우회해 버렸다.
+            and not steps[-1].get("_cw_point")
             # 링크 종류가 같거나, 특수 링크 사이에 낀 아주 짧은 연결부이거나 (v1.21.0).
             # 횡단보도 두 개를 연달아 건너는 교차로에서 그 사이 4m 보도가
             # "4m 직진합니다" 라는 독립 지시로 나오던 것을 앞 스텝에 흡수한다.
