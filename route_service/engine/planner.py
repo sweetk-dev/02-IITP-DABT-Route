@@ -13,13 +13,16 @@ import uuid
 
 import networkx as nx
 
-from .geo import bearing_deg, haversine_m, path_length_m, point_segment_dist_m, turn_angle
+from .geo import (haversine_m, lead_bearing, path_length_m,
+                  point_segment_dist_m, trail_bearing, turn_angle)
 from .graph import edge_coords
 from .profiles import Profile
 
 # 유턴 판정 각도 — steps.py 의 턴바이턴 유턴 기준(150도)과 동일해야
 # "안내에는 유턴으로 뜨는데 탐색은 못 잡는" 불일치가 안 생긴다.
 UTURN_ANGLE_DEG = 150.0
+# 유턴 검출용 방위각 측정 구간(m) — steps.BEARING_SPAN_M 과 같은 취지 (v1.21.0)
+UTURN_BEARING_SPAN_M = 10.0
 UTURN_RETRY = 3
 # 짧은 링크(횡단보도 8m 등)의 DEM 경사는 5m 격자 보간 오차가 그대로 각도로 튄다(8m 링크 1.1m 차이 = 7.8°).
 # 이 길이 미만은 경사로 통행을 막지 않고 비용 가중만 한다 (v1.20.0).
@@ -42,8 +45,10 @@ def _uturn_edges(G, path) -> set:
     prev_edge = None
     for u, v in zip(path[:-1], path[1:]):
         coords = edge_coords(G, u, v)
-        in_b = bearing_deg(coords[0][0], coords[0][1], coords[1][0], coords[1][1])
-        out_b = bearing_deg(coords[-2][0], coords[-2][1], coords[-1][0], coords[-1][1])
+        # 방위각은 끝단 두 점이 아니라 진행 구간으로 잰다 — 미세 절점 때문에 멀쩡한
+        # 링크가 유턴으로 오검출돼 페널티를 받고 오히려 우회가 나오던 것을 막는다 (v1.21.0)
+        in_b = lead_bearing(coords, UTURN_BEARING_SPAN_M)
+        out_b = trail_bearing(coords, UTURN_BEARING_SPAN_M)
         if prev_out is not None and abs(turn_angle(prev_out, in_b)) >= UTURN_ANGLE_DEG:
             edges.add(prev_edge)
             edges.add(frozenset((u, v)))
