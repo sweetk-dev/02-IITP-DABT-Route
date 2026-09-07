@@ -289,3 +289,134 @@ def apply(G, adopted: list, min_confidence: float = 0.0) -> int:
         G.add_edge(c["a"], c["b"], **data)
         n += 1
     return n
+
+
+# ────────────────────────── 이면도로 횡단 교량 (gap bridge) ──────────────────────────
+# 우회 삼각형과는 다른 결함: 좁은 이면도로 양쪽 보도 끝이 십수 m 거리인데 횡단 링크가 없어
+# 블록을 한 바퀴 돈다(안양문화원 → 소방서 정류장: 직선 61m 를 374m, 실측 2026-09-07).
+# 보도 폴리곤 안이 아니므로 우회 삼각형 게이트로는 절대 통과하지 못한다. 별도 규칙:
+#   · 양 끝이 수치지형도 보도 노드(topo1k 링크에 붙은 노드), 직선 ≤ GAP_MAX_M
+#   · 두 노드 사이 보행망 경로가 없거나 직선의 GAP_RATIO_MIN 배 이상
+#   · 신설선이 **도로 링크를 정확히 하나**만 가로지르고, 그 도로가 이면도로(이름이 없거나 '…길'로 끝남 — 간선은 '…로'·'…대로')
+#   · 장애물(옹벽·담장·계단·시설물) 저촉 없음, 종단경사 ≤ 8°
+# 반영: link_type='crossing', unmarked=True(안내 문구 분기), curb_cut=None(미확인 — 수동휠체어는 False 일 때만 막힌다),
+#       topo_source='derived', confidence=GAP_CONFIDENCE(0.65: 수동 0.60 활성·시각 0.70 비활성 — 시각장애 이용자는 표시된 횡단보도만).
+GAP_MAX_M = 20.0
+GAP_RATIO_MIN = 4.0
+GAP_CONFIDENCE = 0.65
+MINOR_ROAD_SUFFIX = ("길",)
+MAJOR_ROAD_SUFFIX = ("대로", "로")
+
+
+def _is_minor_road(name) -> bool:
+    n = (name or "").strip()
+    if not n:
+        return True
+    if n.endswith(MINOR_ROAD_SUFFIX):
+        return True
+    return False
+
+
+def _sidewalk_node(G, n) -> bool:
+    return any(G[n][x].get("topo_source") == "topo1k" and G[n][x].get("link_type") == "sidewalk" for x in G[n])
+
+
+def _road_links_crossed(G, pa, pb, cell_nodes):
+    """신설선이 가로지르는 도로 링크 목록 [(u, v, name)]."""
+    from shapely.geometry import LineString
+    seg = LineString([(pa[1], pa[0]), (pb[1], pb[0])])
+    out, seen = [], set()
+    for n in cell_nodes:
+        for x in G[n]:
+            key = frozenset((n, x))
+            if key in seen:
+                continue
+            seen.add(key)
+            d = G[n][x]
+            if d.get("link_type") not in ("road", "unknown"):
+                continue
+            from ..engine.graph import edge_coords
+            coords = edge_coords(G, n, x)
+            line = LineString([(c[1], c[0]) for c in coords])
+            if line.crosses(seg):
+                out.append((n, x, d.get("link_name")))
+    return out
+
+
+def find_gap_bridges(G, obstacles=None, dem=None) -> list:
+    """이면도로 횡단 교량 후보. 반환 항목은 우회 삼각형 후보와 같은 키 + gate/confidence."""
+    import networkx as nx
+    nodes = [n for n in G.nodes if _sidewalk_node(G, n)]
+    # 격자 색인(약 30m 셀)
+    grid = {}
+    def cell(lat, lon):
+        return (int(lat / 0.00027), int(lon / 0.00034))
+    for n in G.nodes:
+        grid.setdefault(cell(G.nodes[n]["lat"], G.nodes[n]["lon"]), []).append(n)
+    def around(lat, lon):
+        c = cell(lat, lon)
+        out = []
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                out += grid.get((c[0] + di, c[1] + dj), [])
+        return out
+    out, seen = [], set()
+    for a in nodes:
+        pa = (G.nodes[a]["lat"], G.nodes[a]["lon"])
+        near = around(*pa)
+        for b in near:
+            if b == a or b in G[a] or not _sidewalk_node(G, b):
+                continue
+            key = (min(str(a), str(b)), max(str(a), str(b)))
+            if key in seen:
+                continue
+            seen.add(key)
+            pb = (G.nodes[b]["lat"], G.nodes[b]["lon"])
+            straight = haversine_m(pa[0], pa[1], pb[0], pb[1])
+            if straight < 3.0 or straight > GAP_MAX_M:
+                continue
+            crossed = _road_links_crossed(G, pa, pb, near)
+            if len(crossed) != 1:
+                continue
+            c = {"a": a, "m": None, "b": b, "pa": pa, "pb": pb, "pm": None, "straight_m": straight,
+                 "via_m": None, "ratio": None, "type_am": "sidewalk", "type_mb": "sidewalk",
+                 "kind": "gap_bridge", "road_name": crossed[0][2]}
+            # 기존 경로 길이 (없으면 무한)
+            try:
+                via = nx.shortest_path_length(G, a, b, weight="length")
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                via = float("inf")
+            c["via_m"], c["ratio"] = (None if via == float("inf") else via), (None if via == float("inf") else via / straight)
+            if via != float("inf") and via / straight < GAP_RATIO_MIN:
+                continue
+            if not _is_minor_road(crossed[0][2]):
+                c["gate"] = "G1 간선 횡단(%s)" % crossed[0][2]
+                out.append(c); continue
+            if obstacles is not None:
+                from shapely.geometry import LineString
+                why = obstacles.blocks_new_link(LineString([(pa[1], pa[0]), (pb[1], pb[0])]))
+                if why:
+                    c["gate"] = "G3 " + why; out.append(c); continue
+            za, zb = _node_elev(G, a, dem), _node_elev(G, b, dem)
+            if za is not None and zb is not None:
+                slope = math.degrees(math.atan2(abs(za - zb), max(straight, 0.1)))
+                c["slope_deg"] = round(slope, 2)
+                if slope > HARD_SLOPE_DEG:
+                    c["gate"] = "G8 종단경사 %.1f도" % slope; out.append(c); continue
+            c["gate"] = None
+            c["confidence"], c["penalties"] = GAP_CONFIDENCE, ["이면도로 횡단(횡단보도 표시 없음)"]
+            out.append(c)
+    return out
+
+
+def apply_gap_bridges(G, cands: list) -> int:
+    n = 0
+    for c in cands:
+        if c.get("gate") or G.has_edge(c["a"], c["b"]):
+            continue
+        G.add_edge(c["a"], c["b"], length=float(c["straight_m"]), slope=float(c.get("slope_deg") or 0.0),
+                   link_type="crossing", width=None, curb_cut=None, surface=None, link_name=c.get("road_name"),
+                   geometry=None, tactile_paving=None, topo_source="derived", confidence=float(c["confidence"]),
+                   unmarked=True, derived_kind="gap_bridge")
+        n += 1
+    return n
