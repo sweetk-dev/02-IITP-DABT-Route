@@ -232,7 +232,13 @@ def _endpoint_candidates(H, lat, lng, profile, allowed, tag: str, allow_virtual:
             nid = vsnap.attach(H, c, "%s%s_%d" % (vsnap.VIRTUAL_PREFIX, tag, i))
             out.append((nid, c["dist_m"], (c["lat"], c["lng"]), "edge"))
     s = snap(NET, lat, lng, profile, settings.snap_max_dist_m, allowed=allowed)
-    out.append((s["node_id"], s["dist_m"], (s["snapped"]["lat"], s["snapped"]["lng"]), "node"))
+    node = (s["node_id"], s["dist_m"], (s["snapped"]["lat"], s["snapped"]["lng"]), "node")
+    # 노드가 좌표 바로 위(≤ 2m)면 그 노드가 정답이고, 노드보다 5m 넘게 먼 링크는 더 나은 접근점이 될 수 없다 —
+    # 그런 후보를 남기면 경로 비용(경사·횡단 가중)이 조금 낮은 먼 접근점이 뽑혀 유턴이 생긴다(실측 2026-09-07)
+    if s["dist_m"] <= vsnap.NODE_EXACT_M:
+        return [node]
+    out = [c for c in out if c[1] <= s["dist_m"] + vsnap.EDGE_OVER_NODE_TOL_M]
+    out.append(node)
     return out
 
 

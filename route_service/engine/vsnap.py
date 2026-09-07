@@ -32,6 +32,8 @@ DEFAULT_K = 3
 PEDESTRIAN_TYPES = ("sidewalk", "footway", "path", "pedestrian", "living_street", "derived")
 NO_PROJECT_TYPES = ("crossing", "steps", "overpass", "underpass")
 MIN_SPLIT_M = 1.0                # 링크 끝에서 이보다 가까우면 그냥 그 끝 노드로 본다
+NODE_EXACT_M = 2.0               # 노드가 이 안에 있으면 노드 스냅만 쓴다
+EDGE_OVER_NODE_TOL_M = 5.0       # 노드 스냅 거리보다 이만큼 넘게 먼 링크 후보는 버린다
 
 _KY = 110_540.0
 

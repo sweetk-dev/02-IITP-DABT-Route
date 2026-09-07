@@ -260,6 +260,25 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
 - 응답 `origin.snap_kind`·`destination.snap_kind`(`edge`|`node`)·`snap_dist_m`. 끄려면 `EDGE_SNAP=false`(`EDGE_SNAP_RADIUS_M`·`EDGE_SNAP_K`).
 - 실측(anyang-hybrid-2026Q3): 안양아트센터 → 안양문화원 1,283m → **1,060m(우회비 1.55 → 1.28)**, 첫 안내가 목적지 방향. 요청당 약 +40ms.
 
+### 우회 삼각형 직결 링크 정제 — 규칙만으로 (v1.23.0)
+
+A–M, M–B 인접 링크는 있는데 A–B 직결이 없어 짧은 거리를 크게 우회하는 지점(안양문화원 앞 10.6m → 21.8m, 급회전 안내)에
+**사람 검수 없이** 직결 링크를 신설한다. 안전은 하드 게이트가, 선호는 신뢰도(비용)가 맡는다.
+
+```bash
+python scripts/build_topomap_layers.py --src "<1:1000 도엽 폴더>" --out data/topomap_layers          # 인도 면형·장애물 (한 번)
+python scripts/refine_detour_links.py --graph data/network_anyang_hybrid.gpickle --layers data/topomap_layers \
+    --dem data/dem/anyang_5m.tif --report data/refine_report.csv \
+    --out data/network_anyang_hybrid_r1.gpickle --version anyang-hybrid-2026Q3r1
+```
+
+- 후보: 차수 무관, 우회비 ≥ 1.41·우회량 < 20m·직선 ≤ 25m.
+- 하드 게이트(하나라도 걸리면 생성 안 함): 인도 면형 밖(도엽 이음새 0.3m 흡수) · 계단·옹벽·담장·가로시설물 저촉 · 점형 지물 통과 간격 0.8m 미만 · 신설선 종단경사 8° 초과 · 지그재그 경사로(고도차 1m 초과 & 인접 경사 5% 초과) · 우회 구간이 횡단보도 링크.
+- 신뢰도 c(1.0 에서 곱셈 감점): 신설선 내부(양 끝 1m 제외)가 경계 인셋 0.2m 밖 ×0.55 · 보도 폭 1.5m 미만 ×0.70 · A·B 가 **맞닿지 않은** 서로 다른 폴리곤 ×0.60 · 접합각 60° 미만 ×0.70. 인셋 0.2m 는 1:1000 도화 허용오차와 휠체어 반폭 근거.
+- 반영: `topo_source='derived'`·`confidence=c` 로 **추가만** 한다(기존 링크·지그재그 경사로는 그대로). 라우팅은 프로필별 활성 하한(수동 0.60·전동 0.55·시각 0.70·도보 0.40) 미만이면 없는 링크로 보고, 통과분은 `length × (1 + 4(1 − c))` 비용으로 저울질한다.
+- 안양 실측(2026-09-07): 후보 414 → 인도 면형 밖 237(대부분 인도 없는 이면도로) · 횡단보도 우회 173 · **채택 4**(c 1.0·1.0·0.7·0.55). 안양문화원 앞 직결 링크 c=1.0 → 모든 프로필이 10.6m 직결로 지난다. 보고서 `data/refine_report.csv`.
+- 회귀(실증 구간 9건): 거리 불변 또는 단축(안양아트센터 → 안양문화원 1,283 → 1,060m), 계단 관통 링크 증가 0.
+
 ### 저상버스 우선 모드 (v1.22.0)
 
 휠체어 이용자에게 일반버스는 탑승이 불가능하다. 그런데 종전 후보 스코어(도보거리 + 정거장 수 + 탑승 횟수)에는
