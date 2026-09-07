@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.22.0 |
+| 02-IITP-DABT-Route | v1.23.0 |
 
 ## 구조
 
@@ -247,6 +247,18 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
 - 같은 정류장·노선의 반복 폴링은 20초 TTL 캐시로 흡수한다(`GBIS_CACHE_TTL_SEC`). 개발계정 도착정보 한도는 1,000회/일이다.
 - `next_low_floor` 가 `null` 인 것은 "저상버스가 없다"가 아니라 "도착정보에 잡힌 두 대 안에는 없다"는 뜻이다. 3번째 이후 차량은 위치정보로 본다.
 - 스텝(`bus_board`/`bus_alight`)에 `leg_ref{route_id, board_station_id, alight_station_id}` 가 실린다 — 클라이언트가 안내 중 폴링할 키다.
+
+### 링크 투영 스냅 — 출발·도착을 링크 위의 점에 (v1.23.0)
+
+종전에는 출발·도착 좌표를 최근접 **노드**에만 붙였다. 링크 길이 중앙값 47m, 100m 초과 링크가 2,250개인 그래프에서는
+좌표가 긴 링크 중간에 있으면 링크 한쪽 끝까지 갔다가 되돌아오는 경로가 나온다(안양아트센터 → 안양문화원 1,283m / 직선 826m).
+이제 최근접 **링크 위의 점**에 요청 단위 가상 노드를 만들어 붙이고 링크 양쪽으로 나갈 수 있게 한다(`engine/vsnap.py`). 공유 그래프는 바뀌지 않는다.
+
+- 후보: 반경 60m 안 링크에 투영, 가까운 순 3개 + 노드 스냅 폴백. 출발은 도착 최근접 후보를 기준으로, 도착은 고른 출발을 기준으로 **"투영 거리 + 경로 비용"이 최소**인 후보를 택한다(막다른 링크 회피).
+- 안전 필터: 반경 20m 안에 보행 링크(sidewalk 계열)가 있으면 도로 링크 제외 · `crossing`·`steps`·`overpass`·`underpass` 는 투영 금지 · 좌표→투영점 선분이 건물 폴리곤(또는 옹벽·담장 색인)을 가로지르면 탈락(LOS) · 링크 끝 1m 이내면 끝 노드 그대로.
+- 실측 출입구(`manual_survey`·`accessible_entrance`)로 해석된 도착점은 종전대로 노드 스냅 — 출입구 스퍼 끝이 곧 안내 종점이다.
+- 응답 `origin.snap_kind`·`destination.snap_kind`(`edge`|`node`)·`snap_dist_m`. 끄려면 `EDGE_SNAP=false`(`EDGE_SNAP_RADIUS_M`·`EDGE_SNAP_K`).
+- 실측(anyang-hybrid-2026Q3): 안양아트센터 → 안양문화원 1,283m → **1,060m(우회비 1.55 → 1.28)**, 첫 안내가 목적지 방향. 요청당 약 +40ms.
 
 ### 저상버스 우선 모드 (v1.22.0)
 

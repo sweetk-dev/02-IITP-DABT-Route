@@ -180,12 +180,13 @@ def _geometry(G, path) -> list:
 
 
 def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
-         relax: bool = True) -> dict:
+         relax: bool = True, graph=None) -> dict:
     """경로 탐색 + 대안 경로.
 
+    graph: 요청 단위 그래프 사본(가상 노드 포함, engine.vsnap) — 없으면 store.graph.
     반환: {"routes": [...], "fallback": {...}}
     """
-    G = store.graph
+    G = graph if graph is not None else store.graph
     if start_node == goal_node:
         raise NoRouteError("출발지와 목적지가 같은 지점입니다")
 
