@@ -29,6 +29,7 @@ from ..engine.overrides import apply_overrides
 from ..poi import store as poi_store
 from ..transit import gbis_live
 from ..transit import planner as transit
+from ..transit import low_floor as lowfloor
 from .schemas import (
     AccessReportRequest,
     Destination,
@@ -295,6 +296,7 @@ def _entrance_note(target: dict):
 # ────────────────────────── 멀티모달 (#36) ──────────────────────────
 # 제약형: 직결 버스 1회 + 안양 관내 지하철 노선 내 이동. 시각표 없음 — 소요시간 추정.
 ETA_NOTE = "소요시간은 정거장 수 기반 추정이며 차량 대기 시간은 포함되지 않습니다"
+ETA_NOTE_LOW_FLOOR = "소요시간은 정거장 수 기반 추정에 저상버스 대기 시간(조회 시점 실시간)을 더한 값입니다"
 LOW_BUS_WARNING = ("저상버스 정차 여부는 보장되지 않습니다 — "
                    "실시간 도착정보로 저상 차량을 확인하세요")
 
@@ -484,6 +486,8 @@ def _attach_realtime(legs: list, realtime: bool) -> None:
             live = gbis_live.LIVE.arrivals(board["poi_id"], route_id=rid, route_meta=meta)
             leg["realtime"] = live
             nlf = live.get("next_low_floor")
+            if leg.get("low_floor"):
+                continue        # 저상 우선 모드가 이미 판정·문구를 붙였다(#64)
             if live.get("status") == "success":
                 if nlf:
                     leg["warnings"] = [w for w in leg["warnings"] if w != LOW_BUS_WARNING]
@@ -501,20 +505,85 @@ def _attach_realtime(legs: list, realtime: bool) -> None:
                 st["facilities"] = _station_brief(st["poi_id"], st["name"])
 
 
+def _walk_est_sec(profile, *pts) -> float:
+    """(lat,lng) 점열의 도보 근사 초 — 직선×배율 / 프로필 속도 (실계산 전 정렬용)."""
+    m = transit._walk_est(*pts)
+    return m / profile.speed_mps if profile.speed_mps else 0.0
+
+
+def _cand_bus_part(cand: dict):
+    return next((p for p in cand["parts"] if p["kind"] == "bus"), None)
+
+
+def _rank_low_floor(cands: list, judge, profile, origin) -> list:
+    """저상버스 우선 모드 — 근사 단계 정렬(#64).
+
+    후보마다 버스 part 의 승차 정류장까지 도보 근사 초를 구해 실시간 저상 판정을 받고,
+    (계층, 시간) 키로 정렬한다. 버스가 없는 후보(도보+지하철)는 저상 판정이 필요 없어 tier 1 로 둔다.
+    """
+    ranked = []
+    for c in cands:
+        part = _cand_bus_part(c)
+        secs = 0.0
+        for p in c["parts"]:
+            if p["kind"] == "walk":
+                secs += _walk_est_sec(profile, p["frm"][1], p["to"][1])
+            elif p["kind"] == "bus":
+                secs += p["stop_cnt"] * transit.BUS_SEC_PER_STOP + lowfloor.BOARDING_OVERHEAD_SEC
+            else:
+                secs += p["station_cnt"] * transit.SUBWAY_SEC_PER_STATION + transit.SUBWAY_ACCESS_SEC
+        if part is None:
+            j = {"tier": 1, "wait_sec": 0.0, "source": "none", "reason": "no bus leg"}
+        else:
+            walk_to_board = _walk_est_sec(profile, origin, (part["board"]["lat"], part["board"]["lng"]))
+            j = judge.judge(part, walk_to_board)
+            secs += float(j.get("wait_sec") or 0.0)
+        c["low_floor"] = j
+        ranked.append((lowfloor.rank_key(j["tier"], secs), c))
+    ranked.sort(key=lambda x: x[0])
+    return [c for _, c in ranked]
+
+
 def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
-                     mode: str, constraints=None, realtime: bool = False) -> dict:
+                     mode: str, constraints=None, realtime: bool = False,
+                     low_floor=None) -> dict:
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
     profile = _profile_or_400(profile_id)
     relax_margin = 4.0
     allowed = NET.reachable_nodes(profile, profile.hard_slope() + relax_margin)
     target = _resolve_destination(dest, profile, allowed)
+    origin = (origin_lat, origin_lng)
+    tgt = (target["lat"], target["lng"])
 
-    cands = transit.search(
-        (origin_lat, origin_lng), (target["lat"], target["lng"]), mode,
-        stops_near=lambda la, ln, r: poi_store.STORE.stops_near(la, ln, r),
-        stations=poi_store.STORE.stations(),
-    )
+    # ── 저상버스 우선 모드(#64): 휠체어 프로필 기본 on ──
+    lf_mode = lowfloor.resolve_mode(low_floor, profile.id)
+    lf_expanded = False
+    now_ts = int(time.time())
+
+    def _search(radius=None, k=None):
+        return transit.search(
+            origin, tgt, mode,
+            stops_near=lambda la, ln, r: poi_store.STORE.stops_near(la, ln, r),
+            stations=poi_store.STORE.stations(),
+            stop_radius_m=radius, max_stops=k,
+            route_ok=transit.low_bus_route_ok if lf_mode else None,
+        )
+
+    cands = _search()
+    judge = None
+    if lf_mode:
+        judge = lowfloor.LowFloorJudge(gbis_live.LIVE, poi_store.STORE, now=now_ts)
+        cands = _rank_low_floor(cands, judge, profile, origin)
+        best_tier = cands[0]["low_floor"]["tier"] if cands else 3
+        if best_tier not in (1, 2):
+            # 450m 에 탈 수 있는 저상 후보가 없을 때만 800m 로 넓힌다(사용자 결정 반영)
+            wider = _rank_low_floor(_search(lowfloor.STOP_RADIUS_EXPANDED_M, lowfloor.EXPANDED_MAX_STOPS),
+                                    judge, profile, origin)
+            if wider and wider[0]["low_floor"]["tier"] in (1, 2):
+                cands, lf_expanded = wider, True
+            elif not cands and wider:
+                cands = wider
     if not cands:
         raise HTTPException(
             status_code=404,
@@ -543,7 +612,27 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             actual += sum(l.get("station_cnt", 0) for l in built) * transit.STATION_PENALTY_M
             actual += sum(1 for l in built if l["kind"] != "walk") * transit.TRANSIT_LEG_PENALTY_M
             actual += 200 * sum(len(l.get("warnings", [])) for l in built if l["kind"] == "walk")
-            built_cands.append((actual, built))
+            key = actual
+            if lf_mode:
+                # 실제 도보 소요로 다시 판정 — 근사로는 탈 수 있던 차량을 실경로에서는 놓칠 수 있다
+                part = _cand_bus_part(cand)
+                secs = sum(l["summary"]["duration_sec"] for l in built if l["kind"] == "walk")
+                secs += sum(l.get("est_duration_sec", 0) for l in built if l["kind"] != "walk")
+                secs += lowfloor.BOARDING_OVERHEAD_SEC * sum(1 for l in built if l["kind"] == "bus")
+                if part is None:
+                    j = cand["low_floor"]
+                else:
+                    idx = next(i for i, l in enumerate(built) if l["kind"] == "bus")
+                    walk_to_board = built[idx - 1]["summary"]["duration_sec"] \
+                        if idx > 0 and built[idx - 1]["kind"] == "walk" else 0.0
+                    j = judge.judge(part, walk_to_board)
+                    bus_leg = built[idx]
+                    bus_leg["low_floor"] = j
+                    bus_leg["warnings"] = [w for w in bus_leg["warnings"] if w != LOW_BUS_WARNING]
+                    bus_leg["warnings"].insert(0, lowfloor.leg_warning(j))
+                    secs += float(j.get("wait_sec") or 0.0)
+                key = lowfloor.rank_key(j["tier"], secs)
+            built_cands.append((key, built))
         except (SnapError, NoRouteError) as e:
             last_err = e
             continue
@@ -591,6 +680,19 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
 
     fallback = next((l["fallback"] for l in walk_legs if l.get("fallback", {}).get("used")),
                     {"used": False})
+    lf_info = {"mode": lf_mode}
+    if lf_mode:
+        bus_js = [l["low_floor"] for l in transit_legs if l.get("low_floor")]
+        lf_tier = min((int(j["tier"]) for j in bus_js), key=lambda t: lowfloor.TIER_RANK.get(t, 2)) if bus_js else 1
+        lf_info.update({"tier": lf_tier, "expanded_radius": lf_expanded,
+                        "queried_at": now_ts, "valid_for_sec": lowfloor.VALID_FOR_SEC,
+                        "wait_sec": round(sum(float(j.get("wait_sec") or 0) for j in bus_js))})
+        if lf_tier == 3:
+            warnings.insert(0, lowfloor.NO_LOW_FLOOR_WARNING)
+        elif lf_tier == 0:
+            warnings.insert(0, lowfloor.UNKNOWN_LOW_FLOOR_WARNING)
+        if lf_tier in (1, 2):
+            total_dur += lf_info["wait_sec"]
     summary = {
         "total_distance_m": round(total_dist),
         "duration_sec": round(total_dur),
@@ -606,7 +708,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             "stop_cnt": sum(l.get("stop_cnt", 0) for l in transit_legs),
             "station_cnt": sum(l.get("station_cnt", 0) for l in transit_legs),
         },
-        "eta_note": ETA_NOTE,
+        "eta_note": ETA_NOTE if not (lf_mode and lf_info.get("tier") in (1, 2)) else ETA_NOTE_LOW_FLOOR,
         "warnings": warnings,
     }
 
@@ -622,6 +724,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         "resolved_by": target["source"],
                         "note": _entrance_note(target)},
         "routes": [{"summary": summary, "geometry": geometry, "steps": steps, "legs": legs}],
+        "low_floor": lf_info,
         "fallback": fallback,
         "data_quality": {
             "slope_coverage": NET.meta.get("slope_coverage"),
@@ -641,6 +744,7 @@ def route_plan(req: PlanRequest):
         return _plan_multimodal(
             req.origin.lat, req.origin.lng, req.destination,
             req.profile, req.mode, req.constraints, realtime=req.realtime,
+            low_floor=req.low_floor,
         )
     if req.mode not in ("", "walk", None):
         raise HTTPException(status_code=400,
