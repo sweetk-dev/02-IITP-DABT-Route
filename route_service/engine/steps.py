@@ -174,7 +174,11 @@ def _sentence(maneuver: str, distance_m: float, link_name, data: dict, warnings:
     if maneuver == "arrive":
         return "목적지에 도착했습니다."
     if lt == "crossing":
-        base = "횡단보도를 건너 %dm 이동합니다." % dist
+        if data.get("unmarked"):
+            # 정제로 이은 이면도로 횡단(#67) — 횡단보도 표시가 없다. 지시형 대신 주의 문구
+            base = "이면도로를 건너 %dm 이동합니다. 횡단보도 표시가 없으니 차량을 살피세요." % dist
+        else:
+            base = "횡단보도를 건너 %dm 이동합니다." % dist
     elif lt == "elevator":
         base = "승강기를 이용해 이동합니다."
     elif lt == "ramp":

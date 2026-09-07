@@ -130,3 +130,61 @@ def test_refine_pipeline_end_to_end():
     res = rf.refine(G, sw, ObstacleIndex([]))
     assert res["reasons"]["adopted"] == 1 and res["adopted"][0]["confidence"] == 1.0
     assert rf.apply(G, res["adopted"], 0.6) == 1
+
+
+# ---- 이면도로 횡단 교량 (gap bridge) ----
+
+def gap_graph(road_name="현충로52번길", ratio_ok=True):
+    """A(0,0)·B(12,0) 는 보도 노드, 사이를 남북 도로(R1–R2, x=6)가 가른다.
+    A·B 는 도로를 따라가는 먼 우회로(A–P–Q–B, 총 200m)로만 연결된다."""
+    G = nx.Graph()
+    pts = {"A": (0, 0), "B": (12, 0), "A0": (-20, 0), "B0": (32, 0), "R1": (6, -40), "R2": (6, 40),
+           "P": (0, 100), "Q": (12, 100)}
+    for n, (dx, dy) in pts.items():
+        la, lo = _pt(dx, dy)
+        G.add_node(n, lat=la, lon=lo, node_type="intersection")
+    G.add_edge("A0", "A", length=20.0, topo_source="topo1k", **_edge("A0", "A"))
+    G.add_edge("B", "B0", length=20.0, topo_source="topo1k", **_edge("B", "B0"))
+    G.add_edge("R1", "R2", length=80.0, **_edge("R1", "R2", link_type="road", link_name=road_name))
+    via = 100.0 if ratio_ok else 12.0
+    G.add_edge("A", "P", length=via / 2 if not ratio_ok else 100.0, **_edge("A", "P"))
+    G.add_edge("P", "Q", length=12.0 if ratio_ok else 1.0, **_edge("P", "Q"))
+    G.add_edge("Q", "B", length=100.0 if ratio_ok else 5.0, **_edge("Q", "B"))
+    return G
+
+
+def test_gap_bridge_minor_road_adopted():
+    G = gap_graph()
+    c = rf.find_gap_bridges(G)
+    hit = [x for x in c if {x["a"], x["b"]} == {"A", "B"}]
+    assert len(hit) == 1 and hit[0]["gate"] is None and hit[0]["road_name"] == "현충로52번길"
+    assert hit[0]["confidence"] == rf.GAP_CONFIDENCE and hit[0]["ratio"] > rf.GAP_RATIO_MIN
+    n = rf.apply_gap_bridges(G, c)
+    assert n == 1 and G.has_edge("A", "B")
+    d = G["A"]["B"]
+    assert d["link_type"] == "crossing" and d["unmarked"] is True and d["topo_source"] == "derived"
+    # 수동 휠체어(하한 0.60)는 통과, 시각장애(0.70)는 불가
+    wm, vi = prof.PROFILES["wheelchair_manual"], prof.PROFILES["visual"]
+    assert edge_passable(d, wm, wm.hard_slope())
+    assert not edge_passable(d, vi, vi.hard_slope())
+
+
+def test_gap_bridge_major_road_gated():
+    G = gap_graph(road_name="소곡로")
+    c = [x for x in rf.find_gap_bridges(G) if {x["a"], x["b"]} == {"A", "B"}]
+    assert len(c) == 1 and c[0]["gate"].startswith("G1")
+    assert rf.apply_gap_bridges(G, c) == 0 and not G.has_edge("A", "B")
+
+
+def test_gap_bridge_short_detour_skipped():
+    G = gap_graph(ratio_ok=False)
+    c = [x for x in rf.find_gap_bridges(G) if {x["a"], x["b"]} == {"A", "B"}]
+    assert c == []
+
+
+def test_unmarked_crossing_sentence():
+    from route_service.engine.steps import _sentence
+    s = _sentence("straight", 17.2, "현충로52번길", {"link_type": "crossing", "unmarked": True}, [])
+    assert "이면도로를 건너" in s and "횡단보도 표시가 없으니" in s
+    s2 = _sentence("straight", 17.2, None, {"link_type": "crossing"}, [])
+    assert "이면도로" not in s2

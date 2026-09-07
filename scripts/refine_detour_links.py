@@ -3,7 +3,7 @@
 
     python scripts/refine_detour_links.py --graph data/network_anyang_hybrid.gpickle \\
         --layers data/topomap_layers --dem data/dem/anyang_5m.tif \\
-        --out data/network_anyang_hybrid_r1.gpickle --report data/refine_report.csv --version anyang-hybrid-2026Q3r1
+        --out data/network_anyang_hybrid_r2.gpickle --report data/refine_report.csv --version anyang-hybrid-2026Q3r2
 
 --layers 는 scripts/build_topomap_layers.py 산출(sidewalk_polys.geojson, obstacles.geojson).
 --out 을 주지 않으면 보고서만 낸다. 활성 하한은 런타임 프로필이 판단하므로 채택분은 전부 넣는다(--min-confidence 로 제한 가능).
@@ -55,6 +55,16 @@ def main():
             w.writerow([c["a"], c["m"], c["b"], "%.7f" % c["pa"][0], "%.7f" % c["pa"][1], "%.7f" % c["pb"][0], "%.7f" % c["pb"][1],
                         "%.1f" % c["straight_m"], "%.1f" % c["via_m"], "%.2f" % c["ratio"], c["type_am"], c["type_mb"],
                         c.get("gate") or "", c.get("confidence", ""), "|".join(c.get("penalties", [])), c.get("slope_deg", "")])
+    gaps = rf.find_gap_bridges(G, ob, dem)
+    from collections import Counter
+    print("gap bridges %d → %s" % (len(gaps), dict(Counter((c.get("gate") or "adopted").split(" ")[0] for c in gaps))), flush=True)
+    with open(a.report.replace(".csv", "_gaps.csv"), "w", newline="", encoding="utf-8") as fp:
+        w = csv.writer(fp)
+        w.writerow(["a", "b", "lat_a", "lon_a", "lat_b", "lon_b", "straight_m", "via_m", "ratio", "road_name", "gate", "confidence", "slope_deg"])
+        for c in gaps:
+            w.writerow([c["a"], c["b"], "%.7f" % c["pa"][0], "%.7f" % c["pa"][1], "%.7f" % c["pb"][0], "%.7f" % c["pb"][1],
+                        "%.1f" % c["straight_m"], "" if c["via_m"] is None else "%.1f" % c["via_m"], "" if c["ratio"] is None else "%.2f" % c["ratio"],
+                        c.get("road_name") or "", c.get("gate") or "", c.get("confidence", ""), c.get("slope_deg", "")])
     ad = res["adopted"]
     if ad:
         import statistics
@@ -63,6 +73,7 @@ def main():
             len(ad), min(cs), statistics.median(cs), sum(c >= 0.6 for c in cs), sum(c >= 0.55 for c in cs), sum(c >= 0.4 for c in cs)))
     if a.out:
         n = rf.apply(G, ad, a.min_confidence)
+        n += rf.apply_gap_bridges(G, gaps)
         if a.version:
             G.graph["network_version"] = a.version
         with open(a.out, "wb") as f:

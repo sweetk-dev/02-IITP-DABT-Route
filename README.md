@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.23.0 |
+| 02-IITP-DABT-Route | v1.23.1 |
 
 ## 구조
 
@@ -269,7 +269,7 @@ A–M, M–B 인접 링크는 있는데 A–B 직결이 없어 짧은 거리를 
 python scripts/build_topomap_layers.py --src "<1:1000 도엽 폴더>" --out data/topomap_layers          # 인도 면형·장애물 (한 번)
 python scripts/refine_detour_links.py --graph data/network_anyang_hybrid.gpickle --layers data/topomap_layers \
     --dem data/dem/anyang_5m.tif --report data/refine_report.csv \
-    --out data/network_anyang_hybrid_r1.gpickle --version anyang-hybrid-2026Q3r1
+    --out data/network_anyang_hybrid_r2.gpickle --version anyang-hybrid-2026Q3r2
 ```
 
 - 후보: 차수 무관, 우회비 ≥ 1.41·우회량 < 20m·직선 ≤ 25m.
@@ -278,6 +278,17 @@ python scripts/refine_detour_links.py --graph data/network_anyang_hybrid.gpickle
 - 반영: `topo_source='derived'`·`confidence=c` 로 **추가만** 한다(기존 링크·지그재그 경사로는 그대로). 라우팅은 프로필별 활성 하한(수동 0.60·전동 0.55·시각 0.70·도보 0.40) 미만이면 없는 링크로 보고, 통과분은 `length × (1 + 4(1 − c))` 비용으로 저울질한다.
 - 안양 실측(2026-09-07): 후보 414 → 인도 면형 밖 237(대부분 인도 없는 이면도로) · 횡단보도 우회 173 · **채택 4**(c 1.0·1.0·0.7·0.55). 안양문화원 앞 직결 링크 c=1.0 → 모든 프로필이 10.6m 직결로 지난다. 보고서 `data/refine_report.csv`.
 - 회귀(실증 구간 9건): 거리 불변 또는 단축(안양아트센터 → 안양문화원 1,283 → 1,060m), 계단 관통 링크 증가 0.
+
+#### 이면도로 횡단 교량 (v1.23.1)
+
+우회 삼각형과는 다른 결함. 좁은 이면도로 양쪽의 보도 끝이 십수 m 거리인데 횡단 링크가 없어 블록을 한 바퀴 돈다
+(안양문화원 → 소방서 정류장: 직선 61m 를 374m). 보도 면형 안이 아니므로 위 게이트로는 절대 통과하지 못해 별도 규칙을 둔다.
+같은 스크립트가 `<report>_gaps.csv` 를 함께 내고 `--out` 이면 같이 반영한다.
+
+- 후보: 양 끝이 수치지형도 보도 노드, 직선 3~20m, 둘 사이 보행망 경로가 없거나 직선의 4배 이상.
+- 게이트: 신설선이 도로 링크를 **정확히 하나**만 가로지르고 그 도로가 이면도로(이름이 없거나 `…길`, 간선 `…로`·`…대로`는 제외) · 장애물 저촉 없음 · 종단경사 8° 이하.
+- 반영: `link_type='crossing'`·`unmarked=True`·`confidence=0.65`. 수동(0.60)·전동·도보는 지나고 **시각장애(0.70)는 표시된 횡단보도만** 쓴다. 안내 문구는 "이면도로를 건너 17m 이동합니다. 횡단보도 표시가 없으니 차량을 살피세요." 로 나뉜다.
+- 안양 실측(2026-09-07): 후보 16 → 간선 횡단 8 제외 · **채택 8**(현충로52번길·현충로48번길·경수대로1192번길·문예로24번길·안양로111번길). 안양문화원 → 소방서 정류장 374 → 75m. 실증 구간 9건 회귀 불변. 그래프 `anyang-hybrid-2026Q3r2`.
 
 ### 저상버스 우선 모드 (v1.22.0)
 
