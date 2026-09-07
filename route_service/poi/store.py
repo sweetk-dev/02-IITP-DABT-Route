@@ -133,6 +133,9 @@ def _normalize_routes(file_routes, db_routes) -> list:
                         "type": r.get("type") or r.get("route_type_name"),
                         "end_station": (r.get("end_station")
                                         or r.get("end_station_name")),
+                        # 전일 기준 저상 운행 여부(01 v1.5.0, 08 GBIS_LOWFLOOR) — 없으면 None
+                        "low_bus_yn": r.get("low_bus_yn"),
+                        "low_bus_base_dt": r.get("low_bus_base_dt"),
                         "station_seq": [x for x in seq if x is not None]})
         else:
             out.append({"route_id": None, "name": str(r), "type": None,
@@ -619,10 +622,13 @@ class PoiStore:
                                    'name', t.route_name,
                                    'type', t.route_type_name,
                                    'end_station', t.end_station_name,
+                                   'low_bus_yn', t.low_bus_yn,
+                                   'low_bus_base_dt', t.low_bus_base_dt,
                                    'station_seq', t.seqs)
                                  ORDER BY t.route_name, t.route_id)
                           FROM (SELECT r.route_id, r.route_name, r.route_type_name,
                                        r.end_station_name,
+                                       r.low_bus_yn, r.low_bus_base_dt::text AS low_bus_base_dt,
                                        array_agg(rs.station_seq
                                                  ORDER BY rs.station_seq) AS seqs
                                   FROM tran_bus_route_station rs
@@ -633,7 +639,8 @@ class PoiStore:
                                    AND COALESCE(r.del_yn, 'N') = 'N'
                                  GROUP BY r.route_id, r.route_name,
                                           r.route_type_name,
-                                          r.end_station_name) t) AS route_list
+                                          r.end_station_name,
+                                          r.low_bus_yn, r.low_bus_base_dt) t) AS route_list
                   FROM tran_bus_station_info s
                  WHERE """ + " AND ".join(where),
                 params,

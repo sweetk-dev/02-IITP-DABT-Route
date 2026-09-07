@@ -277,9 +277,10 @@ def test_plan_realtime_attaches_arrivals_and_replaces_fixed_warning(client):
 
 
 def test_plan_without_realtime_keeps_fixed_warning(client):
+    # low_floor=false — 저상 우선 모드(#64)는 별도 테스트. 여기서는 종전 계약(고정 경고·호출 없음)만 본다
     body = {"origin": {"lat": 37.3900, "lng": 126.9500},
             "destination": {"type": "tour", "poi_id": "TBF-1"},
-            "profile": "wheelchair_manual", "mode": "walk_bus"}
+            "profile": "wheelchair_manual", "mode": "walk_bus", "low_floor": False}
     r = client.post("/route/plan", json=body)
     bus = [l for l in r.json()["routes"][0]["legs"] if l["kind"] == "bus"][0]
     assert "realtime" not in bus
@@ -293,7 +294,8 @@ def test_plan_realtime_failure_keeps_fixed_warning(client):
     client.live._cache.clear()
     body = {"origin": {"lat": 37.3900, "lng": 126.9500},
             "destination": {"type": "tour", "poi_id": "TBF-1"},
-            "profile": "wheelchair_manual", "mode": "walk_bus", "realtime": True}
+            "profile": "wheelchair_manual", "mode": "walk_bus", "realtime": True,
+            "low_floor": False}
     r = client.post("/route/plan", json=body)
     assert r.status_code == 200
     bus = [l for l in r.json()["routes"][0]["legs"] if l["kind"] == "bus"][0]

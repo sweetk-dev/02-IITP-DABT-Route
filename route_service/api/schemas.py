@@ -48,6 +48,9 @@ class PlanRequest(BaseModel):
     mode: str = Field("walk", description="walk | walk_bus | walk_bus_subway")
     realtime: bool = Field(
         False, description="버스 leg 승차 정류장의 실시간 도착정보(저상 여부)를 함께 붙인다")
+    low_floor: Optional[bool] = Field(
+        None, description="저상버스 우선 모드(#64). 생략하면 휠체어 프로필에서 on, 그 외 off. "
+                          "on 이면 조회 시점 실시간 저상 차량 기준으로 승차 정류장·노선을 고른다")
 
 
 class RerouteRequest(BaseModel):

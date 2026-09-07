@@ -46,7 +46,8 @@ ROW = {
         {"route_id": 213000017, "name": "2", "type": "일반형시내버스",
          "end_station": "군포공영차고지", "station_seq": [5]},
         {"route_id": 241253002, "name": "2-1", "type": "마을버스",
-         "end_station": "안양예술공원", "station_seq": [7]},
+         "end_station": "안양예술공원", "low_bus_yn": None, "low_bus_base_dt": None,
+         "station_seq": [7]},
     ],
 }
 
@@ -65,11 +66,14 @@ def test_stops_normalizes_db_row():
     # 노선번호가 같아도 다른 노선이면 유지하고, 완전 중복만 제거한다
     assert s["routes"] == [
         {"route_id": 213000017, "name": "2", "type": "일반형시내버스",
-         "end_station": "군포공영차고지", "station_seq": [5]},
+         "end_station": "군포공영차고지", "low_bus_yn": None, "low_bus_base_dt": None,
+         "station_seq": [5]},
         {"route_id": 241253001, "name": "2", "type": "마을버스",
-         "end_station": "안양역", "station_seq": [10, 34]},
+         "end_station": "안양역", "low_bus_yn": None, "low_bus_base_dt": None,
+         "station_seq": [10, 34]},
         {"route_id": 241253002, "name": "2-1", "type": "마을버스",
-         "end_station": "안양예술공원", "station_seq": [7]},
+         "end_station": "안양예술공원", "low_bus_yn": None, "low_bus_base_dt": None,
+         "station_seq": [7]},
     ]
 
 
@@ -121,7 +125,8 @@ def test_routes_decode_json_string_payload():
 
     out = _normalize_routes(None, '[{"route_id": 1, "name": "9", "type": "마을버스"}]')
     assert out == [{"route_id": 1, "name": "9", "type": "마을버스",
-                    "end_station": None, "station_seq": []}]
+                    "end_station": None, "low_bus_yn": None, "low_bus_base_dt": None,
+                    "station_seq": []}]
 
 
 def test_routes_expose_station_seq_for_direction():
