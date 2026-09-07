@@ -57,10 +57,17 @@ def _uturn_edges(G, path) -> set:
     return edges
 
 
+DERIVED_COST_LAMBDA = 4.0     # 정제 링크 비용 = length × (1 + λ(1 − confidence)) — 증거가 쌓이면 스스로 이긴다
+
+
 def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
     if data.get("blocked"):
         # 제보·실측 오버라이드(passable=false, engine.overrides) — 승인제로만 설정된다
         return False
+    conf = data.get("confidence")
+    if conf is not None and data.get("topo_source") == "derived" \
+            and float(conf) < float(getattr(profile, "derived_min_confidence", 0.0) or 0.0):
+        return False          # 정제 링크 활성 하한 미달 — 이 프로필에는 없는 링크 (v1.23.0)
     if data["link_type"] in profile.avoid:
         return False
     # max_slope_deg 는 하드 상한(profile.hard_slope() 또는 완화 단계). 짧은 링크는 경사로 막지 않는다 (v1.20.0)
@@ -84,6 +91,9 @@ def edge_cost(data: dict, profile: Profile, penalty: float = 1.0) -> float:
         # 권장 초과 구간은 우회로가 있으면 피하되, 우회가 몇 배로 길어지면 그냥 지난다 (v1.20.0)
         cost *= 1.0 + float(getattr(profile, "slope_over_penalty", 1.0)) * over
     cost *= profile.penalize.get(data["link_type"], 1.0)
+    conf = data.get("confidence")
+    if conf is not None and data.get("topo_source") == "derived":
+        cost *= 1.0 + DERIVED_COST_LAMBDA * (1.0 - float(conf))
     return cost * penalty
 
 
@@ -180,12 +190,13 @@ def _geometry(G, path) -> list:
 
 
 def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
-         relax: bool = True) -> dict:
+         relax: bool = True, graph=None) -> dict:
     """경로 탐색 + 대안 경로.
 
+    graph: 요청 단위 그래프 사본(가상 노드 포함, engine.vsnap) — 없으면 store.graph.
     반환: {"routes": [...], "fallback": {...}}
     """
-    G = store.graph
+    G = graph if graph is not None else store.graph
     if start_node == goal_node:
         raise NoRouteError("출발지와 목적지가 같은 지점입니다")
 

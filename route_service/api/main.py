@@ -23,6 +23,7 @@ from ..engine.access import BuildingIndex, ManualEntrances, resolve_access_point
 from ..engine.graph import STORE as NET
 from ..engine.planner import NoRouteError, off_route_distance_m, plan
 from ..engine.snap import SnapError, snap
+from ..engine import vsnap
 from ..engine.steps import build_steps
 from ..collect import store as collect_store
 from ..engine.overrides import apply_overrides
@@ -204,6 +205,81 @@ def _resolve_destination(dest: Destination, profile, allowed=None) -> dict:
     return resolved
 
 
+
+# ────────────────────────── 링크 투영 스냅 (#67, v1.23.0) ──────────────────────────
+ENTRANCE_SOURCES = ("manual_survey", "accessible_entrance")   # 출입구로 해석된 도착점은 노드 스냅 유지
+LOS = None                                                    # 시선 검사(건물·옹벽·담장) — startup 에서 채운다
+
+
+def _los():
+    global LOS
+    if LOS is None:
+        LOS = vsnap.LineOfSight(buildings=BUILDINGS, obstacles=None)
+    return LOS
+
+
+def _endpoint_candidates(H, lat, lng, profile, allowed, tag: str, allow_virtual: bool = True) -> list:
+    """출발·도착 후보 [(node_id, dist_m, (lat,lng), kind)] — 링크 투영 후보(최대 K) 뒤에 노드 스냅 폴백."""
+    out = []
+    if allow_virtual and settings.edge_snap:
+        try:
+            cands = vsnap.candidates(NET, lat, lng, profile, profile.hard_slope() + 4.0, allowed=allowed,
+                                     radius_m=settings.edge_snap_radius_m, k=settings.edge_snap_k, los=_los())
+        except Exception as e:                       # 투영은 개선 기능 — 실패해도 노드 스냅으로 계속
+            logger.warning("링크 투영 스냅 실패(%s) — 노드 스냅으로 진행", e)
+            cands = []
+        for i, c in enumerate(cands):
+            nid = vsnap.attach(H, c, "%s%s_%d" % (vsnap.VIRTUAL_PREFIX, tag, i))
+            out.append((nid, c["dist_m"], (c["lat"], c["lng"]), "edge"))
+    s = snap(NET, lat, lng, profile, settings.snap_max_dist_m, allowed=allowed)
+    node = (s["node_id"], s["dist_m"], (s["snapped"]["lat"], s["snapped"]["lng"]), "node")
+    # 노드가 좌표 바로 위(≤ 2m)면 그 노드가 정답이고, 노드보다 5m 넘게 먼 링크는 더 나은 접근점이 될 수 없다 —
+    # 그런 후보를 남기면 경로 비용(경사·횡단 가중)이 조금 낮은 먼 접근점이 뽑혀 유턴이 생긴다(실측 2026-09-07)
+    if s["dist_m"] <= vsnap.NODE_EXACT_M:
+        return [node]
+    out = [c for c in out if c[1] <= s["dist_m"] + vsnap.EDGE_OVER_NODE_TOL_M]
+    out.append(node)
+    return out
+
+
+def _pair_cost(H, a, b, profile):
+    from ..engine.planner import _astar, edge_cost
+    import networkx as nx
+    for lvl in (profile.hard_slope(), profile.hard_slope() + 4.0):
+        try:
+            path = _astar(H, a, b, profile, lvl)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+        return sum(edge_cost(H[u][v], profile) for u, v in zip(path[:-1], path[1:]))
+    return None
+
+
+def _choose_endpoints(H, o_cands, d_cands, profile):
+    """(출발 후보, 도착 후보) 중 "투영 거리 + 경로 비용" 최소 조합.
+
+    조합 전수(K+1)² 대신 도착은 최근접 후보로 고정해 출발을 고르고, 그 출발로 도착을 고른다(≤ 2(K+1) 회 탐색).
+    한 쪽이 후보 하나뿐이면 그대로 쓴다. 경로가 없는 후보는 건너뛰고, 전부 없으면 노드 스냅 폴백을 돌려준다.
+    """
+    def pick(fixed, cands, fixed_first):
+        if len(cands) == 1:
+            return cands[0]
+        best = None
+        for c in cands:
+            if c[0] == fixed[0]:
+                continue
+            cost = _pair_cost(H, fixed[0], c[0], profile) if fixed_first else _pair_cost(H, c[0], fixed[0], profile)
+            if cost is None:
+                continue
+            total = cost + c[1]
+            if best is None or total < best[0]:
+                best = (total, c)
+        return best[1] if best else cands[-1]
+
+    o = pick(d_cands[0], o_cands, fixed_first=False)
+    d = pick(o, d_cands, fixed_first=True)
+    return o, d
+
+
 def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
                alternatives: int, constraints=None) -> dict:
     if not NET.loaded:
@@ -226,26 +302,32 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
 
     target = _resolve_destination(dest, profile, allowed)
 
+    # 링크 투영 스냅(#67): 출발지와 좌표·건물 대표점 도착지는 링크 위 점에, 실측 출입구는 노드에 붙인다
+    H = vsnap.virtual_graph(NET)
     try:
-        s = snap(NET, origin_lat, origin_lng, profile, settings.snap_max_dist_m, allowed=allowed)
-        g = snap(NET, target["lat"], target["lng"], profile, settings.snap_max_dist_m, allowed=allowed)
+        o_cands = _endpoint_candidates(H, origin_lat, origin_lng, profile, allowed, "o")
+        d_cands = _endpoint_candidates(H, target["lat"], target["lng"], profile, allowed, "d",
+                                       allow_virtual=target.get("source") not in ENTRANCE_SOURCES)
     except SnapError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    if not s["reachable"]:
+    if all(c[1] > settings.snap_max_dist_m for c in o_cands):
         raise HTTPException(
             status_code=422,
             detail="현재 위치가 보행 네트워크에서 %.0fm 떨어져 있어 경로를 만들 수 없습니다"
-            % s["dist_m"],
+            % min(c[1] for c in o_cands),
         )
+    o_sel, d_sel = _choose_endpoints(H, o_cands, d_cands, profile)
+    s = {"node_id": o_sel[0], "dist_m": round(o_sel[1], 1), "snapped": {"lat": o_sel[2][0], "lng": o_sel[2][1]}, "kind": o_sel[3]}
+    g = {"node_id": d_sel[0], "dist_m": round(d_sel[1], 1), "snapped": {"lat": d_sel[2][0], "lng": d_sel[2][1]}, "kind": d_sel[3]}
 
     relax = True if constraints is None else constraints.relax_if_no_route
     try:
-        result = plan(NET, s["node_id"], g["node_id"], profile, alternatives, relax=relax)
+        result = plan(NET, s["node_id"], g["node_id"], profile, alternatives, relax=relax, graph=H)
     except NoRouteError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    G = NET.graph
+    G = H
     route_id = "r_%s" % uuid.uuid4().hex[:10]
     routes = []
     for r in result["routes"]:
@@ -262,11 +344,12 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
         "profile": profile.id,
         "network_version": NET.meta.get("network_version"),
         "origin": {"lat": origin_lat, "lng": origin_lng,
-                   "snapped": s["snapped"], "snap_dist_m": s["dist_m"]},
+                   "snapped": s["snapped"], "snap_dist_m": s["dist_m"], "snap_kind": s["kind"]},
         "destination": {"type": dest.type, "poi_id": dest.poi_id,
                         "lat": target["lat"], "lng": target["lng"],
                         "resolved_by": target["source"],
-                        "note": _entrance_note(target)},
+                        "note": _entrance_note(target),
+                        "snapped": g["snapped"], "snap_dist_m": g["dist_m"], "snap_kind": g["kind"]},
         "routes": routes,
         "fallback": result["fallback"],
         "data_quality": {
@@ -301,23 +384,28 @@ LOW_BUS_WARNING = ("저상버스 정차 여부는 보장되지 않습니다 — 
                    "실시간 도착정보로 저상 차량을 확인하세요")
 
 
-def _walk_leg(frm, to, profile, allowed, label_from, label_to):
-    """도보 leg 1개 — 기존 보행 라우팅 재사용. 15m 미만은 leg 생략(None)."""
+def _walk_leg(frm, to, profile, allowed, label_from, label_to, to_is_entrance: bool = False):
+    """도보 leg 1개 — 기존 보행 라우팅 재사용. 15m 미만은 leg 생략(None).
+
+    양 끝은 링크 투영 스냅(#67)을 쓴다. 실측 출입구로 해석된 목적지만 노드 스냅(to_is_entrance).
+    """
     straight = transit.haversine_m(frm[0], frm[1], to[0], to[1])
     if straight < 15.0:
         return None
-    s = snap(NET, frm[0], frm[1], profile, settings.snap_max_dist_m, allowed=allowed)
-    g = snap(NET, to[0], to[1], profile, settings.snap_max_dist_m, allowed=allowed)
-    if s["node_id"] == g["node_id"]:
-        return None      # 같은 노드로 스냅되는 지척 이동 — leg 생략
-    result = plan(NET, s["node_id"], g["node_id"], profile, 1, relax=True)
+    H = vsnap.virtual_graph(NET)
+    o_cands = _endpoint_candidates(H, frm[0], frm[1], profile, allowed, "wo")
+    d_cands = _endpoint_candidates(H, to[0], to[1], profile, allowed, "wd", allow_virtual=not to_is_entrance)
+    o_sel, d_sel = _choose_endpoints(H, o_cands, d_cands, profile)
+    if o_sel[0] == d_sel[0]:
+        return None      # 같은 지점으로 스냅되는 지척 이동 — leg 생략
+    result = plan(NET, o_sel[0], d_sel[0], profile, 1, relax=True, graph=H)
     r = result["routes"][0]
     leg = {
         "kind": "walk",
         "from_label": label_from, "to_label": label_to,
         "summary": r["summary"],
         "geometry": r["geometry"],
-        "steps": build_steps(NET.graph, r["path"], profile),
+        "steps": build_steps(H, r["path"], profile),
         "fallback": result["fallback"],
     }
     # 보행망 단절 가능성 — 짧은 직선을 크게 우회하면 위상 문제일 확률이 높다(#30 안양역)
@@ -599,7 +687,9 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             for part in cand["parts"]:
                 if part["kind"] == "walk":
                     leg = _walk_leg(part["frm"][1], part["to"][1], profile, allowed,
-                                    part["frm"][0], part["to"][0])
+                                    part["frm"][0], part["to"][0],
+                                    to_is_entrance=(part["to"][0] == "목적지"
+                                                    and target.get("source") in ENTRANCE_SOURCES))
                     if leg is not None:
                         built.append(leg)
                 elif part["kind"] == "bus":

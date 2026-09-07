@@ -33,6 +33,9 @@ class Profile:
     requires_curb_cut: bool = False
     hard_slope_deg: float = 0.0          # 0 = max_slope_deg 와 동일 (v1.20.0)
     slope_over_penalty: float = 1.0      # 권장 초과 1도당 비용 가중 배수 증가분 (v1.20.0)
+    # 정제로 신설된 직결 링크(topo_source='derived')의 활성 하한 (v1.23.0, #67).
+    # 링크 속성 confidence 가 이 값 미만이면 이 프로필에는 존재하지 않는 링크다.
+    derived_min_confidence: float = 0.40
 
     def hard_slope(self) -> float:
         """통행 불가 경사 상한 — 권장 상한보다 낮게는 잡히지 않는다(제약으로 max 를 올리면 같이 올라간다)."""
@@ -48,6 +51,7 @@ class Profile:
             "avoid": list(self.avoid),
             "min_width_m": self.min_width_m,
             "requires_curb_cut": self.requires_curb_cut,
+            "derived_min_confidence": self.derived_min_confidence,
         }
 
 
@@ -66,6 +70,7 @@ PROFILES = {
         requires_curb_cut=True,
         hard_slope_deg=8.0,
         slope_over_penalty=1.0,
+        derived_min_confidence=0.60,
     ),
     "wheelchair_electric": Profile(
         id="wheelchair_electric",
@@ -79,6 +84,7 @@ PROFILES = {
         requires_curb_cut=True,
         hard_slope_deg=10.0,
         slope_over_penalty=0.6,
+        derived_min_confidence=0.55,
     ),
     "crutch": Profile(
         id="crutch",
@@ -99,6 +105,7 @@ PROFILES = {
         avoid=(),
         penalize={"crossing": 1.5, "overpass": 2.0, "underpass": 1.5},
         min_width_m=0.0,
+        derived_min_confidence=0.70,
     ),
     "walk": Profile(
         id="walk",

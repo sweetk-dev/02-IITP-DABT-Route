@@ -115,6 +115,24 @@ class ObstacleIndex:
         buf = line.buffer(clearance_m / _kx(line.centroid.y))
         return bool(self._hits(FURNITURE, buf))
 
+    def furniture_gap_below(self, line, gap_m: float = 0.8, search_m: float = 2.0) -> bool:
+        """선분 근처 점형 지물(볼라드·가로수)과 다른 지물·옹벽·담장 사이 통과 간격이 gap_m 미만인가 (#67 H12)."""
+        lat = line.centroid.y
+        near = self._hits(FURNITURE, line.buffer(search_m / _kx(lat)))
+        if not near:
+            return False
+        others = []
+        for klass in (WALL, FENCE, FURNITURE):
+            others += self._hits(klass, line.buffer((search_m + gap_m) / _kx(lat)))
+        tol = gap_m / _kx(lat)
+        for p in near:
+            for o in others:
+                if o is p:
+                    continue
+                if 0 < p.distance(o) < tol:
+                    return True
+        return False
+
     def blocks_new_link(self, line) -> str | None:
         """신설 링크 하드 게이트. 배제 사유 문자열, 통과면 None."""
         if self.crosses_stairs(line, min_m=0.5):
