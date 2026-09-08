@@ -50,6 +50,31 @@ MVPOI_FACILITY_MAP = {
     "지체장애인 관람석 있음": "accessible_room_yn",
 }
 
+# ── 무장애 속성 오버레이 (v1.24.0) ──────────────────────────────────────────
+# 종전에는 mv_poi(경기관광공사) 하나만 봤다. 통합DB 에 이미 적재돼 있는 두 소스를
+# 결합하지 않아 안양 관광 POI 228건 중 25건만 추천 후보가 됐다(2026-09-07 실측).
+#   1) mv_poi.detail_json.accessible_facilities  — 경기관광공사(GGTOUR)
+#   2) poi_tour_bf_facility                      — 한국관광공사 무장애여행(KorWith)
+#   3) poi_facility_accessibility                — 한국사회보장정보원 장애인편의시설
+FACL_FIELD_MAP = {
+    "dis_toilet_yn": "toilet_yn",
+    "elevator_yn": "elevator_yn",
+    "dis_parking_yn": "parking_yn",
+    "entrance_ramp_yn": "slope_yn",
+    "approach_road_yn": "slope_yn",
+    "accessible_room_yn": "accessible_room_yn",
+    "guide_facility_yn": "tactile_map_yn",
+}
+# 좌표 매칭 상한. 30m 를 넘기면 이웃 건물 오결합이 급격히 는다(100m 에서 식당↔모텔
+# 18m 급 오결합 다수 실측) — 넓히지 말 것.
+FACL_MATCH_M = 30.0
+BF_MATCH_M = 150.0        # 한국관광공사분은 이름 일치가 1차, 좌표는 보조
+# 이름이 안 맞아도 같은 건물로 볼 수 있는 거리. 백화점 입점 매장(거리 0m)처럼
+# 이름이 다를 수밖에 없는 정상 매칭을 살리되, 이웃 건물 오결합은 막는다.
+SAME_BUILDING_M = 15.0
+SOURCE_LABELS = {"ggtour": "경기관광공사", "kto": "한국관광공사",
+                 "kowsi": "한국사회보장정보원"}
+
 # 장애 유형 -> 필요한 편의시설 필드 (10-TripSense 매칭 로직과 동일한 사고)
 DISABILITY_REQUIREMENTS = {
     "지체장애": ["toilet_yn", "elevator_yn", "parking_yn", "slope_yn", "wheelchair_rent_yn"],
@@ -236,6 +261,12 @@ class PoiStore:
         if self.backend == "none":
             return []
         variants = sigungu_variants(sigungu)
+        # 오버레이 결합은 지역당 한 번만 계산한다. /tour/recommend 는 total 산출 때문에
+        # 같은 호출을 두 번 하므로 캐시가 없으면 매칭 비용이 그대로 두 배가 된다.
+        merged_key = "spots:%s:%d" % ("|".join(variants or []), limit)
+        if self.backend == "db" and merged_key in self._cache:
+            out = self._cache[merged_key]
+            return self._bbox_filter(out, bbox)[:limit]
         if self.backend == "file":
             rows = self._load_file("tour_bf.json")
         else:
@@ -244,6 +275,11 @@ class PoiStore:
             # POI(거리 307km)까지 포함시켰다(#26). title 대조도 같은 이유로 지역
             # 필터에서 제외한다(이름 검색은 get_tour_spot 의 이름 폴백이 담당).
             sg_clause = ""
+            # 지역이 지정되지 않은 호출(get_tour_spot 의 ID·이름 폴백 스캔)은 종전처럼
+            # 속성 보유 행으로 좁힌다. 필터를 풀면 전국 5만여 건에서 LIMIT 만큼 임의로
+            # 잘려 안양 POI 가 통째로 빠진다(2026-09-08 실측).
+            fac_clause = "" if variants else \
+                "AND COALESCE(detail_json->>'accessible_facilities', '') <> ''"
             params = {"limit": limit}
             if variants:
                 ors = []
@@ -265,24 +301,32 @@ class PoiStore:
                   FROM mv_poi
                  WHERE language_code = 'ko'
                    AND latitude IS NOT NULL AND longitude IS NOT NULL
-                   AND COALESCE(detail_json->>'accessible_facilities', '') <> ''
+                   {fac}
                    {sg}
                  LIMIT :limit
-                """.format(sg=sg_clause),
+                """.format(fac=fac_clause, sg=sg_clause),
                 params,
             )
         out = [self._normalize_tour(r) for r in rows]
+        # 3소스 결합 — mv_poi 만으로는 대부분이 "정보 없음" 이라 후보에서 탈락한다.
+        out = self._apply_overlays(out, variants)
         if variants and self.backend == "file":
             out = [r for r in out if _addr_in_sigungu(r.get("addr"), variants)]
-        if bbox:
-            min_lat, min_lng, max_lat, max_lng = bbox
-            out = [
-                r for r in out
-                if r["lat"] is not None
-                and min_lat <= r["lat"] <= max_lat
-                and min_lng <= r["lng"] <= max_lng
-            ]
-        return out[:limit]
+        if self.backend == "db":
+            self._cache[merged_key] = out
+        return self._bbox_filter(out, bbox)[:limit]
+
+    @staticmethod
+    def _bbox_filter(rows: list, bbox) -> list:
+        if not bbox:
+            return rows
+        min_lat, min_lng, max_lat, max_lng = bbox
+        return [
+            r for r in rows
+            if r["lat"] is not None
+            and min_lat <= r["lat"] <= max_lat
+            and min_lng <= r["lng"] <= max_lng
+        ]
 
     @staticmethod
     def _facilities_from_text(text: str) -> dict:
@@ -293,6 +337,159 @@ class PoiStore:
             if key:
                 fac[key] = True
         return fac
+
+    # ---------- 무장애 속성 오버레이 (v1.24.0) ----------
+    def _overlay_rows(self, variants):
+        """지역별 오버레이 2종을 한 번만 읽어 캐시한다(배치로만 바뀌는 데이터)."""
+        key = "overlay:%s" % "|".join(variants or [])
+        if key in self._cache:
+            return self._cache[key]
+        bf, facl = [], []
+        if self.backend == "db":
+            params, clause = {}, ""
+            if variants:
+                ors = []
+                for i, v in enumerate(variants):
+                    ors.append("COALESCE(addr_road, '') LIKE '%%' || :v{0} || '%%'"
+                               " OR COALESCE(addr_jibun, '') LIKE '%%' || :v{0} || '%%'".format(i))
+                    params["v%d" % i] = v
+                clause = " AND (%s)" % " OR ".join(ors)
+            try:
+                bf = self._query(
+                    "SELECT fclt_id, fclt_name, latitude, longitude,"
+                    " toilet_yn, elevator_yn, parking_yn, slope_yn, subway_yn, bus_stop_yn,"
+                    " wheelchair_rent_yn, tactile_map_yn, audio_guide_yn, nursing_room_yn,"
+                    " accessible_room_yn, stroller_rent_yn"
+                    " FROM poi_tour_bf_facility"
+                    " WHERE del_yn = 'N' AND latitude IS NOT NULL" + clause, params)
+            except Exception:
+                logger.warning("poi_tour_bf_facility 조회 실패 — 해당 오버레이 생략", exc_info=True)
+            params2, clause2 = {}, ""
+            if variants:
+                ors = []
+                for i, v in enumerate(variants):
+                    ors.append("COALESCE(addr, '') LIKE '%%' || :w{0} || '%%'".format(i))
+                    params2["w%d" % i] = v
+                clause2 = " AND (%s)" % " OR ".join(ors)
+            try:
+                facl = self._query(
+                    "SELECT facl_id, facl_name, facl_type, latitude, longitude,"
+                    " dis_toilet_yn, elevator_yn, dis_parking_yn, entrance_ramp_yn,"
+                    " approach_road_yn, accessible_room_yn, guide_facility_yn"
+                    " FROM poi_facility_accessibility"
+                    " WHERE del_yn = 'N' AND latitude IS NOT NULL" + clause2, params2)
+            except Exception:
+                logger.warning("poi_facility_accessibility 조회 실패 — 해당 오버레이 생략", exc_info=True)
+        self._cache[key] = (bf, facl)
+        return bf, facl
+
+    @staticmethod
+    def _pick_overlay(spot, rows, name_key, max_m):
+        """이름 일치를 1순위, 거리를 2순위로 오버레이 행 하나를 고른다.
+
+        이름이 안 맞으면 같은 건물로 볼 수 있는 거리(SAME_BUILDING_M) 안에서만
+        받아들인다 — 100m 로 넓히면 식당에 이웃 모텔의 편의시설이 붙는다(실측).
+        """
+        if spot.get("lat") is None or spot.get("lng") is None:
+            return None, None
+        nq = _norm_name(spot.get("name"))
+        best = None
+        for r in rows:
+            la, lo = r.get("latitude"), r.get("longitude")
+            if la is None or lo is None:
+                continue
+            dist = haversine_m(spot["lat"], spot["lng"], float(la), float(lo))
+            if dist > max_m:
+                continue
+            rank = _name_match_rank(nq, r.get(name_key) or "")
+            if rank is None and dist > SAME_BUILDING_M:
+                continue
+            key = (0 if rank is not None else 1, rank if rank is not None else 9, dist)
+            if best is None or key < best[0]:
+                best = (key, r, dist, rank)
+        if best is None:
+            return None, None
+        return best[1], {"name": best[1].get(name_key), "distance_m": round(best[2], 1),
+                         "by": "name" if best[3] is not None else "coords"}
+
+    def _assign_overlay(self, spots: list, rows: list, name_key: str, max_m: float) -> dict:
+        """오버레이 행 하나는 POI 하나에만 붙인다.
+
+        한 건물에 입점 매장이 여럿이면(롯데백화점 평촌점 40여 개) 좌표만으로는 매장
+        전부에 백화점 편의시설이 붙어 추천 목록이 매장으로 뒤덮인다. 행 단위로
+        이름 일치 > 근접 순으로 대표 POI 하나만 고른다.
+        """
+        best = {}
+        for idx, spot in enumerate(spots):
+            row, meta = self._pick_overlay(spot, rows, name_key, max_m)
+            if row is None:
+                continue
+            key = id(row)
+            rank = (0 if meta.get("by") == "name" else 1, meta.get("distance_m") or 0.0)
+            if key not in best or rank < best[key][0]:
+                best[key] = (rank, idx, row, meta)
+        return {idx: (row, meta) for _, idx, row, meta in best.values()}
+
+    def _apply_overlays(self, spots: list, variants) -> list:
+        """mv_poi 기반 결과에 한국관광공사·한국사회보장정보원 속성을 덧씌운다.
+
+        병합 규칙: 어느 소스든 Y 면 Y(합집합). 다른 소스가 N 이면 값은 유지하되
+        ``facility_conflicts`` 로 남긴다 — 상충 자체가 현장 검증 대상이다.
+        세 소스 어디에도 정보가 없는 POI 는 무장애 후보가 아니므로 제외한다.
+        """
+        if self.backend != "db" or not variants:
+            # file/none 백엔드는 픽스처를 그대로 쓴다 — 종전에도 속성 필터가 없었다.
+            # 지역 미지정 호출은 SQL 단계에서 이미 속성 보유 행으로 좁혀져 있다.
+            return spots
+        bf_rows, facl_rows = self._overlay_rows(variants)
+        if not bf_rows and not facl_rows:
+            return [s for s in spots if any((s.get("facilities") or {}).values())]
+        bf_assign = self._assign_overlay(spots, bf_rows, "fclt_name", BF_MATCH_M)
+        facl_assign = self._assign_overlay(spots, facl_rows, "facl_name", FACL_MATCH_M)
+        out = []
+        for idx, spot in enumerate(spots):
+            fac = dict(spot.get("facilities") or {})
+            sources = {k: (["ggtour"] if fac.get(k) else []) for k in TOUR_FIELDS}
+            conflicts, matched = [], {}
+
+            bf, bf_meta = bf_assign.get(idx, (None, None))
+            if bf is not None:
+                matched["kto"] = bf_meta
+                for field in TOUR_FIELDS:
+                    val = bf.get(field)
+                    if val is None or str(val).strip() == "":
+                        continue
+                    if _is_y(val):
+                        fac[field] = True
+                        sources[field].append("kto")
+                    elif sources[field]:
+                        conflicts.append({"field": field, "yes": list(sources[field]), "no": "kto"})
+
+            facl, facl_meta = facl_assign.get(idx, (None, None))
+            if facl is not None:
+                matched["kowsi"] = facl_meta
+                for col, field in FACL_FIELD_MAP.items():
+                    val = facl.get(col)
+                    if val is None or str(val).strip() == "":
+                        continue
+                    if _is_y(val):
+                        fac[field] = True
+                        if "kowsi" not in sources[field]:
+                            sources[field].append("kowsi")
+                    elif sources[field] and "kowsi" not in sources[field]:
+                        conflicts.append({"field": field, "yes": list(sources[field]), "no": "kowsi"})
+
+            if not any(fac.values()):
+                continue
+            merged = dict(spot)
+            merged["facilities"] = fac
+            merged["facility_sources"] = {k: v for k, v in sources.items() if v}
+            if conflicts:
+                merged["facility_conflicts"] = conflicts
+            if matched:
+                merged["facility_match"] = matched
+            out.append(merged)
+        return out
 
     @staticmethod
     def _normalize_tour(r: dict) -> dict:
@@ -398,6 +595,21 @@ class PoiStore:
         ID 전용 조회는 404 를 낸다. 이름 폴백으로 실사용 실패를 막는다.
         """
         key = str(poi_id).strip()
+        if self.backend == "db" and key.isdigit():
+            # ID 직접 조회 — 좌표 해석이 목적이므로 무장애 속성 보유 여부와 무관하게
+            # 찾아야 한다. 종전에는 전국 목록을 LIMIT 1만으로 훑어서, 속성이 아직
+            # 안 채워진 신규 등재 POI 는 검색은 되는데 목적지로는 못 쓰였다.
+            direct = self._query(
+                "SELECT poi_id, title AS name,"
+                " COALESCE(address_road, address_detail) AS addr, latitude, longitude,"
+                " detail_json->>'accessible_facilities' AS fac_text,"
+                " search_filter_json->'search_filter'->>'tourist_type' AS tourist_type"
+                "  FROM mv_poi"
+                " WHERE poi_id = :pid AND language_code = 'ko'"
+                "   AND COALESCE(is_deleted, 'N') = 'N'"
+                " LIMIT 1", {"pid": int(key)})
+            if direct:
+                return self._normalize_tour(direct[0])
         rows = self.list_tour_spots(limit=10000)
         for r in rows:
             if r["poi_id"] == key:
