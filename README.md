@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.23.1 |
+| 02-IITP-DABT-Route | v1.24.0 |
 
 ## 구조
 
@@ -28,6 +28,9 @@ route_service/
       osm.py           OpenStreetMap 보행망 어댑터
       tabular.py       node/link 표(xlsx·csv) 어댑터
   poi/store.py         무장애 관광지 · 대중교통 접근점 (db | file | none)
+                       무장애 속성은 3소스 결합 — mv_poi(경기관광공사) +
+                       poi_tour_bf_facility(한국관광공사) +
+                       poi_facility_accessibility(한국사회보장정보원)
   api/main.py          FastAPI
 scripts/
   build_network.py     그래프 구축 CLI
