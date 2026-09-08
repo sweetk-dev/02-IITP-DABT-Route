@@ -13,14 +13,20 @@ import uuid
 
 import networkx as nx
 
-from .geo import bearing_deg, haversine_m, path_length_m, point_segment_dist_m, turn_angle
+from .geo import (haversine_m, lead_bearing, path_length_m,
+                  point_segment_dist_m, trail_bearing, turn_angle)
 from .graph import edge_coords
 from .profiles import Profile
 
 # 유턴 판정 각도 — steps.py 의 턴바이턴 유턴 기준(150도)과 동일해야
 # "안내에는 유턴으로 뜨는데 탐색은 못 잡는" 불일치가 안 생긴다.
 UTURN_ANGLE_DEG = 150.0
+# 유턴 검출용 방위각 측정 구간(m) — steps.BEARING_SPAN_M 과 같은 취지 (v1.21.0)
+UTURN_BEARING_SPAN_M = 10.0
 UTURN_RETRY = 3
+# 짧은 링크(횡단보도 8m 등)의 DEM 경사는 5m 격자 보간 오차가 그대로 각도로 튄다(8m 링크 1.1m 차이 = 7.8°).
+# 이 길이 미만은 경사로 통행을 막지 않고 비용 가중만 한다 (v1.20.0).
+SHORT_LINK_M = 15.0
 
 
 class NoRouteError(Exception):
@@ -39,8 +45,10 @@ def _uturn_edges(G, path) -> set:
     prev_edge = None
     for u, v in zip(path[:-1], path[1:]):
         coords = edge_coords(G, u, v)
-        in_b = bearing_deg(coords[0][0], coords[0][1], coords[1][0], coords[1][1])
-        out_b = bearing_deg(coords[-2][0], coords[-2][1], coords[-1][0], coords[-1][1])
+        # 방위각은 끝단 두 점이 아니라 진행 구간으로 잰다 — 미세 절점 때문에 멀쩡한
+        # 링크가 유턴으로 오검출돼 페널티를 받고 오히려 우회가 나오던 것을 막는다 (v1.21.0)
+        in_b = lead_bearing(coords, UTURN_BEARING_SPAN_M)
+        out_b = trail_bearing(coords, UTURN_BEARING_SPAN_M)
         if prev_out is not None and abs(turn_angle(prev_out, in_b)) >= UTURN_ANGLE_DEG:
             edges.add(prev_edge)
             edges.add(frozenset((u, v)))
@@ -49,13 +57,21 @@ def _uturn_edges(G, path) -> set:
     return edges
 
 
+DERIVED_COST_LAMBDA = 4.0     # 정제 링크 비용 = length × (1 + λ(1 − confidence)) — 증거가 쌓이면 스스로 이긴다
+
+
 def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
     if data.get("blocked"):
         # 제보·실측 오버라이드(passable=false, engine.overrides) — 승인제로만 설정된다
         return False
+    conf = data.get("confidence")
+    if conf is not None and data.get("topo_source") == "derived" \
+            and float(conf) < float(getattr(profile, "derived_min_confidence", 0.0) or 0.0):
+        return False          # 정제 링크 활성 하한 미달 — 이 프로필에는 없는 링크 (v1.23.0)
     if data["link_type"] in profile.avoid:
         return False
-    if data["slope"] > max_slope_deg:
+    # max_slope_deg 는 하드 상한(profile.hard_slope() 또는 완화 단계). 짧은 링크는 경사로 막지 않는다 (v1.20.0)
+    if data["slope"] > max_slope_deg and float(data.get("length") or 0.0) >= SHORT_LINK_M:
         return False
     w = data.get("width")
     if profile.min_width_m and w is not None and w < profile.min_width_m:
@@ -68,8 +84,16 @@ def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
 
 def edge_cost(data: dict, profile: Profile, penalty: float = 1.0) -> float:
     length = max(float(data["length"]), 0.1)
-    cost = length * (1.0 + profile.slope_factor * float(data["slope"]))
+    slope = float(data["slope"])
+    cost = length * (1.0 + profile.slope_factor * slope)
+    over = slope - float(profile.max_slope_deg)
+    if over > 0:
+        # 권장 초과 구간은 우회로가 있으면 피하되, 우회가 몇 배로 길어지면 그냥 지난다 (v1.20.0)
+        cost *= 1.0 + float(getattr(profile, "slope_over_penalty", 1.0)) * over
     cost *= profile.penalize.get(data["link_type"], 1.0)
+    conf = data.get("confidence")
+    if conf is not None and data.get("topo_source") == "derived":
+        cost *= 1.0 + DERIVED_COST_LAMBDA * (1.0 - float(conf))
     return cost * penalty
 
 
@@ -108,7 +132,7 @@ def _summarize(G, path, profile, slope_coverage: float = 1.0) -> dict:
         if lt == "crossing" and d.get("curb_cut") is False:
             warnings.append("턱낮춤 없는 횡단보도 구간이 있습니다")
         warnings.extend(d.get("report_warnings") or [])   # 이용자 제보 경고 (overrides)
-        if float(d["slope"]) > profile.max_slope_deg:
+        if float(d["slope"]) > profile.max_slope_deg and float(d.get("length") or 0.0) >= SHORT_LINK_M:
             warnings.append(
                 "권장 경사(%.1f도)를 넘는 구간이 포함되어 있습니다" % profile.max_slope_deg
             )
@@ -166,19 +190,21 @@ def _geometry(G, path) -> list:
 
 
 def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
-         relax: bool = True) -> dict:
+         relax: bool = True, graph=None) -> dict:
     """경로 탐색 + 대안 경로.
 
+    graph: 요청 단위 그래프 사본(가상 노드 포함, engine.vsnap) — 없으면 store.graph.
     반환: {"routes": [...], "fallback": {...}}
     """
-    G = store.graph
+    G = graph if graph is not None else store.graph
     if start_node == goal_node:
         raise NoRouteError("출발지와 목적지가 같은 지점입니다")
 
-    fallback = {"used": False, "reason": None, "applied_max_slope_deg": profile.max_slope_deg}
-    levels = [profile.max_slope_deg]
+    hard = profile.hard_slope()   # 하드 상한 (v1.20.0) — 권장 상한(max_slope_deg) 초과는 가중으로 처리한다
+    fallback = {"used": False, "reason": None, "applied_max_slope_deg": hard}
+    levels = [hard]
     if relax:
-        levels += [profile.max_slope_deg + 2.0, profile.max_slope_deg + 4.0]
+        levels += [hard + 2.0, hard + 4.0]
 
     primary = None
     for i, lvl in enumerate(levels):
@@ -189,7 +215,7 @@ def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
                     "used": True,
                     "reason": (
                         "제약(최대 경사 %.1f도)을 만족하는 경로가 없어 %.1f도까지 완화해 탐색했습니다"
-                        % (profile.max_slope_deg, lvl)
+                        % (hard, lvl)
                     ),
                     "applied_max_slope_deg": lvl,
                 }

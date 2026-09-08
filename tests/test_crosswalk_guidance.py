@@ -68,8 +68,19 @@ def test_crossing_point_step_warns_when_no_curb_cut():
 
     cw = [s for s in steps if s["maneuver"] == "crossing_point"][0]
     assert "턱낮춤 없음" in cw["warnings"]
-    assert "점자블록 없음" in cw["warnings"]
+    assert "점자블록 없음" not in cw["warnings"]   # 휠체어 프로필엔 점자블록 경고를 붙이지 않는다 (v1.20.0)
     assert "턱낮춤 미상" not in cw["warnings"]
+
+
+def test_tactile_warning_only_for_visual_profile():
+    """v1.20.0 — '점자블록 없음' 은 시각장애 프로필 안내에만 (실증 2026-09-03: 지체장애 탭에서 점자블록 안내가 나왔다)."""
+    G = _base_graph()
+    G.nodes["N2"].update(crosswalk_cnt=1, cw_curb_cut=None, cw_tactile_paving=False)
+    p, r = _route(_store(G), "visual")
+    steps = build_steps(_store(G).graph, r["path"], p)
+    cw = [s for s in steps if s["maneuver"] == "crossing_point"][0]
+    assert "점자블록 없음" in cw["warnings"]
+    assert "점자블록 없음" in cw["instruction"]
 
 
 def test_multiple_crosswalks_on_node_mentioned_in_instruction():

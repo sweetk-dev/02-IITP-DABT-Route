@@ -43,6 +43,10 @@ class Settings:
 
     # 탐색 파라미터
     snap_max_dist_m: float = float(os.environ.get("SNAP_MAX_DIST_M", "300"))
+    # 링크 투영 스냅(#67) — 끄면 종전 노드 스냅만 쓴다
+    edge_snap: bool = os.environ.get("EDGE_SNAP", "true").lower() not in ("0", "false", "no")
+    edge_snap_radius_m: float = float(os.environ.get("EDGE_SNAP_RADIUS_M", "60"))
+    edge_snap_k: int = int(os.environ.get("EDGE_SNAP_K", "3"))
     max_alternatives: int = int(os.environ.get("MAX_ALTERNATIVES", "2"))
     off_route_threshold_m: float = float(os.environ.get("OFF_ROUTE_THRESHOLD_M", "30"))
 

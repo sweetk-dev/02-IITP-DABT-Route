@@ -53,7 +53,30 @@ def nearest(items, lat, lng, radius_m, k):
     return out[:k]
 
 
-def _direct_bus_pairs(stops_a, stops_b, origin=None, target=None):
+LOW_BUS_STALE_DAYS = 7          # 전일 기준 저상 노선 표가 이보다 오래되면 'N' 을 믿지 않는다
+
+
+def low_bus_route_ok(route: dict, today=None) -> bool:
+    """저상버스 우선 모드의 1차 필터 — 전일 기준 저상 운행 노선 표(01 low_bus_yn)로
+    저상이 아예 없는 노선을 후보에서 뺀다. 값이 없거나(NULL) 표가 오래되면 통과시킨다
+    (실시간 판정이 뒤에 있으므로 여기서 과하게 거르지 않는다)."""
+    yn = (route or {}).get("low_bus_yn")
+    if yn != "N":
+        return True
+    base = (route or {}).get("low_bus_base_dt")
+    if base:
+        try:
+            import datetime as _dt
+            d = _dt.date.fromisoformat(str(base)[:10])
+            t = today or _dt.date.today()
+            if (t - d).days > LOW_BUS_STALE_DAYS:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def _direct_bus_pairs(stops_a, stops_b, origin=None, target=None, route_ok=None):
     """직결 버스 조합 — 같은 노선이 올바른 순번 방향으로 두 정류장을 지나는 경우.
 
     회차 노선은 한 정류장에 순번이 여러 개다(예: [1, 42]) — 모든 (승차, 하차)
@@ -78,6 +101,8 @@ def _direct_bus_pairs(stops_a, stops_b, origin=None, target=None):
                 ra = routes_a.get(r.get("route_id"))
                 if not ra:
                     continue
+                if route_ok is not None and not route_ok(ra):
+                    continue          # 저상 우선 모드 1차 필터 등
                 best = None
                 for sa in (ra.get("station_seq") or []):
                     for sb in (r.get("station_seq") or []):
@@ -118,24 +143,28 @@ def _walk_est(*pts):
     return total * WALK_DETOUR
 
 
-def search(origin, target, mode, stops_near, stations):
+def search(origin, target, mode, stops_near, stations, stop_radius_m=None,
+           max_stops=None, route_ok=None):
     """조합 후보를 스코어 오름차순으로 반환.
 
     origin/target: (lat, lng)
     mode: walk_bus | walk_bus_subway
     stops_near(lat, lng, radius_m) -> 정류장 목록(routes 포함)
     stations: 안양 관내 역 목록(list_transit 의 정규화 형식 + line 판정은 이름 기반)
+    stop_radius_m / max_stops: 출발·도착 인근 정류장 탐색 반경·개수(기본 450m·6개).
+        저상버스 우선 모드는 450m 에 저상 후보가 없을 때만 800m 로 넓힌다(#64).
+    route_ok(route) -> bool: 버스 노선 사전 필터(None 이면 전부 허용).
     """
     o, t = origin, target
     cands = []
+    radius = float(stop_radius_m or STOP_RADIUS_M)
+    k = int(max_stops or MAX_CANDIDATE_STOPS)
 
-    stops_o = nearest(stops_near(o[0], o[1], STOP_RADIUS_M), o[0], o[1],
-                      STOP_RADIUS_M, MAX_CANDIDATE_STOPS)
-    stops_t = nearest(stops_near(t[0], t[1], STOP_RADIUS_M), t[0], t[1],
-                      STOP_RADIUS_M, MAX_CANDIDATE_STOPS)
+    stops_o = nearest(stops_near(o[0], o[1], radius), o[0], o[1], radius, k)
+    stops_t = nearest(stops_near(t[0], t[1], radius), t[0], t[1], radius, k)
 
     # ── 직결 버스 ──
-    for p in _direct_bus_pairs(stops_o, stops_t, origin=o, target=t):
+    for p in _direct_bus_pairs(stops_o, stops_t, origin=o, target=t, route_ok=route_ok):
         walk = (_walk_est(o, (p["board"]["lat"], p["board"]["lng"]))
                 + _walk_est((p["alight"]["lat"], p["alight"]["lng"]), t))
         score = walk + p["stop_cnt"] * STOP_PENALTY_M + TRANSIT_LEG_PENALTY_M
@@ -182,7 +211,7 @@ def search(origin, target, mode, stops_near, stations):
                 stops_s1 = nearest(stops_near(s1["lat"], s1["lng"], STOP_NEAR_STATION_M),
                                    s1["lat"], s1["lng"], STOP_NEAR_STATION_M, 4)
                 for p in _direct_bus_pairs(stops_o, stops_s1, origin=o,
-                                            target=(s1["lat"], s1["lng"])):
+                                            target=(s1["lat"], s1["lng"]), route_ok=route_ok):
                     line, n = hop
                     walk = (_walk_est(o, (p["board"]["lat"], p["board"]["lng"]))
                             + _walk_est((p["alight"]["lat"], p["alight"]["lng"]), (s1["lat"], s1["lng"]))

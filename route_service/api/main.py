@@ -23,12 +23,14 @@ from ..engine.access import BuildingIndex, ManualEntrances, resolve_access_point
 from ..engine.graph import STORE as NET
 from ..engine.planner import NoRouteError, off_route_distance_m, plan
 from ..engine.snap import SnapError, snap
+from ..engine import vsnap
 from ..engine.steps import build_steps
 from ..collect import store as collect_store
 from ..engine.overrides import apply_overrides
 from ..poi import store as poi_store
 from ..transit import gbis_live
 from ..transit import planner as transit
+from ..transit import low_floor as lowfloor
 from .schemas import (
     AccessReportRequest,
     Destination,
@@ -203,6 +205,81 @@ def _resolve_destination(dest: Destination, profile, allowed=None) -> dict:
     return resolved
 
 
+
+# ────────────────────────── 링크 투영 스냅 (#67, v1.23.0) ──────────────────────────
+ENTRANCE_SOURCES = ("manual_survey", "accessible_entrance")   # 출입구로 해석된 도착점은 노드 스냅 유지
+LOS = None                                                    # 시선 검사(건물·옹벽·담장) — startup 에서 채운다
+
+
+def _los():
+    global LOS
+    if LOS is None:
+        LOS = vsnap.LineOfSight(buildings=BUILDINGS, obstacles=None)
+    return LOS
+
+
+def _endpoint_candidates(H, lat, lng, profile, allowed, tag: str, allow_virtual: bool = True) -> list:
+    """출발·도착 후보 [(node_id, dist_m, (lat,lng), kind)] — 링크 투영 후보(최대 K) 뒤에 노드 스냅 폴백."""
+    out = []
+    if allow_virtual and settings.edge_snap:
+        try:
+            cands = vsnap.candidates(NET, lat, lng, profile, profile.hard_slope() + 4.0, allowed=allowed,
+                                     radius_m=settings.edge_snap_radius_m, k=settings.edge_snap_k, los=_los())
+        except Exception as e:                       # 투영은 개선 기능 — 실패해도 노드 스냅으로 계속
+            logger.warning("링크 투영 스냅 실패(%s) — 노드 스냅으로 진행", e)
+            cands = []
+        for i, c in enumerate(cands):
+            nid = vsnap.attach(H, c, "%s%s_%d" % (vsnap.VIRTUAL_PREFIX, tag, i))
+            out.append((nid, c["dist_m"], (c["lat"], c["lng"]), "edge"))
+    s = snap(NET, lat, lng, profile, settings.snap_max_dist_m, allowed=allowed)
+    node = (s["node_id"], s["dist_m"], (s["snapped"]["lat"], s["snapped"]["lng"]), "node")
+    # 노드가 좌표 바로 위(≤ 2m)면 그 노드가 정답이고, 노드보다 5m 넘게 먼 링크는 더 나은 접근점이 될 수 없다 —
+    # 그런 후보를 남기면 경로 비용(경사·횡단 가중)이 조금 낮은 먼 접근점이 뽑혀 유턴이 생긴다(실측 2026-09-07)
+    if s["dist_m"] <= vsnap.NODE_EXACT_M:
+        return [node]
+    out = [c for c in out if c[1] <= s["dist_m"] + vsnap.EDGE_OVER_NODE_TOL_M]
+    out.append(node)
+    return out
+
+
+def _pair_cost(H, a, b, profile):
+    from ..engine.planner import _astar, edge_cost
+    import networkx as nx
+    for lvl in (profile.hard_slope(), profile.hard_slope() + 4.0):
+        try:
+            path = _astar(H, a, b, profile, lvl)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+        return sum(edge_cost(H[u][v], profile) for u, v in zip(path[:-1], path[1:]))
+    return None
+
+
+def _choose_endpoints(H, o_cands, d_cands, profile):
+    """(출발 후보, 도착 후보) 중 "투영 거리 + 경로 비용" 최소 조합.
+
+    조합 전수(K+1)² 대신 도착은 최근접 후보로 고정해 출발을 고르고, 그 출발로 도착을 고른다(≤ 2(K+1) 회 탐색).
+    한 쪽이 후보 하나뿐이면 그대로 쓴다. 경로가 없는 후보는 건너뛰고, 전부 없으면 노드 스냅 폴백을 돌려준다.
+    """
+    def pick(fixed, cands, fixed_first):
+        if len(cands) == 1:
+            return cands[0]
+        best = None
+        for c in cands:
+            if c[0] == fixed[0]:
+                continue
+            cost = _pair_cost(H, fixed[0], c[0], profile) if fixed_first else _pair_cost(H, c[0], fixed[0], profile)
+            if cost is None:
+                continue
+            total = cost + c[1]
+            if best is None or total < best[0]:
+                best = (total, c)
+        return best[1] if best else cands[-1]
+
+    o = pick(d_cands[0], o_cands, fixed_first=False)
+    d = pick(o, d_cands, fixed_first=True)
+    return o, d
+
+
 def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
                alternatives: int, constraints=None) -> dict:
     if not NET.loaded:
@@ -221,30 +298,36 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
     # 실제로는 갈 수 있는 목적지가 "경로 없음" 이 되므로, 스냅 후보를 최대 연결요소로 제한한다.
     # 제약 완화(폴백) 범위까지 고려해 여유 경사를 더한 기준으로 계산한다.
     relax_margin = 4.0 if (constraints is None or constraints.relax_if_no_route) else 0.0
-    allowed = NET.reachable_nodes(profile, profile.max_slope_deg + relax_margin)
+    allowed = NET.reachable_nodes(profile, profile.hard_slope() + relax_margin)   # 하드 상한 기준 (v1.20.0)
 
     target = _resolve_destination(dest, profile, allowed)
 
+    # 링크 투영 스냅(#67): 출발지와 좌표·건물 대표점 도착지는 링크 위 점에, 실측 출입구는 노드에 붙인다
+    H = vsnap.virtual_graph(NET)
     try:
-        s = snap(NET, origin_lat, origin_lng, profile, settings.snap_max_dist_m, allowed=allowed)
-        g = snap(NET, target["lat"], target["lng"], profile, settings.snap_max_dist_m, allowed=allowed)
+        o_cands = _endpoint_candidates(H, origin_lat, origin_lng, profile, allowed, "o")
+        d_cands = _endpoint_candidates(H, target["lat"], target["lng"], profile, allowed, "d",
+                                       allow_virtual=target.get("source") not in ENTRANCE_SOURCES)
     except SnapError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    if not s["reachable"]:
+    if all(c[1] > settings.snap_max_dist_m for c in o_cands):
         raise HTTPException(
             status_code=422,
             detail="현재 위치가 보행 네트워크에서 %.0fm 떨어져 있어 경로를 만들 수 없습니다"
-            % s["dist_m"],
+            % min(c[1] for c in o_cands),
         )
+    o_sel, d_sel = _choose_endpoints(H, o_cands, d_cands, profile)
+    s = {"node_id": o_sel[0], "dist_m": round(o_sel[1], 1), "snapped": {"lat": o_sel[2][0], "lng": o_sel[2][1]}, "kind": o_sel[3]}
+    g = {"node_id": d_sel[0], "dist_m": round(d_sel[1], 1), "snapped": {"lat": d_sel[2][0], "lng": d_sel[2][1]}, "kind": d_sel[3]}
 
     relax = True if constraints is None else constraints.relax_if_no_route
     try:
-        result = plan(NET, s["node_id"], g["node_id"], profile, alternatives, relax=relax)
+        result = plan(NET, s["node_id"], g["node_id"], profile, alternatives, relax=relax, graph=H)
     except NoRouteError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    G = NET.graph
+    G = H
     route_id = "r_%s" % uuid.uuid4().hex[:10]
     routes = []
     for r in result["routes"]:
@@ -261,11 +344,12 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
         "profile": profile.id,
         "network_version": NET.meta.get("network_version"),
         "origin": {"lat": origin_lat, "lng": origin_lng,
-                   "snapped": s["snapped"], "snap_dist_m": s["dist_m"]},
+                   "snapped": s["snapped"], "snap_dist_m": s["dist_m"], "snap_kind": s["kind"]},
         "destination": {"type": dest.type, "poi_id": dest.poi_id,
                         "lat": target["lat"], "lng": target["lng"],
                         "resolved_by": target["source"],
-                        "note": _entrance_note(target)},
+                        "note": _entrance_note(target),
+                        "snapped": g["snapped"], "snap_dist_m": g["dist_m"], "snap_kind": g["kind"]},
         "routes": routes,
         "fallback": result["fallback"],
         "data_quality": {
@@ -295,27 +379,33 @@ def _entrance_note(target: dict):
 # ────────────────────────── 멀티모달 (#36) ──────────────────────────
 # 제약형: 직결 버스 1회 + 안양 관내 지하철 노선 내 이동. 시각표 없음 — 소요시간 추정.
 ETA_NOTE = "소요시간은 정거장 수 기반 추정이며 차량 대기 시간은 포함되지 않습니다"
+ETA_NOTE_LOW_FLOOR = "소요시간은 정거장 수 기반 추정에 저상버스 대기 시간(조회 시점 실시간)을 더한 값입니다"
 LOW_BUS_WARNING = ("저상버스 정차 여부는 보장되지 않습니다 — "
                    "실시간 도착정보로 저상 차량을 확인하세요")
 
 
-def _walk_leg(frm, to, profile, allowed, label_from, label_to):
-    """도보 leg 1개 — 기존 보행 라우팅 재사용. 15m 미만은 leg 생략(None)."""
+def _walk_leg(frm, to, profile, allowed, label_from, label_to, to_is_entrance: bool = False):
+    """도보 leg 1개 — 기존 보행 라우팅 재사용. 15m 미만은 leg 생략(None).
+
+    양 끝은 링크 투영 스냅(#67)을 쓴다. 실측 출입구로 해석된 목적지만 노드 스냅(to_is_entrance).
+    """
     straight = transit.haversine_m(frm[0], frm[1], to[0], to[1])
     if straight < 15.0:
         return None
-    s = snap(NET, frm[0], frm[1], profile, settings.snap_max_dist_m, allowed=allowed)
-    g = snap(NET, to[0], to[1], profile, settings.snap_max_dist_m, allowed=allowed)
-    if s["node_id"] == g["node_id"]:
-        return None      # 같은 노드로 스냅되는 지척 이동 — leg 생략
-    result = plan(NET, s["node_id"], g["node_id"], profile, 1, relax=True)
+    H = vsnap.virtual_graph(NET)
+    o_cands = _endpoint_candidates(H, frm[0], frm[1], profile, allowed, "wo")
+    d_cands = _endpoint_candidates(H, to[0], to[1], profile, allowed, "wd", allow_virtual=not to_is_entrance)
+    o_sel, d_sel = _choose_endpoints(H, o_cands, d_cands, profile)
+    if o_sel[0] == d_sel[0]:
+        return None      # 같은 지점으로 스냅되는 지척 이동 — leg 생략
+    result = plan(NET, o_sel[0], d_sel[0], profile, 1, relax=True, graph=H)
     r = result["routes"][0]
     leg = {
         "kind": "walk",
         "from_label": label_from, "to_label": label_to,
         "summary": r["summary"],
         "geometry": r["geometry"],
-        "steps": build_steps(NET.graph, r["path"], profile),
+        "steps": build_steps(H, r["path"], profile),
         "fallback": result["fallback"],
     }
     # 보행망 단절 가능성 — 짧은 직선을 크게 우회하면 위상 문제일 확률이 높다(#30 안양역)
@@ -331,9 +421,19 @@ def _walk_leg(frm, to, profile, allowed, label_from, label_to):
 def _bus_leg(part):
     route = part["route"]
     path = poi_store.STORE.route_stop_path(route["route_id"], part["seq_from"], part["seq_to"])
-    geometry = [[round(s["lat"], 7), round(s["lng"], 7)] for s in path]
+    stop_geom = [[round(s["lat"], 7), round(s["lng"], 7)] for s in path]
+    # 지도선은 GBIS 노선형상(실제 차로)을 승·하차 정류장 사이로 잘라 쓴다 (v1.20.0).
+    # 형상을 못 받거나 정류장이 형상에 붙지 않으면 종전대로 정류장 직선.
+    geometry, geometry_source = stop_geom, "stops"
+    try:
+        line = gbis_live.LIVE.route_line(route["route_id"]) if gbis_live.LIVE.enabled else []
+        seg = gbis_live.LIVE.slice_line(line, part["board"], part["alight"]) if line else []
+        if len(seg) >= 2:
+            geometry, geometry_source = [[round(a, 7), round(b, 7)] for a, b in seg], "gbis_line"
+    except Exception as e:                       # 지도선은 부가 정보 — 경로 안내를 막지 않는다
+        logger.warning("노선형상 적용 실패 route_id=%s — %s", route["route_id"], e)
     dist = 0.0
-    for a, b in zip(geometry[:-1], geometry[1:]):
+    for a, b in zip(stop_geom[:-1], stop_geom[1:]):
         dist += transit.haversine_m(a[0], a[1], b[0], b[1])
     warnings = [LOW_BUS_WARNING]
     for key, s in (("board", part["board"]), ("alight", part["alight"])):
@@ -354,6 +454,7 @@ def _bus_leg(part):
         "stops": [{"name": s["name"], "mobile_no": s["mobile_no"], "lat": s["lat"],
                    "lng": s["lng"], "station_seq": s["station_seq"]} for s in path],
         "geometry": geometry,
+        "geometry_source": geometry_source,
         "est_distance_m": round(dist),
         "est_duration_sec": part["stop_cnt"] * transit.BUS_SEC_PER_STOP,
         "warnings": warnings,
@@ -473,6 +574,8 @@ def _attach_realtime(legs: list, realtime: bool) -> None:
             live = gbis_live.LIVE.arrivals(board["poi_id"], route_id=rid, route_meta=meta)
             leg["realtime"] = live
             nlf = live.get("next_low_floor")
+            if leg.get("low_floor"):
+                continue        # 저상 우선 모드가 이미 판정·문구를 붙였다(#64)
             if live.get("status") == "success":
                 if nlf:
                     leg["warnings"] = [w for w in leg["warnings"] if w != LOW_BUS_WARNING]
@@ -490,20 +593,85 @@ def _attach_realtime(legs: list, realtime: bool) -> None:
                 st["facilities"] = _station_brief(st["poi_id"], st["name"])
 
 
+def _walk_est_sec(profile, *pts) -> float:
+    """(lat,lng) 점열의 도보 근사 초 — 직선×배율 / 프로필 속도 (실계산 전 정렬용)."""
+    m = transit._walk_est(*pts)
+    return m / profile.speed_mps if profile.speed_mps else 0.0
+
+
+def _cand_bus_part(cand: dict):
+    return next((p for p in cand["parts"] if p["kind"] == "bus"), None)
+
+
+def _rank_low_floor(cands: list, judge, profile, origin) -> list:
+    """저상버스 우선 모드 — 근사 단계 정렬(#64).
+
+    후보마다 버스 part 의 승차 정류장까지 도보 근사 초를 구해 실시간 저상 판정을 받고,
+    (계층, 시간) 키로 정렬한다. 버스가 없는 후보(도보+지하철)는 저상 판정이 필요 없어 tier 1 로 둔다.
+    """
+    ranked = []
+    for c in cands:
+        part = _cand_bus_part(c)
+        secs = 0.0
+        for p in c["parts"]:
+            if p["kind"] == "walk":
+                secs += _walk_est_sec(profile, p["frm"][1], p["to"][1])
+            elif p["kind"] == "bus":
+                secs += p["stop_cnt"] * transit.BUS_SEC_PER_STOP + lowfloor.BOARDING_OVERHEAD_SEC
+            else:
+                secs += p["station_cnt"] * transit.SUBWAY_SEC_PER_STATION + transit.SUBWAY_ACCESS_SEC
+        if part is None:
+            j = {"tier": 1, "wait_sec": 0.0, "source": "none", "reason": "no bus leg"}
+        else:
+            walk_to_board = _walk_est_sec(profile, origin, (part["board"]["lat"], part["board"]["lng"]))
+            j = judge.judge(part, walk_to_board)
+            secs += float(j.get("wait_sec") or 0.0)
+        c["low_floor"] = j
+        ranked.append((lowfloor.rank_key(j["tier"], secs), c))
+    ranked.sort(key=lambda x: x[0])
+    return [c for _, c in ranked]
+
+
 def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
-                     mode: str, constraints=None, realtime: bool = False) -> dict:
+                     mode: str, constraints=None, realtime: bool = False,
+                     low_floor=None) -> dict:
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
     profile = _profile_or_400(profile_id)
     relax_margin = 4.0
-    allowed = NET.reachable_nodes(profile, profile.max_slope_deg + relax_margin)
+    allowed = NET.reachable_nodes(profile, profile.hard_slope() + relax_margin)
     target = _resolve_destination(dest, profile, allowed)
+    origin = (origin_lat, origin_lng)
+    tgt = (target["lat"], target["lng"])
 
-    cands = transit.search(
-        (origin_lat, origin_lng), (target["lat"], target["lng"]), mode,
-        stops_near=lambda la, ln, r: poi_store.STORE.stops_near(la, ln, r),
-        stations=poi_store.STORE.stations(),
-    )
+    # ── 저상버스 우선 모드(#64): 휠체어 프로필 기본 on ──
+    lf_mode = lowfloor.resolve_mode(low_floor, profile.id)
+    lf_expanded = False
+    now_ts = int(time.time())
+
+    def _search(radius=None, k=None):
+        return transit.search(
+            origin, tgt, mode,
+            stops_near=lambda la, ln, r: poi_store.STORE.stops_near(la, ln, r),
+            stations=poi_store.STORE.stations(),
+            stop_radius_m=radius, max_stops=k,
+            route_ok=transit.low_bus_route_ok if lf_mode else None,
+        )
+
+    cands = _search()
+    judge = None
+    if lf_mode:
+        judge = lowfloor.LowFloorJudge(gbis_live.LIVE, poi_store.STORE, now=now_ts)
+        cands = _rank_low_floor(cands, judge, profile, origin)
+        best_tier = cands[0]["low_floor"]["tier"] if cands else 3
+        if best_tier not in (1, 2):
+            # 450m 에 탈 수 있는 저상 후보가 없을 때만 800m 로 넓힌다(사용자 결정 반영)
+            wider = _rank_low_floor(_search(lowfloor.STOP_RADIUS_EXPANDED_M, lowfloor.EXPANDED_MAX_STOPS),
+                                    judge, profile, origin)
+            if wider and wider[0]["low_floor"]["tier"] in (1, 2):
+                cands, lf_expanded = wider, True
+            elif not cands and wider:
+                cands = wider
     if not cands:
         raise HTTPException(
             status_code=404,
@@ -519,7 +687,9 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             for part in cand["parts"]:
                 if part["kind"] == "walk":
                     leg = _walk_leg(part["frm"][1], part["to"][1], profile, allowed,
-                                    part["frm"][0], part["to"][0])
+                                    part["frm"][0], part["to"][0],
+                                    to_is_entrance=(part["to"][0] == "목적지"
+                                                    and target.get("source") in ENTRANCE_SOURCES))
                     if leg is not None:
                         built.append(leg)
                 elif part["kind"] == "bus":
@@ -532,7 +702,27 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             actual += sum(l.get("station_cnt", 0) for l in built) * transit.STATION_PENALTY_M
             actual += sum(1 for l in built if l["kind"] != "walk") * transit.TRANSIT_LEG_PENALTY_M
             actual += 200 * sum(len(l.get("warnings", [])) for l in built if l["kind"] == "walk")
-            built_cands.append((actual, built))
+            key = actual
+            if lf_mode:
+                # 실제 도보 소요로 다시 판정 — 근사로는 탈 수 있던 차량을 실경로에서는 놓칠 수 있다
+                part = _cand_bus_part(cand)
+                secs = sum(l["summary"]["duration_sec"] for l in built if l["kind"] == "walk")
+                secs += sum(l.get("est_duration_sec", 0) for l in built if l["kind"] != "walk")
+                secs += lowfloor.BOARDING_OVERHEAD_SEC * sum(1 for l in built if l["kind"] == "bus")
+                if part is None:
+                    j = cand["low_floor"]
+                else:
+                    idx = next(i for i, l in enumerate(built) if l["kind"] == "bus")
+                    walk_to_board = built[idx - 1]["summary"]["duration_sec"] \
+                        if idx > 0 and built[idx - 1]["kind"] == "walk" else 0.0
+                    j = judge.judge(part, walk_to_board)
+                    bus_leg = built[idx]
+                    bus_leg["low_floor"] = j
+                    bus_leg["warnings"] = [w for w in bus_leg["warnings"] if w != LOW_BUS_WARNING]
+                    bus_leg["warnings"].insert(0, lowfloor.leg_warning(j))
+                    secs += float(j.get("wait_sec") or 0.0)
+                key = lowfloor.rank_key(j["tier"], secs)
+            built_cands.append((key, built))
         except (SnapError, NoRouteError) as e:
             last_err = e
             continue
@@ -580,6 +770,19 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
 
     fallback = next((l["fallback"] for l in walk_legs if l.get("fallback", {}).get("used")),
                     {"used": False})
+    lf_info = {"mode": lf_mode}
+    if lf_mode:
+        bus_js = [l["low_floor"] for l in transit_legs if l.get("low_floor")]
+        lf_tier = min((int(j["tier"]) for j in bus_js), key=lambda t: lowfloor.TIER_RANK.get(t, 2)) if bus_js else 1
+        lf_info.update({"tier": lf_tier, "expanded_radius": lf_expanded,
+                        "queried_at": now_ts, "valid_for_sec": lowfloor.VALID_FOR_SEC,
+                        "wait_sec": round(sum(float(j.get("wait_sec") or 0) for j in bus_js))})
+        if lf_tier == 3:
+            warnings.insert(0, lowfloor.NO_LOW_FLOOR_WARNING)
+        elif lf_tier == 0:
+            warnings.insert(0, lowfloor.UNKNOWN_LOW_FLOOR_WARNING)
+        if lf_tier in (1, 2):
+            total_dur += lf_info["wait_sec"]
     summary = {
         "total_distance_m": round(total_dist),
         "duration_sec": round(total_dur),
@@ -595,7 +798,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             "stop_cnt": sum(l.get("stop_cnt", 0) for l in transit_legs),
             "station_cnt": sum(l.get("station_cnt", 0) for l in transit_legs),
         },
-        "eta_note": ETA_NOTE,
+        "eta_note": ETA_NOTE if not (lf_mode and lf_info.get("tier") in (1, 2)) else ETA_NOTE_LOW_FLOOR,
         "warnings": warnings,
     }
 
@@ -611,6 +814,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         "resolved_by": target["source"],
                         "note": _entrance_note(target)},
         "routes": [{"summary": summary, "geometry": geometry, "steps": steps, "legs": legs}],
+        "low_floor": lf_info,
         "fallback": fallback,
         "data_quality": {
             "slope_coverage": NET.meta.get("slope_coverage"),
@@ -630,6 +834,7 @@ def route_plan(req: PlanRequest):
         return _plan_multimodal(
             req.origin.lat, req.origin.lng, req.destination,
             req.profile, req.mode, req.constraints, realtime=req.realtime,
+            low_floor=req.low_floor,
         )
     if req.mode not in ("", "walk", None):
         raise HTTPException(status_code=400,
@@ -658,7 +863,7 @@ def route_snap(req: SnapRequest):
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
     profile = _profile_or_400(req.profile) if req.profile else None
-    allowed = NET.reachable_nodes(profile, profile.max_slope_deg + 4.0) if profile else None
+    allowed = NET.reachable_nodes(profile, profile.hard_slope() + 4.0) if profile else None
     try:
         return snap(NET, req.lat, req.lng, profile,
                     req.max_dist_m or settings.snap_max_dist_m, allowed=allowed)
@@ -801,7 +1006,7 @@ def tour_spot_entrance(poi_id: str, profile: str = Query("wheelchair_manual")):
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
 
-    allowed = NET.reachable_nodes(p, p.max_slope_deg + 4.0)
+    allowed = NET.reachable_nodes(p, p.hard_slope() + 4.0)
     acc = resolve_access_point(NET, spot["lat"], spot["lng"], p, BUILDINGS,
                                max_walk_m=settings.entrance_max_walk_m, allowed=allowed)
     acc["note"] = _entrance_note(acc)

@@ -179,8 +179,10 @@ def test_walk_bus_legs_contract(client):
     assert body["mode"] == "walk_bus"
     legs = body["routes"][0]["legs"]
     kinds = [l["kind"] for l in legs]
-    assert kinds == ["bus", "walk"], kinds     # 첫 도보는 지척이라 생략
-    bus = legs[0]
+    # v1.23.0 링크 투영 스냅: 승차 정류장(18m 앞, 링크 중간)까지의 짧은 도보 leg 가 생긴다
+    assert kinds == ["walk", "bus", "walk"], kinds
+    assert legs[0]["summary"]["total_distance_m"] < 25
+    bus = legs[1]
     assert bus["route"]["route_id"] == "R100" and bus["route"]["type"] == "마을버스"
     assert bus["board"]["station_seq"] == 5 and bus["alight"]["station_seq"] == 9
     assert bus["stop_cnt"] == 4 and len(bus["stops"]) == 5

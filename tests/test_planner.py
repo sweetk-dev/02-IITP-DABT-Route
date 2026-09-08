@@ -45,11 +45,42 @@ def test_no_route_raises_when_all_blocked(store):
 
 def test_fallback_relaxes_slope_limit(store):
     G = store.graph
-    G["N1"]["N2"]["slope"] = 5.0        # 수동휠체어 한계(4도) 초과
-    G["N2"]["N3"]["slope"] = 5.0
+    G["N1"]["N2"]["slope"] = 9.0        # 수동휠체어 하드 상한(8도) 초과 (v1.20.0: 권장 4도 초과는 가중, 8도 초과가 차단)
+    G["N2"]["N3"]["slope"] = 9.0
     res = plan(store, "N1", "N3", get_profile("wheelchair_manual"))
     assert res["fallback"]["used"] is True
-    assert res["fallback"]["applied_max_slope_deg"] >= 6.0
+    assert res["fallback"]["applied_max_slope_deg"] >= 10.0
+
+
+def test_over_recommended_slope_is_penalized_not_blocked(store):
+    """v1.20.0 — 권장 경사(4도) 초과·하드 상한(8도) 이하 링크는 통행 가능하되 경고가 붙는다.
+    (실증 2026-09-03: 5~8도 링크 하나 때문에 205m 직행이 649m 우회로 바뀌었다)"""
+    G = store.graph
+    G["N1"]["N2"]["slope"] = 5.0
+    G["N2"]["N3"]["slope"] = 5.0
+    res = plan(store, "N1", "N3", get_profile("wheelchair_manual"))
+    assert res["fallback"]["used"] is False
+    assert res["routes"][0]["path"] == ["N1", "N2", "N3"]
+    assert any("권장 경사" in w for w in res["routes"][0]["summary"]["warnings"])
+
+
+def test_short_link_is_never_blocked_by_slope(store):
+    """v1.20.0 — 15m 미만 짧은 링크의 DEM 경사(격자 보간 튐)는 통행을 막지 않는다."""
+    G = store.graph
+    G["N1"]["N2"]["slope"] = 12.0
+    G["N1"]["N2"]["length"] = 8.0
+    res = plan(store, "N1", "N3", get_profile("wheelchair_manual"), relax=False)
+    assert res["routes"][0]["path"] == ["N1", "N2", "N3"]
+    assert not any("권장 경사" in w for w in res["routes"][0]["summary"]["warnings"])
+
+
+def test_profile_hard_slope_and_constraint_override():
+    from route_service.engine.profiles import get_profile as gp
+    from dataclasses import replace
+    assert gp("wheelchair_manual").hard_slope() == 8.0
+    assert gp("wheelchair_electric").hard_slope() == 10.0
+    assert gp("visual").hard_slope() == 12.0          # hard 미지정 → max 와 동일
+    assert replace(gp("wheelchair_manual"), max_slope_deg=20.0).hard_slope() == 20.0   # 제약으로 올리면 같이 오른다
 
 
 def test_off_route_distance(store):
