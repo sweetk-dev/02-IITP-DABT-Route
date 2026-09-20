@@ -43,3 +43,6 @@ data/dem/
 data/terrain/
 data/poi/*.json
 results/
+
+# 계측 로그(#73) — 볼륨에 append 되는 이벤트 파일
+data/metrics/

@@ -41,11 +41,13 @@ class Constraints(BaseModel):
 class PlanRequest(BaseModel):
     origin: Coord
     destination: Destination
-    profile: str = "wheelchair_manual"
+    # v1.25.0(#73): 기본 프로필 전동 휠체어 — 생략 시 engine.profiles.DEFAULT_PROFILE
+    profile: str = "wheelchair_electric"
     constraints: Optional[Constraints] = None
     alternatives: int = Field(1, ge=1, le=3)
-    # walk(기존, 기본) | walk_bus(직결 버스 허용) | walk_bus_subway(버스+안양 관내 지하철 허용)
-    mode: str = Field("walk", description="walk | walk_bus | walk_bus_subway")
+    # walk(기존, 기본) | walk_bus(직결 버스 허용) | walk_subway(안양 관내 지하철만, #73)
+    # | walk_bus_subway(버스+지하철 허용)
+    mode: str = Field("walk", description="walk | walk_bus | walk_subway | walk_bus_subway")
     realtime: bool = Field(
         False, description="버스 leg 승차 정류장의 실시간 도착정보(저상 여부)를 함께 붙인다")
     low_floor: Optional[bool] = Field(
@@ -56,14 +58,16 @@ class PlanRequest(BaseModel):
 class RerouteRequest(BaseModel):
     current: Coord
     destination: Destination
-    profile: str = "wheelchair_manual"
+    profile: str = "wheelchair_electric"
     route_id: Optional[str] = None
+    # v1.25.0(#73): 재탐색 사유·이탈 거리는 클라이언트가 안다 — 계측 로그에만 쓴다
+    reason: Optional[str] = Field(None, max_length=40, description="off_route | stale | manual | 기타")
 
 
 class SnapRequest(BaseModel):
     lat: float
     lng: float
-    profile: Optional[str] = "wheelchair_manual"
+    profile: Optional[str] = "wheelchair_electric"
     max_dist_m: Optional[float] = None
 
 
