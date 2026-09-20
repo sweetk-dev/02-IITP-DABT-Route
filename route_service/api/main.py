@@ -13,10 +13,11 @@ from collections import OrderedDict
 
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from .. import __version__
+from .. import metrics
 from ..config import get_settings
 from ..engine import profiles as prof
 from ..engine.access import BuildingIndex, ManualEntrances, resolve_access_point
@@ -60,6 +61,8 @@ def _apply_overrides_safe() -> dict:
 async def lifespan(_app: FastAPI):
     poi_store.configure(settings)
     collect_store.configure(settings)
+    metrics.configure(settings)
+    logger.info("계측 로그: %s", metrics.METRICS.path or "메모리만")
     gbis_live.LIVE = gbis_live.configure(settings)
     logger.info("GBIS 실시간: %s", "사용" if gbis_live.LIVE.enabled else "인증키 없음(비활성)")
     global BUILDINGS, ENTRANCES
@@ -77,6 +80,7 @@ async def lifespan(_app: FastAPI):
     except Exception as e:
         logger.warning("네트워크 로드 실패(%s) — /meta/network 로 상태 확인", e)
     yield
+    metrics.METRICS.close()
 
 
 app = FastAPI(
@@ -97,6 +101,31 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _timing(request: Request, call_next):
+    """모든 요청의 서버 내부 처리시간(ms)을 계측한다(#73, 실증 지표 ② 원천).
+
+    응답 헤더 X-Process-Time-Ms 로 즉시 노출하고, 계측 로그에 request 행을 남긴다.
+    핸들러가 metrics.tag() 로 붙인 문맥(profile·mode·route_id 등)을 같은 행에 합친다.
+    """
+    metrics.reset_tags()
+    t0 = time.perf_counter()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        status = response.status_code if response is not None else 500
+        if response is not None:
+            response.headers["X-Process-Time-Ms"] = str(ms)
+        path = request.url.path
+        if not path.startswith(("/docs", "/openapi", "/redoc", "/meta/latency")):
+            metrics.METRICS.write("request", path=path, method=request.method,
+                                  status=status, ms=ms, **metrics.current_tags())
+
 
 # 목적지 접근점(무장애 출입구) 해석용 — 기동 시 로드
 BUILDINGS = BuildingIndex()
@@ -143,6 +172,15 @@ def meta_network():
 @app.get("/profiles", tags=["meta"])
 def get_profiles():
     return {"profiles": prof.list_profiles(), "default": prof.DEFAULT_PROFILE}
+
+
+@app.get("/meta/latency", tags=["meta"], dependencies=[Depends(auth)])
+def meta_latency(since_sec: float = Query(0.0, ge=0, description="0 이면 메모리 보유분 전부")):
+    """경로별 처리시간 요약(건수·평균·P50·P95·3초 초과 건수). 실증 중 즉시 확인용(#73).
+
+    정식 산출은 계측 로그 파일(JSONL)을 배치로 집계한다 — 여기는 최근 5,000건 메모리 기준.
+    """
+    return metrics.METRICS.summary(since_sec)
 
 
 # ────────────────────────── route ──────────────────────────
@@ -644,8 +682,8 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     origin = (origin_lat, origin_lng)
     tgt = (target["lat"], target["lng"])
 
-    # ── 저상버스 우선 모드(#64): 휠체어 프로필 기본 on ──
-    lf_mode = lowfloor.resolve_mode(low_floor, profile.id)
+    # ── 저상버스 우선 모드(#64): 휠체어 프로필 기본 on. 버스가 없는 walk_subway 는 항상 off(#73) ──
+    lf_mode = lowfloor.resolve_mode(low_floor, profile.id) if transit.uses_bus(mode) else False
     lf_expanded = False
     now_ts = int(time.time())
 
@@ -675,7 +713,9 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     if not cands:
         raise HTTPException(
             status_code=404,
-            detail="조건에 맞는 직결 대중교통 경로를 찾지 못했습니다 — 도보 경로를 이용하세요",
+            detail=("조건에 맞는 지하철 경로를 찾지 못했습니다 — 도보 경로를 이용하세요"
+                    if mode == "walk_subway" else
+                    "조건에 맞는 직결 대중교통 경로를 찾지 못했습니다 — 도보 경로를 이용하세요"),
         )
 
     # 근사 스코어 순 상위 후보를 전부 실계산해 비교한다 — 도보 근사(직선×배율)와
@@ -825,12 +865,16 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     for leg in legs:                     # 내부 필드 정리
         leg.pop("fallback", None)
     _cache_put(route_id, payload)
+    metrics.tag(route_id=route_id, walk_m=summary["walk_distance_m"],
+                total_m=summary["total_distance_m"])
     return payload
 
 
 @app.post("/route/plan", tags=["route"], dependencies=[Depends(auth)])
 def route_plan(req: PlanRequest):
-    if req.mode in ("walk_bus", "walk_bus_subway"):
+    metrics.tag(profile=req.profile, mode=req.mode or "walk", dest_type=req.destination.type,
+                dest_id=req.destination.poi_id)
+    if req.mode in transit.MODES:
         return _plan_multimodal(
             req.origin.lat, req.origin.lng, req.destination,
             req.profile, req.mode, req.constraints, realtime=req.realtime,
@@ -839,10 +883,21 @@ def route_plan(req: PlanRequest):
     if req.mode not in ("", "walk", None):
         raise HTTPException(status_code=400,
                             detail="지원하지 않는 mode 입니다: %s" % req.mode)
-    return _plan_core(
+    payload = _plan_core(
         req.origin.lat, req.origin.lng, req.destination,
         req.profile, req.alternatives, req.constraints,
     )
+    _tag_plan_result(payload)
+    return payload
+
+
+def _tag_plan_result(payload: dict):
+    try:
+        summ = payload["routes"][0]["summary"]
+        metrics.tag(route_id=payload.get("route_id"), total_m=summ.get("total_distance_m"),
+                    walk_m=summ.get("walk_distance_m", summ.get("total_distance_m")))
+    except (KeyError, IndexError, TypeError):
+        pass
 
 
 @app.post("/route/reroute", tags=["route"], dependencies=[Depends(auth)])
@@ -852,9 +907,18 @@ def route_reroute(req: RerouteRequest):
         geom = ROUTE_CACHE[req.route_id]["routes"][0]["geometry"]
         off = off_route_distance_m(geom, req.current.lat, req.current.lng)
 
+    metrics.tag(profile=req.profile, mode="walk", prev_route_id=req.route_id, reason=req.reason)
     payload = _plan_core(req.current.lat, req.current.lng, req.destination, req.profile, 1, None)
     payload["off_route"] = bool(off is not None and off > settings.off_route_threshold_m)
     payload["off_route_dist_m"] = round(off, 1) if off is not None else None
+    _tag_plan_result(payload)
+    # 재탐색 이벤트(#73) — 지표 ① 산출 시 route_id 계보(이전→신규)와 이탈 거리를 추적한다
+    metrics.METRICS.write(
+        "reroute", prev_route_id=req.route_id, route_id=payload.get("route_id"),
+        off_route=payload["off_route"], off_route_dist_m=payload["off_route_dist_m"],
+        reason=req.reason, profile=req.profile,
+        current=[round(req.current.lat, 6), round(req.current.lng, 6)],
+    )
     return payload
 
 
@@ -987,7 +1051,7 @@ def tour_spot_detail(poi_id: str):
 
 
 @app.get("/tour/bf-spots/{poi_id}/entrance", tags=["tour"], dependencies=[Depends(auth)])
-def tour_spot_entrance(poi_id: str, profile: str = Query("wheelchair_manual")):
+def tour_spot_entrance(poi_id: str, profile: str = Query(prof.DEFAULT_PROFILE)):
     """무장애 접근 지점. 실측 출입구 > 건물 접근점 > 시설 대표점 순으로 해석한다."""
     p = _profile_or_400(profile)
     manual = ENTRANCES.get(poi_id)
@@ -1024,6 +1088,17 @@ def tour_recommend(req: RecommendRequest):
         req.disabilities, req.sigungu, req.match_mode, 10000,
         origin_lat=req.origin_lat, origin_lng=req.origin_lng, offset=0,
     ))
+    # 추천 스냅샷(#73) — 지표 ③ MAP 산출용. 순위·점수만 남긴다(본문은 결정적이라 재현 가능)
+    metrics.METRICS.write(
+        "recommend", disabilities=req.disabilities, sigungu=req.sigungu,
+        match_mode=req.match_mode, topk=req.topk, offset=req.offset,
+        origin=([round(req.origin_lat, 6), round(req.origin_lng, 6)]
+                if req.origin_lat is not None and req.origin_lng is not None else None),
+        total=total,
+        items=[{"poi_id": str(it.get("poi_id")), "score": it.get("score"),
+                "distance_m": it.get("distance_m")} for it in items],
+    )
+    metrics.tag(sigungu=req.sigungu, result_cnt=len(items))
     return {"source": poi_store.STORE.source, "count": len(items),
             "total": total, "offset": req.offset,
             "has_more": req.offset + len(items) < total, "items": items}
@@ -1034,7 +1109,7 @@ def tour_recommend(req: RecommendRequest):
 def transit_access_points(
     lat: float = Query(...), lng: float = Query(...),
     radius_m: float = Query(800, ge=50, le=3000),
-    profile: str = Query("wheelchair_manual"),
+    profile: str = Query(prof.DEFAULT_PROFILE),
     limit: int = Query(20, ge=1, le=100),
 ):
     """휠체어로 접근 가능한 정류장·역. 대중교통 환승 계산은 하지 않는다."""

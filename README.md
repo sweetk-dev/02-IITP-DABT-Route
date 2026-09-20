@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.24.0 |
+| 02-IITP-DABT-Route | v1.25.0 |
 
 ## 구조
 
@@ -211,8 +211,8 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
 
 | id | 대상 | 최대 경사 | 회피 |
 |---|---|---|---|
-| `wheelchair_manual` | 수동 휠체어 (기본값) | 4.0° | 계단·육교·지하보도 |
-| `wheelchair_electric` | 전동 휠체어 | 6.0° | 계단·육교·지하보도 |
+| `wheelchair_manual` | 수동 휠체어 | 4.0° | 계단·육교·지하보도 |
+| `wheelchair_electric` | 전동 휠체어 **(기본값, v1.25.0)** | 6.0° | 계단·육교·지하보도 |
 | `crutch` | 목발·보행보조 | 8.0° | 육교 (계단은 비용 가중) |
 | `visual` | 시각장애 | 12.0° | — (육교·지하보도 비용 가중) |
 | `walk` | 일반 보행 | 20.0° | — |
@@ -235,6 +235,22 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
 - 목적지 유형 `transit_station`: 지하철역 — 승강설비(엘리베이터/리프트) 보유 여부로 접근성 판정
 - 목적지 유형 `transit_stop`: 버스 정류장 — 저상버스 정차 여부는 정적 데이터에 없다.
   **v1.19.0 부터 실시간 도착정보(GBIS `lowPlate`)를 서비스가 직접 조회한다** — 아래 "실시간 버스" 참고
+
+### 도보+지하철 전용 모드 · 계측 로그 (v1.25.0)
+
+- `mode=walk_subway` — 버스 조합을 만들지 않고 **안양 관내 지하철(노선 내 이동)만** 쓴다.
+  역 탐색 반경은 이 모드에서만 **3km**(`STATION_RADIUS_SUBWAY_ONLY_M`)로, 종전 `walk_bus_subway` 의
+  700m 는 그대로다(버스와 경쟁하는 조합에서 반경을 넓히면 먼 역까지 걷는 후보가 근거리 버스를
+  밀어낼 수 있어서다). 모든 모드에서 도보 leg 한 구간은 **5km**(`MAX_WALK_LEG_M`, 직선×배율 근사)를
+  넘지 않는다. `walk_subway` 에서는 저상버스 우선 모드가 항상 꺼진다.
+- **기본 프로필이 `wheelchair_electric`** 이 됐다(`/profiles` 의 `default`). 수동 이용자에게는
+  전동 기준 경사(하드 10°)가 위험하므로 클라이언트는 현재 프로필을 화면에 상시 표시해야 한다.
+- **계측 로그** — 모든 요청의 서버 내부 처리시간을 `X-Process-Time-Ms` 헤더로 돌려주고,
+  `METRICS_LOG_PATH`(기본 `data/metrics/events.jsonl`) 에 1행 1이벤트로 append 한다.
+  행 종류: `request`(경로·상태·ms·profile·mode·route_id) / `reroute`(이전→신규 route_id, 이탈 거리,
+  클라이언트 사유) / `recommend`(추천 조건과 결과 순위·점수 스냅샷). `GET /meta/latency` 는 최근
+  5,000건의 경로별 건수·P50·P95·3초 초과 건수를 즉시 요약한다. `METRICS_ENABLED=false` 로 끈다.
+  파일을 못 열어도 서비스는 계속 동작한다(메모리 요약만).
 
 ### 실시간 버스 (v1.19.0)
 

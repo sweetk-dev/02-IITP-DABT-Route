@@ -100,7 +100,7 @@ def test_health_and_meta(client):
 
 def test_profiles_endpoint(client):
     body = client.get("/profiles").json()
-    assert body["default"] == "wheelchair_manual"
+    assert body["default"] == "wheelchair_electric"
     assert len(body["profiles"]) >= 5
 
 
