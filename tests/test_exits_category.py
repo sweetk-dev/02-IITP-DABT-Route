@@ -175,6 +175,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("ROUTE_API_TOKEN", "")
     monkeypatch.setenv("METRICS_LOG_PATH", str(log))
     # 합성 보행망 위에 출구를 둔다 — 명학 1번(목적지 쪽), 2번(반대편), 안양 1번
+    monkeypatch.setattr(ex, "_PLATFORMS", {})   # 합성 역 — 승강장 윤곽 없음(역 중심 기준 판정)
     monkeypatch.setattr(ex, "_DATA", {
         "명학": [{"exit_no": "1", "lat": 37.3905, "lng": 126.9511},
                  {"exit_no": "2", "lat": 37.3900, "lng": 126.9500}],
