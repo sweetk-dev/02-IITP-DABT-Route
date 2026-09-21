@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.25.0 |
+| 02-IITP-DABT-Route | v1.26.0 |
 
 ## 구조
 
@@ -235,6 +235,20 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
 - 목적지 유형 `transit_station`: 지하철역 — 승강설비(엘리베이터/리프트) 보유 여부로 접근성 판정
 - 목적지 유형 `transit_stop`: 버스 정류장 — 저상버스 정차 여부는 정적 데이터에 없다.
   **v1.19.0 부터 실시간 도착정보(GBIS `lowPlate`)를 서비스가 직접 조회한다** — 아래 "실시간 버스" 참고
+
+### 긴급대응 지원시설 · 화장실 근접 조회 (v1.26.0)
+
+전동 보장구 이용자의 이동 중 방전·고장, 그리고 화장실 — 실증에서 확인된 두 생활 질의다.
+
+- `GET /support/nearby?lat&lng&types=charge,repair,calltaxi&radius_m=2000&limit=5` — 01 `poi_emergency_support`
+  (08 이 적재: 충전기 4,053 · 수리센터 2,248)를 거리순으로 돌려준다. 유형별 `limit` 개. 운영시간이 비어 있으면
+  `open_hours_status=unknown`(전화 확인 권장)으로 두고 값을 만들지 않는다. 출처(`source_label`)·신뢰도·좌표 의심
+  표시를 그대로 싣는다.
+- `GET /toilet/nearby?lat&lng&radius_m=800&limit=5&accessible_only=true` — `poi_public_toilet_info`(안양 243)에서
+  장애인 대·소변기 보유분만 거리순. 역사 화장실은 종전 `/transit/station/facilities`.
+- 경로 계획 응답에 `support_hint` — **전동 휠체어 프로필에만** 경로선 1km 회랑 안의 충전기 수와 최근접 1곳을 붙인다.
+  조회에 실패해도 경로 계획은 깨지지 않는다(`null`).
+- 파일 백엔드: `data/poi/emergency_support.json`, `data/poi/public_toilets.json`(DB 컬럼명 그대로).
 
 ### 도보+지하철 전용 모드 · 계측 로그 (v1.25.0)
 
