@@ -38,6 +38,15 @@ class Constraints(BaseModel):
     relax_if_no_route: bool = True
 
 
+class OriginStation(BaseModel):
+    """역 안(승강장)에서 출발 (#79) — 이용자가 '역 안'이라고 답했을 때만 보낸다.
+
+    travel 은 타고 온 열차의 진행 방향이다(north=상행·서울 방향, south=하행). 모르면 비운다.
+    """
+    name: str = Field(..., min_length=1, max_length=20, description="역 이름(예: 관악)")
+    travel: Optional[str] = Field(None, description="north | south | 생략(모름)")
+
+
 class PlanRequest(BaseModel):
     origin: Coord
     destination: Destination
@@ -53,6 +62,9 @@ class PlanRequest(BaseModel):
     low_floor: Optional[bool] = Field(
         None, description="저상버스 우선 모드(#64). 생략하면 휠체어 프로필에서 on, 그 외 off. "
                           "on 이면 조회 시점 실시간 저상 차량 기준으로 승차 정류장·노선을 고른다")
+    origin_station: Optional[OriginStation] = Field(
+        None, description="역 안에서 출발(#79, walk 모드만). 주면 출발점을 그 역의 출구로 바꾸고 "
+                          "승강장 승강기 → 출구 승강기 안내 스텝을 앞에 붙인다")
 
 
 class RerouteRequest(BaseModel):

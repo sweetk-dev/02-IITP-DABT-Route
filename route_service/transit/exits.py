@@ -113,6 +113,9 @@ _LINE_EXTRA = {
 }
 # 상행 = 서울 방향(북), 하행 = 반대(남) — 1·4호선 공통
 _UPDOWN = {"상행": "north", "하행": "south"}
+TRAVELS = ("north", "south")
+# 방향 선택지의 먼 쪽 대표 지명 — 이용자가 "어디서 타고 왔는지"를 알아듣는 이름
+_FAR = {"1호선": {"north": "서울", "south": "수원"}, "4호선": {"north": "사당", "south": "오이도"}}
 
 
 def _direction(board_name: str, alight_name: str):
@@ -139,7 +142,20 @@ def platform_facilities(board_name: str, alight_name: str, facilities: dict) -> 
     (arrival), 반대쪽 이름만 있으면 반대편(opposite), 둘 다 있거나 둘 다 없으면 모름(unknown).
     확실하지 않으면 모름으로 둔다 — 반대편 승강기로 안내하면 휠체어 이용자는 되돌아올 수 없다.
     """
-    d = _direction(board_name, alight_name)
+    return _platform_by_direction(_direction(board_name, alight_name), facilities)
+
+
+def _direction_by_travel(station_name: str, travel: str):
+    """이용자가 답한 진행 방향(north|south)으로 (노선, 역 인덱스, 진행 방향) — 역 출발 안내(#79)."""
+    if travel not in TRAVELS:
+        return None
+    line, ia = _line_of(_key(station_name))
+    if line is None or ia is None:
+        return None
+    return line, ia, travel
+
+
+def _platform_by_direction(d, facilities: dict) -> list:
     names = _side_names(d[0], d[1]) if d else None
     out = []
     for kind, key in (("elevator", "elevators"), ("lift", "lifts")):
@@ -172,10 +188,17 @@ def _kind_ko(kind: str) -> str:
     return "승강기" if kind == "elevator" else "휠체어리프트"
 
 
-def egress_guide(station_name: str, board_name: str, facilities: dict, exit_sel: dict) -> dict:
-    """하차 후 안내 — 역 안(승강장) 기준 문장 목록과 역 밖(출구) 기준 문장."""
+def egress_guide(station_name: str, board_name: str, facilities: dict, exit_sel: dict,
+                 travel: str = None) -> dict:
+    """하차 후 안내 — 역 안(승강장) 기준 문장 목록과 역 밖(출구) 기준 문장.
+
+    travel(north|south)을 주면 승차역 대신 그 진행 방향으로 하차 승강장을 판정한다 —
+    서비스 밖에서 전철로 와 역 안에서 도보 경로를 시작하는 경우(#79)."""
     name = _key(station_name)
-    plat = platform_facilities(board_name, name, facilities)
+    if travel:
+        plat = _platform_by_direction(_direction_by_travel(name, travel), facilities)
+    else:
+        plat = platform_facilities(board_name, name, facilities)
     arrival = [p for p in plat if p["side"] == "arrival"]
     unknown = [p for p in plat if p["side"] == "unknown"]
     inside = []
@@ -210,3 +233,40 @@ def egress_guide(station_name: str, board_name: str, facilities: dict, exit_sel:
         "outside": outside,
         "question": "지금 역 안(승강장)에 계신가요, 역 밖으로 나오셨나요?",
     }
+
+
+def arrival_choices(station_name: str) -> list:
+    """역 안에서 출발할 때 "어느 쪽에서 타고 오셨나요?" 선택지 (#79).
+
+    travel 은 **열차의 진행 방향**이다. 서울 쪽에서 타고 왔으면 남쪽으로 달려 온 열차(하행)라
+    하행 승강장에 내렸다. 역이 노선표에 없으면 빈 목록 — 방향을 묻지 않는다.
+    """
+    line, ia = _line_of(_key(station_name))
+    if line is None or ia is None:
+        return []
+    seq = LINES[line]
+    extra = _LINE_EXTRA.get(line, {"north": [], "south": []})
+    near = {"north": seq[ia - 1] if ia > 0 else (extra["north"][0] if extra["north"] else None),
+            "south": seq[ia + 1] if ia + 1 < len(seq) else (extra["south"][0] if extra["south"] else None)}
+    out = []
+    for came, travel, updown in (("north", "south", "하행"), ("south", "north", "상행")):
+        names = [n for n in (near[came], _FAR.get(line, {}).get(came)) if n]
+        names = list(dict.fromkeys(names))
+        if not names:
+            continue
+        out.append({"travel": travel, "updown": updown,
+                    "label": "%s 쪽에서 타고 왔어요" % "·".join(names)})
+    return out
+
+
+def station_start_guide(station_name: str, travel, facilities: dict, exit_sel: dict) -> dict:
+    """역 안(승강장)에서 도보 경로를 시작할 때의 안내 (#79).
+
+    하차 안내(egress_guide)와 같은 문장 규칙을 쓰되, 승차역 대신 이용자가 답한 진행 방향으로
+    내린 승강장을 판정한다. 방향을 모르면(travel=None) 승강장 설비를 '모름'으로 두고
+    위치만 알린다 — 반대편 승강기로 단정해 안내하지 않는다.
+    """
+    g = egress_guide(station_name, "", facilities, exit_sel, travel=travel if travel in TRAVELS else None)
+    g["travel"] = travel if travel in TRAVELS else None
+    g["question"] = None          # 이미 역 안이라고 답했다 — 다시 묻지 않는다
+    return g

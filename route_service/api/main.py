@@ -1016,11 +1016,120 @@ def route_plan(req: PlanRequest):
     if req.mode not in ("", "walk", None):
         raise HTTPException(status_code=400,
                             detail="지원하지 않는 mode 입니다: %s" % req.mode)
-    payload = _plan_core(
-        req.origin.lat, req.origin.lng, req.destination,
-        req.profile, req.alternatives, req.constraints,
-    )
+    if req.origin_station is not None:
+        payload = _plan_from_station(req)
+    else:
+        payload = _plan_core(
+            req.origin.lat, req.origin.lng, req.destination,
+            req.profile, req.alternatives, req.constraints,
+        )
+        hint = _station_nearby_hint(req.origin.lat, req.origin.lng, req.profile)
+        if hint:
+            payload["station_nearby"] = hint
     _tag_plan_result(payload)
+    return payload
+
+
+# ────────────────────────── 역에서 출발하는 도보 경로 (#79) ──────────────────────────
+# 서비스 밖(예: 서울)에서 전철로 와 역에서 도보 경로를 시작하면, 경로에 지하철 구간이 없어
+# 하차 안내(egress)가 붙지 않는다. 출발점이 역 가까이면 화면이 "역 안/밖"을 묻고, 역 안이면
+# "어느 쪽에서 타고 왔는지"를 물어 origin_station 으로 다시 요청한다. 그러면 출발점을 목적지에
+# 맞는 출구로 옮기고, 내린 승강장 승강기 → 출구 승강기 스텝을 맨 앞에 붙인다.
+STATION_NEAR_M = 150.0      # 역 중심에서 이 안이면 묻는다(10량 승강장 반 길이 ≈ 100m + GPS 오차)
+
+
+def _find_station(name: str):
+    k = station_exits._key(name)
+    for s in poi_store.STORE.stations():
+        if station_exits._key(s.get("name") or "") == k:
+            return s
+    return None
+
+
+def _station_nearby_hint(lat: float, lng: float, profile_id: str):
+    """출발점이 역 가까이면 묻기 위한 정보. 출구 자료가 없는 역은 안내할 수 없으므로 묻지 않는다."""
+    try:
+        best = None
+        for s in poi_store.STORE.stations():
+            d = transit.haversine_m(lat, lng, s["lat"], s["lng"])
+            if d <= STATION_NEAR_M and (best is None or d < best[0]) and station_exits.exits_for(s["name"]):
+                best = (d, s)
+        if best is None:
+            return None
+        d, st = best
+        name = station_exits._key(st["name"])
+        return {
+            "station": name,
+            "distance_m": round(d),
+            "question": "지금 %s역 안(승강장)에 계신가요, 역 밖에 계신가요?" % name,
+            "travel_question": "어느 쪽에서 열차를 타고 오셨나요?",
+            "choices": station_exits.arrival_choices(name),
+        }
+    except Exception as e:                  # 힌트는 부가 정보 — 실패해도 경로는 그대로 준다
+        logger.warning("역 근처 판정 실패: %s", e)
+        return None
+
+
+def _plan_from_station(req: PlanRequest) -> dict:
+    os_ = req.origin_station
+    travel = (os_.travel or "").strip().lower() or None
+    if travel is not None and travel not in station_exits.TRAVELS:
+        raise HTTPException(status_code=400, detail="origin_station.travel 은 north | south 입니다")
+    st = _find_station(os_.name)
+    if st is None:
+        raise HTTPException(status_code=404, detail="역을 찾을 수 없습니다: %s" % os_.name)
+    profile = _profile_or_400(req.profile)
+    fac = _station_facilities_cached(st) or {}
+    wheel = str(getattr(profile, "id", "")).startswith("wheelchair")
+    opts = station_exits.exit_options(st["name"], fac, wheel)
+    name = station_exits._key(st["name"])
+    metrics.tag(start="station_inside", start_station=name, travel=travel)
+    if not opts:
+        # 출구 좌표가 없는 역 — 현재 위치에서 계획하고 역 안 문장만 붙인다
+        payload = _plan_core(req.origin.lat, req.origin.lng, req.destination,
+                             req.profile, req.alternatives, req.constraints)
+        chosen = None
+    else:
+        target = _resolve_destination(req.destination, profile)
+        # 목적지에서 직선으로 가까운 순. 성공한 출구 2곳까지만 실제 경로를 비교하고,
+        # 가까운 출구가 보행망에서 막혀 있으면 다음 출구로 넘어간다
+        best, last_err, ok = None, None, 0
+        for ex in station_exits.nearest_exits(opts, (target["lat"], target["lng"]), len(opts)):
+            if ok >= 2:
+                break
+            try:
+                p = _plan_core(ex["lat"], ex["lng"], req.destination,
+                               req.profile, req.alternatives, req.constraints)
+            except HTTPException as e:
+                last_err = e
+                continue
+            ok += 1
+            dur = p["routes"][0]["summary"]["duration_sec"] if p.get("routes") else float("inf")
+            if best is None or dur < best[0]:
+                best = (dur, p, ex)
+        if best is None:
+            raise last_err or HTTPException(status_code=422, detail="역 출구에서 경로를 만들 수 없습니다")
+        _, payload, chosen = best
+    brief = station_exits.exit_brief(chosen) if chosen else None
+    guide = station_exits.station_start_guide(name, travel, fac, brief)
+    if brief:
+        how = "승강기" if brief.get("elevator") else ("휠체어리프트" if brief.get("lift") else None)
+        ins = ("%s역 안에서 출발합니다. %s번 출구%s로 나간 뒤 걸어서 이동합니다"
+               % (name, brief["exit_no"], "(%s)" % how if how else ""))
+        coord = [round(brief["lat"], 7), round(brief["lng"], 7)]
+        payload["origin"]["label"] = "%s역 %s번 출구" % (name, brief["exit_no"])
+    else:
+        ins = "%s역 안에서 출발합니다. 출구로 나간 뒤 걸어서 이동합니다" % name
+        coord = [payload["origin"]["lat"], payload["origin"]["lng"]]
+    step = {"maneuver": "station_start", "instruction": ins,
+            "distance_m": 0, "duration_sec": 0, "coord": coord,
+            "link_type": "walk", "link_name": None, "egress": guide, "warnings": []}
+    for r in payload.get("routes") or []:
+        r["steps"] = [dict(step)] + list(r.get("steps") or [])
+        for i, s_ in enumerate(r["steps"]):      # 스텝 번호 계약 유지 — 앞에 붙인 만큼 다시 매긴다
+            s_["idx"] = i
+    payload["station_start"] = {"station": name, "travel": guide.get("travel"),
+                                "exit": brief, "egress": guide}
     return payload
 
 
