@@ -739,7 +739,7 @@ def _walk_leg_via_exit(station: dict, direction: str, other, profile, allowed,
     fac = _station_facilities_cached(station)
     wheel = str(getattr(profile, "id", "")).startswith("wheelchair")
     opts = station_exits.nearest_exits(
-        station_exits.exit_options(station["name"], fac or {}, wheel), other, 2)
+        station_exits.exit_options(station["name"], fac or {}, wheel), other, 3)
     best, last_err = None, None
     for ex in opts:
         pt = (ex["lat"], ex["lng"])
@@ -752,6 +752,10 @@ def _walk_leg_via_exit(station: dict, direction: str, other, profile, allowed,
                 leg = _walk_leg(other, pt, profile, allowed, other_label, label)
         except (SnapError, NoRouteError) as e:
             last_err = e
+            continue
+        if leg is None and transit.haversine_m(pt[0], pt[1], other[0], other[1]) > 40.0:
+            # 지척이 아닌데 leg 가 없다 = 양 끝이 같은 노드로 스냅됐다. 거리 0 으로 뽑히면
+            # 도보 구간이 통째로 빠진 후보가 이긴다 — 이 출구는 후보에서 뺀다.
             continue
         dur = leg["summary"]["duration_sec"] if leg else 0.0
         if best is None or dur < best[0]:

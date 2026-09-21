@@ -69,6 +69,42 @@ def test_egress_guide_inside_and_outside_sentences():
     assert "역 안" in g["question"] and "역 밖" in g["question"]
 
 
+def test_platform_side_unknown_when_not_certain():
+    fac = {"elevators": [
+        {"exit_no": "내부", "detail_loc": "서울 방면 승강장 5-1"},        # 북쪽 종착 이름 → 안양→관악(북행) 하차 쪽
+        {"exit_no": "내부", "detail_loc": "수원 방면 승강장 3-2"},        # 남쪽 → 반대편
+        {"exit_no": "내부", "detail_loc": "하행 승강장 끝"},              # 하행 = 남쪽 → 반대편
+        {"exit_no": "내부", "detail_loc": "대합실 중앙"},                 # 방향 없음 → 모름
+        {"exit_no": "내부", "detail_loc": "서울·수원 방면 공용"}],         # 양쪽 → 모름
+        "lifts": []}
+    side = {p["detail_loc"]: p["side"] for p in ex.platform_facilities("안양", "관악", fac)}
+    assert side["서울 방면 승강장 5-1"] == "arrival"
+    assert side["수원 방면 승강장 3-2"] == "opposite"
+    assert side["하행 승강장 끝"] == "opposite"
+    assert side["대합실 중앙"] == "unknown"
+    assert side["서울·수원 방면 공용"] == "unknown"
+    # 노선 판정이 안 되면(다른 노선) 전부 모름
+    assert all(p["side"] == "unknown" for p in ex.platform_facilities("평촌", "관악", GWANAK_FAC))
+
+
+def test_lift_only_station_prefers_lift_exits(monkeypatch):
+    monkeypatch.setattr(ex, "_DATA", {"리프트": [
+        {"exit_no": "1", "lat": 37.0, "lng": 127.0}, {"exit_no": "2", "lat": 37.001, "lng": 127.0}]})
+    fac = {"elevators": [], "lifts": [{"exit_no": "2", "detail_loc": "2번 출구 계단 옆"}]}
+    got = ex.exit_options("리프트역", fac, wheelchair=True)
+    assert [e["exit_no"] for e in got] == ["2"] and got[0]["lift"] == "2번 출구 계단 옆"
+
+
+def test_manager_name_without_parenthesis_and_festival_category():
+    from route_service.poi.support import _tel_owner
+    from route_service.poi.store import tour_category
+    assert _tel_owner("STD_WCHAIR_CHARGER", "관리기관: 밀알보장구수리센터 031-381-6103 | 동시사용 2대")["name"] == "밀알보장구수리센터"
+    assert _tel_owner("STD_WCHAIR_CHARGER", "관리기관: 온누리 부흥센터")["name"] == "온누리 부흥센터"
+    assert tour_category({"sf_tourist_spot": "문화관광축제,지역축제"})[0] == "event"
+    assert tour_category({"sf_tourist_spot": "도시공원,주제공원"})[0] == "tour"
+    assert tour_category({"sf_shopping": "시장,상설시장"})[0] == "shopping"
+
+
 # ── 공통 픽스처 ─────────────────────────────────────────────
 @pytest.fixture()
 def client(tmp_path, monkeypatch):

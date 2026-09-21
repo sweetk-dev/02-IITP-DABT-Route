@@ -237,7 +237,7 @@ def tour_category(r: dict):
         return r["category"], r.get("category_detail")
     spot = (r.get("sf_tourist_spot") or "").strip()
     if spot:
-        return ("event" if spot.startswith("축제") else "tour"), spot
+        return ("event" if "축제" in spot else "tour"), spot
     for key, cat in (("sf_restaurant", "food"), ("sf_shopping", "shopping"),
                      ("sf_accommodation", "stay")):
         v = (r.get(key) or "").strip()

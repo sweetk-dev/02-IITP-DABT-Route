@@ -79,7 +79,7 @@ def _norm_support(r: dict) -> dict:
     return out
 
 
-_MGR_RE = re.compile(r"관리기관:\s*([^()|]+?)(?:\s+[0-9-]{7,})?\s*\(")
+_MGR_RE = re.compile(r"관리기관:\s*([^()|]+?)(?:\s+[0-9-]{7,})?\s*(?=\(|\||$)")
 
 
 def _tel_owner(source, note) -> dict:

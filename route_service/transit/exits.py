@@ -82,11 +82,18 @@ def exit_options(name: str, facilities: dict, wheelchair: bool) -> list:
         with_elev = [e for e in exits if e["exit_no"] in elev]
         if with_elev:
             return with_elev
+    if wheelchair and not elev and lifts:
+        # 승강기는 없고 출구 리프트만 있는 역 — 리프트 출구를 후보로(계단뿐인 출구 배제)
+        with_lift = [e for e in exits if e["exit_no"] in lifts]
+        if with_lift:
+            return with_lift
     return exits
 
 
-def nearest_exits(opts: list, pt, k: int = 2) -> list:
-    """다른 쪽 끝점에서 직선으로 가까운 출구 k 개 — 실제 경로 계산 대상을 줄인다."""
+def nearest_exits(opts: list, pt, k: int = 3) -> list:
+    """다른 쪽 끝점에서 직선으로 가까운 출구 k 개 — 실제 경로 계산 대상을 줄인다.
+
+    가까운 출구가 보행망에서 막혀 있을 수 있어 3곳까지 본다(승강기 출구는 대개 2~4곳)."""
     return sorted(opts, key=lambda e: haversine_m(e["lat"], e["lng"], pt[0], pt[1]))[:k]
 
 
@@ -96,25 +103,44 @@ def exit_brief(ex: dict) -> dict:
             "lift": ex.get("lift")}
 
 
-def _neighbors(board_name: str, alight_name: str):
-    """진행 방향 기준 하차역의 직전 역 이름(반대편 승강장 판정용)."""
+# 노선 방향 판정용 — LINES 순서(북 → 남) 바깥의 역·종착역 이름. 설비 문구는 "○○역 방향",
+# "○○ 방면", "상행/하행" 을 섞어 쓰므로, 진행 방향 쪽 이름이 들어 있을 때만 하차 승강장으로 본다.
+_LINE_EXTRA = {
+    "1호선": {"north": ["금천구청", "구로", "서울", "청량리", "소요산", "광운대", "의정부", "인천", "용산"],
+              "south": ["금정", "군포", "의왕", "성균관대", "수원", "병점", "서동탄", "천안", "신창"]},
+    "4호선": {"north": ["과천", "사당", "당고개", "진접", "서울역"],
+              "south": ["금정", "산본", "수리산", "안산", "오이도"]},
+}
+# 상행 = 서울 방향(북), 하행 = 반대(남) — 1·4호선 공통
+_UPDOWN = {"상행": "north", "하행": "south"}
+
+
+def _direction(board_name: str, alight_name: str):
+    """(노선, 하차역 인덱스, 진행 방향 north|south) 또는 None."""
     line, ia = _line_of(alight_name or "")
     line_b, ib = _line_of(board_name or "")
     if line is None or line != line_b or ia is None or ib is None or ia == ib:
         return None
-    step = 1 if ia > ib else -1
-    return LINES[line][ia - step]
+    return line, ia, ("south" if ia > ib else "north")
+
+
+def _side_names(line: str, ia: int) -> dict:
+    seq = LINES[line]
+    extra = _LINE_EXTRA.get(line, {"north": [], "south": []})
+    return {"north": list(seq[:ia]) + extra["north"], "south": list(seq[ia + 1:]) + extra["south"]}
 
 
 def platform_facilities(board_name: str, alight_name: str, facilities: dict) -> list:
     """역 내부(승강장) 승강설비 — 하차 승강장 쪽인지 표시한다.
 
     DB 문구는 "(1F) 안양역 방향 승강장 …" 처럼 **그 승강장에서 타는 열차의 방향**을 쓴다.
-    안양에서 관악으로 왔다면 내린 곳은 '석수 방향' 승강장이다. 그래서 직전 역 이름이
-    들어간 "…방향" 설비는 반대편(opposite), 다른 방향 문구는 하차 쪽(arrival), 방향
-    문구가 없으면 모름(unknown)으로 둔다. 문구 기반 추정이므로 화면에는 원문을 함께 보인다.
+    안양에서 관악으로 왔다면(북행) 내린 곳은 북쪽으로 가는 열차의 승강장이다. 문구에
+    진행 방향 쪽(관악 기준 북쪽: 석수·금천구청·서울…, 또는 '상행') 이름만 있으면 하차 쪽
+    (arrival), 반대쪽 이름만 있으면 반대편(opposite), 둘 다 있거나 둘 다 없으면 모름(unknown).
+    확실하지 않으면 모름으로 둔다 — 반대편 승강기로 안내하면 휠체어 이용자는 되돌아올 수 없다.
     """
-    prev_name = _neighbors(board_name, alight_name)
+    d = _direction(board_name, alight_name)
+    names = _side_names(d[0], d[1]) if d else None
     out = []
     for kind, key in (("elevator", "elevators"), ("lift", "lifts")):
         for f in (facilities or {}).get(key) or []:
@@ -123,12 +149,21 @@ def platform_facilities(board_name: str, alight_name: str, facilities: dict) -> 
             txt = (f.get("detail_loc") or "").strip()
             if not txt:
                 continue
-            if "방향" not in txt:
-                side = "unknown"
-            elif prev_name and (prev_name + "역 방향" in txt or prev_name + " 방향" in txt):
-                side = "opposite"
-            else:
-                side = "arrival"
+            side = "unknown"
+            if d:
+                hit = {"north": False, "south": False}
+                if "방향" in txt or "방면" in txt:
+                    for sd in ("north", "south"):
+                        if any(n in txt for n in names[sd]):
+                            hit[sd] = True
+                for word, sd in _UPDOWN.items():
+                    if word in txt:
+                        hit[sd] = True
+                travel, other = d[2], ("north" if d[2] == "south" else "south")
+                if hit[travel] and not hit[other]:
+                    side = "arrival"
+                elif hit[other] and not hit[travel]:
+                    side = "opposite"
             out.append({"kind": kind, "detail_loc": txt, "side": side})
     return out
 
