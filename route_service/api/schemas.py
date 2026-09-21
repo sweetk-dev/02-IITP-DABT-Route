@@ -128,3 +128,4 @@ class RecommendRequest(BaseModel):
     origin_lat: Optional[float] = None
     origin_lng: Optional[float] = None
     offset: int = Field(0, ge=0, description="거리순 목록에서 건너뛸 개수")
+    category: str = Field("tour", description="tour(관광 분류만, 기본) | all(상점·식당·숙박 포함, 종전 동작)")

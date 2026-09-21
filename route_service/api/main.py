@@ -33,6 +33,7 @@ from ..poi import support as poi_support
 from ..transit import gbis_live
 from ..transit import planner as transit
 from ..transit import low_floor as lowfloor
+from ..transit import exits as station_exits
 from .schemas import (
     AccessReportRequest,
     Destination,
@@ -112,6 +113,9 @@ async def _timing(request: Request, call_next):
     핸들러가 metrics.tag() 로 붙인 문맥(profile·mode·route_id 등)을 같은 행에 합친다.
     """
     metrics.reset_tags()
+    tag = metrics.client_tag(request.headers.get("x-client-tag"))
+    if tag:
+        metrics.tag(client=tag)       # 요청 출처(실증 계정 등) — 지표 산출 시 요청을 가른다(#77)
     t0 = time.perf_counter()
     response = None
     try:
@@ -176,12 +180,13 @@ def get_profiles():
 
 
 @app.get("/meta/latency", tags=["meta"], dependencies=[Depends(auth)])
-def meta_latency(since_sec: float = Query(0.0, ge=0, description="0 이면 메모리 보유분 전부")):
+def meta_latency(since_sec: float = Query(0.0, ge=0, description="0 이면 메모리 보유분 전부"),
+                 client: str = Query(None, description="X-Client-Tag 값으로 한정(실증 계정 등)")):
     """경로별 처리시간 요약(건수·평균·P50·P95·3초 초과 건수). 실증 중 즉시 확인용(#73).
 
     정식 산출은 계측 로그 파일(JSONL)을 배치로 집계한다 — 여기는 최근 5,000건 메모리 기준.
     """
-    return metrics.METRICS.summary(since_sec)
+    return metrics.METRICS.summary(since_sec, client=metrics.client_tag(client))
 
 
 # ────────────────────────── route ──────────────────────────
@@ -548,10 +553,18 @@ def _transit_step(leg, boarding: bool) -> dict:
         if boarding:
             instruction = ("%s역에서 %s에 승차합니다 — %d개 역 이동"
                            % (leg["board"]["name"], leg["line"], leg["station_cnt"]))
+            bx = leg.get("board_exit")
+            if bx:
+                instruction += " (%s번 출구%s 이용)" % (bx["exit_no"],
+                                                   " 승강기" if bx.get("has_elevator") else "")
             coord = [leg["board"]["lat"], leg["board"]["lng"]]
             maneuver = "subway_board"
         else:
             instruction = "%s역에서 하차합니다" % leg["alight"]["name"]
+            ax = leg.get("alight_exit")
+            if ax:
+                instruction += " — %s번 출구%s로 나갑니다" % (ax["exit_no"],
+                                                        "(승강기)" if ax.get("has_elevator") else "")
             coord = [leg["alight"]["lat"], leg["alight"]["lng"]]
             maneuver = "subway_alight"
     leg_ref = {"kind": leg["kind"]}
@@ -565,13 +578,33 @@ def _transit_step(leg, boarding: bool) -> dict:
         leg_ref.update({"line": leg.get("line"),
                         "board_station_id": str(leg["board"]["poi_id"]),
                         "alight_station_id": str(leg["alight"]["poi_id"])})
-    return {"maneuver": maneuver, "instruction": instruction,
-            "distance_m": 0 if not boarding else leg["est_distance_m"],
-            "duration_sec": 0 if not boarding else leg["est_duration_sec"],
-            "coord": [round(coord[0], 7), round(coord[1], 7)],
-            "link_type": leg["kind"], "link_name": None,
-            "leg_ref": leg_ref,
-            "warnings": leg["warnings"] if boarding else []}
+    out = {"maneuver": maneuver, "instruction": instruction,
+           "distance_m": 0 if not boarding else leg["est_distance_m"],
+           "duration_sec": 0 if not boarding else leg["est_duration_sec"],
+           "coord": [round(coord[0], 7), round(coord[1], 7)],
+           "link_type": leg["kind"], "link_name": None,
+           "leg_ref": leg_ref,
+           "warnings": leg["warnings"] if boarding else []}
+    if not boarding and leg.get("egress"):
+        out["egress"] = leg["egress"]       # 화면이 역 안/밖을 묻고 해당 문장을 쓴다(#77)
+    return out
+
+
+def _station_exit_step(leg) -> dict:
+    """하차 뒤 출구 통과 스텝 — 좌표가 출구라 역 밖으로 나오면 자연스럽게 다음 스텝으로 넘어간다."""
+    ax = leg.get("alight_exit") if leg.get("kind") == "subway" else None
+    if not ax:
+        return None
+    name = leg["alight"]["name"]
+    return {"maneuver": "station_exit",
+            "instruction": "%s역 %s번 출구입니다. 여기서부터 걸어서 이동합니다" % (name, ax["exit_no"]),
+            "distance_m": 0, "duration_sec": 0,
+            "coord": [round(ax["lat"], 7), round(ax["lng"], 7)],
+            "link_type": "walk", "link_name": None,
+            "leg_ref": {"kind": "subway", "alight_station_id": str(leg["alight"]["poi_id"]),
+                        "exit_no": ax["exit_no"]},
+            "egress": leg.get("egress"),
+            "warnings": []}
 
 
 def _station_brief(poi_id: str, name: str) -> dict:
@@ -672,6 +705,67 @@ def _rank_low_floor(cands: list, judge, profile, origin) -> list:
     return [c for _, c in ranked]
 
 
+_FAC_CACHE = {}
+_FAC_TTL_SEC = 600
+
+
+def _station_facilities_cached(station: dict):
+    """역 설비 — 후보 조합마다 같은 역을 되풀이 조회하지 않도록 10분 캐시."""
+    key = (str(station.get("poi_id")), station.get("name"))
+    hit = _FAC_CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[0] < _FAC_TTL_SEC:
+        return hit[1]
+    try:
+        fac = poi_store.STORE.station_facilities(stn_cd=station.get("poi_id"), name=station["name"])
+    except Exception as e:
+        logger.warning("역 설비 조회 실패 %s: %s", station.get("name"), e)
+        fac = None
+    _FAC_CACHE[key] = (now, fac)
+    return fac
+
+
+def _walk_leg_via_exit(station: dict, direction: str, other, profile, allowed,
+                       other_label: str, to_is_entrance: bool = False):
+    """역 출구 좌표를 도보 leg 의 한쪽 끝으로 쓴다 (#77).
+
+    direction="from": 하차역 출구 → other, "to": other → 승차역 출구.
+    출구 좌표가 없는 역은 종전처럼 역 중심을 쓴다. 후보 출구는 다른 쪽 끝에서 직선으로
+    가까운 2곳만 실제 경로를 계산해 소요시간이 짧은 쪽을 고른다.
+    반환: (leg | None, 선택 출구 | None)
+    """
+    center = (station["lat"], station["lng"])
+    st_label = "%s역" % station["name"]
+    fac = _station_facilities_cached(station)
+    wheel = str(getattr(profile, "id", "")).startswith("wheelchair")
+    opts = station_exits.nearest_exits(
+        station_exits.exit_options(station["name"], fac or {}, wheel), other, 2)
+    best, last_err = None, None
+    for ex in opts:
+        pt = (ex["lat"], ex["lng"])
+        label = "%s %s번 출구" % (st_label, ex["exit_no"])
+        try:
+            if direction == "from":
+                leg = _walk_leg(pt, other, profile, allowed, label, other_label,
+                                to_is_entrance=to_is_entrance)
+            else:
+                leg = _walk_leg(other, pt, profile, allowed, other_label, label)
+        except (SnapError, NoRouteError) as e:
+            last_err = e
+            continue
+        dur = leg["summary"]["duration_sec"] if leg else 0.0
+        if best is None or dur < best[0]:
+            best = (dur, leg, ex)
+    if best is not None:
+        return best[1], best[2]
+    if opts and last_err is not None:
+        logger.info("출구 기준 도보 경로 실패 %s — 역 중심으로 대체: %s", station.get("name"), last_err)
+    if direction == "from":
+        return _walk_leg(center, other, profile, allowed, st_label, other_label,
+                         to_is_entrance=to_is_entrance), None
+    return _walk_leg(other, center, profile, allowed, other_label, st_label), None
+
+
 def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                      mode: str, constraints=None, realtime: bool = False,
                      low_floor=None) -> dict:
@@ -726,18 +820,41 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     for cand in cands[:8]:      # 근사-실계산 괴리 보정 폭 — 도보 leg 계산은 저렴하다
         try:
             built = []
-            for part in cand["parts"]:
-                if part["kind"] == "walk":
+            parts = cand["parts"]
+            walk_legs_by_idx, exit_by_idx = {}, {}
+            for pi, part in enumerate(parts):   # 1) 도보 leg — 지하철과 맞닿은 쪽은 출구 기준(#77)
+                if part["kind"] != "walk":
+                    continue
+                to_ent = (part["to"][0] == "목적지"
+                          and target.get("source") in ENTRANCE_SOURCES)
+                prev = parts[pi - 1] if pi > 0 else None
+                nxt = parts[pi + 1] if pi + 1 < len(parts) else None
+                if prev is not None and prev["kind"] == "subway":
+                    leg, ex = _walk_leg_via_exit(prev["alight"], "from", part["to"][1], profile,
+                                                 allowed, part["to"][0], to_is_entrance=to_ent)
+                    exit_by_idx[(pi - 1, "alight")] = ex
+                elif nxt is not None and nxt["kind"] == "subway":
+                    leg, ex = _walk_leg_via_exit(nxt["board"], "to", part["frm"][1], profile,
+                                                 allowed, part["frm"][0])
+                    exit_by_idx[(pi + 1, "board")] = ex
+                else:
                     leg = _walk_leg(part["frm"][1], part["to"][1], profile, allowed,
-                                    part["frm"][0], part["to"][0],
-                                    to_is_entrance=(part["to"][0] == "목적지"
-                                                    and target.get("source") in ENTRANCE_SOURCES))
-                    if leg is not None:
-                        built.append(leg)
+                                    part["frm"][0], part["to"][0], to_is_entrance=to_ent)
+                walk_legs_by_idx[pi] = leg
+            for pi, part in enumerate(parts):   # 2) 순서대로 조립
+                if part["kind"] == "walk":
+                    if walk_legs_by_idx.get(pi) is not None:
+                        built.append(walk_legs_by_idx[pi])
                 elif part["kind"] == "bus":
                     built.append(_bus_leg(part))
                 else:
-                    built.append(_subway_leg(part))
+                    sl = _subway_leg(part)
+                    bx, ax = exit_by_idx.get((pi, "board")), exit_by_idx.get((pi, "alight"))
+                    if bx:
+                        sl["board_exit"] = station_exits.exit_brief(bx)
+                    if ax:
+                        sl["alight_exit"] = station_exits.exit_brief(ax)
+                    built.append(sl)
             actual = sum(l["summary"]["total_distance_m"] for l in built
                          if l["kind"] == "walk")
             actual += sum(l.get("stop_cnt", 0) for l in built) * transit.STOP_PENALTY_M
@@ -776,6 +893,12 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
         )
 
     _attach_realtime(legs, realtime)
+    for leg in legs:                      # 하차 후 역 안/밖 안내 (#77)
+        if leg["kind"] == "subway":
+            ax = leg.get("alight_exit")
+            leg["egress"] = station_exits.egress_guide(
+                leg["alight"]["name"], leg["board"]["name"],
+                leg["alight"].get("facilities") or {}, ax)
 
     # ── 통합 요약·geometry·steps ──
     walk_legs = [l for l in legs if l["kind"] == "walk"]
@@ -802,6 +925,9 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
         else:
             steps.append(_transit_step(leg, boarding=True))
             steps.append(_transit_step(leg, boarding=False))
+            ex_step = _station_exit_step(leg)
+            if ex_step:
+                steps.append(ex_step)
     if not steps or steps[-1]["maneuver"] != "arrive":
         last = geometry[-1] if geometry else [target["lat"], target["lng"]]
         steps.append({"maneuver": "arrive", "instruction": "목적지에 도착했습니다.",
@@ -1082,19 +1208,24 @@ def tour_spot_entrance(poi_id: str, profile: str = Query(prof.DEFAULT_PROFILE)):
 
 @app.post("/tour/recommend", tags=["tour"], dependencies=[Depends(auth)])
 def tour_recommend(req: RecommendRequest):
+    if req.category not in poi_store.RECOMMEND_CATEGORIES:
+        raise HTTPException(status_code=400, detail="지원하지 않는 category 입니다: %s" % req.category)
     items = poi_store.STORE.recommend_tour(
         req.disabilities, req.sigungu, req.match_mode, req.topk,
         origin_lat=req.origin_lat, origin_lng=req.origin_lng, offset=req.offset,
+        category=req.category,
     )
     # total 은 클라이언트가 무한스크롤 종료를 판단하는 근거 — offset+topk 로는 알 수 없다.
     total = len(poi_store.STORE.recommend_tour(
         req.disabilities, req.sigungu, req.match_mode, 10000,
         origin_lat=req.origin_lat, origin_lng=req.origin_lng, offset=0,
+        category=req.category,
     ))
     # 추천 스냅샷(#73) — 지표 ③ MAP 산출용. 순위·점수만 남긴다(본문은 결정적이라 재현 가능)
     metrics.METRICS.write(
         "recommend", disabilities=req.disabilities, sigungu=req.sigungu,
-        match_mode=req.match_mode, topk=req.topk, offset=req.offset,
+        match_mode=req.match_mode, topk=req.topk, offset=req.offset, category=req.category,
+        client=metrics.current_tags().get("client"),
         origin=([round(req.origin_lat, 6), round(req.origin_lng, 6)]
                 if req.origin_lat is not None and req.origin_lng is not None else None),
         total=total,
