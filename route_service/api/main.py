@@ -29,6 +29,7 @@ from ..engine.steps import build_steps
 from ..collect import store as collect_store
 from ..engine.overrides import apply_overrides
 from ..poi import store as poi_store
+from ..poi import support as poi_support
 from ..transit import gbis_live
 from ..transit import planner as transit
 from ..transit import low_floor as lowfloor
@@ -390,6 +391,7 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         "snapped": g["snapped"], "snap_dist_m": g["dist_m"], "snap_kind": g["kind"]},
         "routes": routes,
         "fallback": result["fallback"],
+        "support_hint": _support_hint(routes[0]["geometry"] if routes else [], profile),
         "data_quality": {
             "slope_coverage": NET.meta.get("slope_coverage"),
             "link_type_available": NET.meta.get("link_type_available"),
@@ -854,6 +856,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         "resolved_by": target["source"],
                         "note": _entrance_note(target)},
         "routes": [{"summary": summary, "geometry": geometry, "steps": steps, "legs": legs}],
+        "support_hint": _support_hint(geometry, profile),
         "low_floor": lf_info,
         "fallback": fallback,
         "data_quality": {
@@ -1102,6 +1105,61 @@ def tour_recommend(req: RecommendRequest):
     return {"source": poi_store.STORE.source, "count": len(items),
             "total": total, "offset": req.offset,
             "has_more": req.offset + len(items) < total, "items": items}
+
+
+# ────────────────────────── 긴급대응·화장실 (#75) ──────────────────────────
+def _support_hint(geometry: list, profile) -> dict:
+    """전동 휠체어 경로에 붙는 한 줄 요약 — 경로 1km 회랑 안의 충전기 수와 최근접 1곳.
+
+    수동·시각장애 등 다른 프로필에는 붙이지 않는다(배터리 개념이 없다). 조회 실패는
+    경로 계획을 깨지 않는다 — None 을 두고 로그만 남긴다.
+    """
+    if getattr(profile, "id", "") != "wheelchair_electric":
+        return None
+    try:
+        return poi_support.charge_hint(poi_store.STORE, geometry)
+    except Exception as e:                       # DB 미가용 등
+        logger.warning("충전기 요약 조회 실패(%s) — 요약 없이 응답", e)
+        return None
+
+
+@app.get("/support/nearby", tags=["support"], dependencies=[Depends(auth)])
+def support_nearby(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    types: str = Query("charge,repair,calltaxi", description="charge | repair | calltaxi (콤마 구분)"),
+    radius_m: float = Query(2000, ge=50, le=20000),
+    limit: int = Query(5, ge=1, le=50, description="유형별 최대 건수"),
+):
+    """긴급대응 지원시설 근접 조회 — 전동보장구 충전기·보장구 수리·장애인콜택시.
+
+    거리순이며 운영시간이 비어 있으면 `open_hours_status=unknown`(전화 확인 권장)이다.
+    좌표 의심 표시(`coord_suspect`)가 있는 행은 같은 좌표에 여러 시설이 겹친 경우다.
+    """
+    tlist = [t.strip() for t in types.split(",") if t.strip()]
+    bad = [t for t in tlist if t not in poi_support.SUPPORT_TYPES]
+    if bad:
+        raise HTTPException(status_code=400, detail="지원하지 않는 유형: %s" % ",".join(bad))
+    items = poi_support.support_near(poi_store.STORE, lat, lng, tlist, radius_m, limit)
+    by_type = {t: sum(1 for i in items if i["support_type"] == t) for t in tlist}
+    metrics.tag(support_types=",".join(tlist), result_cnt=len(items))
+    return {"source": poi_store.STORE.source, "radius_m": radius_m, "count": len(items),
+            "count_by_type": by_type, "items": items}
+
+
+@app.get("/toilet/nearby", tags=["support"], dependencies=[Depends(auth)])
+def toilet_nearby(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    radius_m: float = Query(800, ge=50, le=5000),
+    limit: int = Query(5, ge=1, le=30),
+    accessible_only: bool = Query(True, description="장애인 대·소변기 보유분만"),
+):
+    """반경 내 공중화장실 — 기본은 장애인 화장실 보유분만, 거리순. 역사 화장실은 `/transit/station/facilities`."""
+    items = poi_support.toilets_near(poi_store.STORE, lat, lng, radius_m, limit, accessible_only)
+    metrics.tag(result_cnt=len(items))
+    return {"source": poi_store.STORE.source, "radius_m": radius_m,
+            "accessible_only": accessible_only, "count": len(items), "items": items}
 
 
 # ────────────────────────── transit ──────────────────────────
