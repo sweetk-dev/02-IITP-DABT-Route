@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 
@@ -41,6 +42,21 @@ def _load() -> dict:
     return _DATA
 
 
+_PLATFORMS = None
+
+
+def _load_platforms() -> dict:
+    """역 승강장 윤곽(OSM railway=platform 면). 없는 역은 빈 목록."""
+    global _PLATFORMS
+    if _PLATFORMS is None:
+        try:
+            with open(_PATH, encoding="utf-8") as f:
+                _PLATFORMS = json.load(f).get("platforms", {}) or {}
+        except (OSError, ValueError):
+            _PLATFORMS = {}
+    return _PLATFORMS
+
+
 def _key(name: str) -> str:
     n = (name or "").strip()
     return n[:-1] if n.endswith("역") and len(n) > 1 else n
@@ -54,6 +70,60 @@ def _exit_no(v):
 
 def exits_for(name: str) -> list:
     return [dict(e) for e in _load().get(_key(name), [])]
+
+
+def platforms_for(name: str) -> list:
+    """승강장 윤곽 목록 — 각 원소는 [[lat, lng], ...] 닫힌 고리."""
+    return [p.get("ring") or [] for p in _load_platforms().get(_key(name), []) if p.get("ring")]
+
+
+def _xy(lat0: float, lng0: float, lat: float, lng: float):
+    """기준점 둘레 평면 근사(m). 역 하나 크기(수백 m)에서는 오차가 무시할 만하다."""
+    r = 6371000.0
+    x = math.radians(lng - lng0) * r * math.cos(math.radians(lat0))
+    y = math.radians(lat - lat0) * r
+    return x, y
+
+
+def _seg_dist(px, py, ax, ay, bx, by) -> float:
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    t = 0.0 if L2 == 0 else max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+    qx, qy = ax + t * dx, ay + t * dy
+    return math.hypot(px - qx, py - qy)
+
+
+def _inside(px, py, pts) -> bool:
+    c = False
+    n = len(pts)
+    for i in range(n):
+        (x1, y1), (x2, y2) = pts[i], pts[(i + 1) % n]
+        if (y1 > py) != (y2 > py) and px < (x2 - x1) * (py - y1) / (y2 - y1) + x1:
+            c = not c
+    return c
+
+
+def footprint_distance_m(name: str, lat: float, lng: float):
+    """출발점에서 역 시설(승강장 윤곽·출구)까지의 최단 거리(m). 승강장 안이면 0.
+
+    승강장 윤곽 자료가 없는 역은 None — 호출자가 역 중심 기준으로 판정한다.
+    (역 중심 좌표는 역사 건물 쪽에 찍혀 있어 승강장에서 60~140m 떨어진 역도 있다 — 명학·관악.)
+    """
+    rings = platforms_for(name)
+    if not rings:
+        return None
+    best = None
+    for ring in rings:
+        pts = [_xy(lat, lng, a, b) for a, b in ring]
+        if len(pts) >= 3 and _inside(0.0, 0.0, pts):
+            return 0.0
+        for i in range(len(pts) - 1):
+            d = _seg_dist(0.0, 0.0, *pts[i], *pts[i + 1])
+            best = d if best is None or d < best else best
+    for e in exits_for(name):
+        d = haversine_m(lat, lng, e["lat"], e["lng"])
+        best = d if best is None or d < best else best
+    return best
 
 
 def exit_options(name: str, facilities: dict, wheelchair: bool) -> list:

@@ -1035,7 +1035,11 @@ def route_plan(req: PlanRequest):
 # 하차 안내(egress)가 붙지 않는다. 출발점이 역 가까이면 화면이 "역 안/밖"을 묻고, 역 안이면
 # "어느 쪽에서 타고 왔는지"를 물어 origin_station 으로 다시 요청한다. 그러면 출발점을 목적지에
 # 맞는 출구로 옮기고, 내린 승강장 승강기 → 출구 승강기 스텝을 맨 앞에 붙인다.
-STATION_NEAR_M = 150.0      # 역 중심에서 이 안이면 묻는다(10량 승강장 반 길이 ≈ 100m + GPS 오차)
+# 역 근처 판정 (v1.29.0) — 역 중심 좌표는 역사 건물 쪽에 찍혀 있어 승강장이 통째로 60~140m 밖에
+# 있는 역이 있다(명학 63~104m, 관악 82~139m). 중심점 반경을 줄이면 승강장 위에서도 묻지 않게 되고,
+# 넓히면 역에서 먼 골목에서도 묻는다. 그래서 승강장 윤곽·출구에서 50m 안일 때 묻는다.
+STATION_FOOTPRINT_NEAR_M = 50.0   # 승강장 윤곽·출구에서 이 안이면 묻는다(GPS 오차 여유)
+STATION_NEAR_M = 150.0            # 승강장 윤곽 자료가 없는 역(4호선)만 — 역 중심에서 이 안이면 묻는다
 
 
 def _find_station(name: str):
@@ -1051,16 +1055,24 @@ def _station_nearby_hint(lat: float, lng: float, profile_id: str):
     try:
         best = None
         for s in poi_store.STORE.stations():
-            d = transit.haversine_m(lat, lng, s["lat"], s["lng"])
-            if d <= STATION_NEAR_M and (best is None or d < best[0]) and station_exits.exits_for(s["name"]):
-                best = (d, s)
+            if not station_exits.exits_for(s["name"]):
+                continue
+            d = station_exits.footprint_distance_m(s["name"], lat, lng)
+            if d is not None:
+                ok, basis = d <= STATION_FOOTPRINT_NEAR_M, "platform"
+            else:
+                d = transit.haversine_m(lat, lng, s["lat"], s["lng"])
+                ok, basis = d <= STATION_NEAR_M, "center"
+            if ok and (best is None or d < best[0]):
+                best = (d, s, basis)
         if best is None:
             return None
-        d, st = best
+        d, st, basis = best
         name = station_exits._key(st["name"])
         return {
             "station": name,
             "distance_m": round(d),
+            "basis": basis,        # platform = 승강장 윤곽·출구까지 거리 / center = 역 중심까지 거리
             "question": "지금 %s역 안(승강장)에 계신가요, 역 밖에 계신가요?" % name,
             "travel_question": "어느 쪽에서 열차를 타고 오셨나요?",
             "choices": station_exits.arrival_choices(name),

@@ -134,3 +134,52 @@ def test_station_without_exit_data_still_gets_inside_step(client, monkeypatch):
     # 출구 자료가 없으면 역 근처라도 묻지 않는다(안내할 출구가 없다)
     plain = client.post("/route/plan", json={"origin": NEAR_MYEONGHAK, "destination": DEST}).json()
     assert "station_nearby" not in plain
+
+
+# ── 역 근처 판정 기준: 승강장 윤곽·출구에서 50m (v1.29.0) ──────────────────
+# 역 중심 좌표는 역사 쪽에 찍혀 있어 명학·관악은 승강장 전체가 중심에서 60~140m 밖이다.
+# 중심점 반경을 50m 로 줄이면 승강장 위에서도 묻지 않게 되므로, 승강장 윤곽과 출구를 기준으로 잰다.
+GWANAK_CENTER = (37.419578, 126.908476)     # 운영 DB 역 좌표
+GWANAK_PLATFORM_N_END = (37.42058, 126.90753)
+GWANAK_PLATFORM_MID = (37.419745, 126.908215)
+MYEONGHAK_PLATFORM_MID = (37.38429, 126.93577)
+
+
+def test_footprint_uses_real_platform_outline():
+    from route_service.engine.geo import haversine_m
+    # 승강장 위 — 거리 0 에 가깝다. 역 중심에서는 100m 이상 떨어진 지점이다
+    assert ex.footprint_distance_m("관악역", *GWANAK_PLATFORM_N_END) < 5
+    assert haversine_m(*GWANAK_CENTER, *GWANAK_PLATFORM_N_END) > 130
+    assert ex.footprint_distance_m("관악", *GWANAK_PLATFORM_MID) < 5
+    assert ex.footprint_distance_m("명학", *MYEONGHAK_PLATFORM_MID) < 5
+    # 출구 앞도 50m 안
+    e1 = [e for e in ex.exits_for("명학") if e["exit_no"] == "1"][0]
+    assert ex.footprint_distance_m("명학", e1["lat"], e1["lng"]) < 1
+    # 승강장에서 동쪽으로 약 26m → 안 / 약 88m → 밖
+    near = ex.footprint_distance_m("명학", MYEONGHAK_PLATFORM_MID[0], MYEONGHAK_PLATFORM_MID[1] + 0.0003)
+    far = ex.footprint_distance_m("명학", MYEONGHAK_PLATFORM_MID[0], MYEONGHAK_PLATFORM_MID[1] + 0.0010)
+    assert near <= 50 < far
+    # 승강장 윤곽이 없는 역(4호선)은 None — 역 중심 기준으로 판정한다
+    assert ex.footprint_distance_m("범계", 37.389793, 126.950876) is None
+
+
+def test_walk_hint_uses_platform_outline_when_available(client, monkeypatch):
+    lat, lng = NEAR_MYEONGHAK["lat"], NEAR_MYEONGHAK["lng"]
+    d = 0.0001
+    ring = [[lat - d, lng - d], [lat - d, lng + d], [lat + d, lng + d], [lat + d, lng - d], [lat - d, lng - d]]
+    monkeypatch.setattr(ex, "_PLATFORMS", {"명학": [{"ring": ring}]})
+    r = client.post("/route/plan", json={"origin": NEAR_MYEONGHAK, "destination": DEST})
+    hint = r.json()["station_nearby"]
+    assert hint["station"] == "명학" and hint["basis"] == "platform" and hint["distance_m"] == 0
+    # 역 중심(합성 역)에서는 150m 안이지만 승강장·출구에서 50m 밖 → 묻지 않는다
+    import route_service.api.main as m
+    from route_service.engine.geo import haversine_m
+    off = (lat, lng + 0.0014)                  # 승강장에서 약 120m 동쪽 (합성 보행망 밖이라 판정 함수로 확인)
+    assert haversine_m(37.3908, 126.9510, *off) < m.STATION_NEAR_M
+    assert m._station_nearby_hint(off[0], off[1], "wheelchair_electric") is None
+    assert m._station_nearby_hint(lat, lng, "wheelchair_electric")["basis"] == "platform"
+
+
+def test_walk_hint_falls_back_to_center_without_outline(client):
+    r = client.post("/route/plan", json={"origin": NEAR_MYEONGHAK, "destination": DEST})
+    assert r.json()["station_nearby"]["basis"] == "center"
