@@ -216,6 +216,35 @@ def _name_match_rank(nq: str, name: str):
     return None
 
 
+
+# ── 관광 분류 (#77) ──
+# mv_poi 의 search_filter 는 원천(경기관광 등) 분류를 그대로 담는다. 무장애 관광지 추천에
+# 상점·식당·숙박이 섞여 들어가던 원인이 이 분류를 쓰지 않은 데 있었다.
+#   tourist_spot  → tour   (관광지·문화시설·공원·레저 등)
+#   restaurant    → food / shopping → shopping / accommodation → stay
+#   tourist_spot 중 "축제…" → event (기간 한정이라 상시 추천 대상에서 뺀다)
+# 분류 정보가 전혀 없는 행(수기 등재분·파일 픽스처)은 tour 로 본다 — 무장애 관광지로
+# 직접 등재한 것이라 관광 목적이 확실하다.
+TOUR_CATEGORY_LABEL = {"tour": "관광지", "event": "축제·행사", "food": "음식점",
+                       "shopping": "쇼핑", "stay": "숙박"}
+RECOMMEND_CATEGORIES = ("tour", "all")
+RECOMMEND_TOP_TIER_SCORE = 0.6     # 이 점수 이상을 먼저, 같은 등급 안에서는 거리순
+
+
+def tour_category(r: dict):
+    """(분류, 원천 세부분류 문자열)."""
+    if r.get("category") in TOUR_CATEGORY_LABEL:          # 이미 정규화된 행(파일 픽스처 등)
+        return r["category"], r.get("category_detail")
+    spot = (r.get("sf_tourist_spot") or "").strip()
+    if spot:
+        return ("event" if "축제" in spot else "tour"), spot
+    for key, cat in (("sf_restaurant", "food"), ("sf_shopping", "shopping"),
+                     ("sf_accommodation", "stay")):
+        v = (r.get(key) or "").strip()
+        if v:
+            return cat, v
+    return "tour", None
+
 class PoiStore:
     def __init__(self, backend: str = "none", data_dir: str = "", dsn: str = ""):
         self.backend = backend
@@ -297,7 +326,11 @@ class PoiStore:
                        COALESCE(address_road, address_detail) AS addr,
                        latitude, longitude,
                        detail_json->>'accessible_facilities' AS fac_text,
-                       search_filter_json->'search_filter'->>'tourist_type' AS tourist_type
+                       search_filter_json->'search_filter'->>'tourist_type' AS tourist_type,
+                       search_filter_json->'search_filter'->>'tourist_spot' AS sf_tourist_spot,
+                       search_filter_json->'search_filter'->>'restaurant' AS sf_restaurant,
+                       search_filter_json->'search_filter'->>'shopping' AS sf_shopping,
+                       search_filter_json->'search_filter'->>'accommodation' AS sf_accommodation
                   FROM mv_poi
                  WHERE language_code = 'ko'
                    AND latitude IS NOT NULL AND longitude IS NOT NULL
@@ -500,6 +533,7 @@ class PoiStore:
             fac = PoiStore._facilities_from_text(r.get("fac_text"))
         else:
             fac = {k: _is_y(r.get(k)) for k in TOUR_FIELDS}
+        category, sub = tour_category(r)
         return {
             "poi_id": str(r.get("poi_id") or r.get("fclt_id") or r.get("id") or ""),
             "type": "tour",
@@ -509,6 +543,8 @@ class PoiStore:
             "lng": float(lng) if lng is not None else None,
             "facilities": fac,
             "entrance": r.get("entrance"),
+            "category": category,
+            "category_detail": sub,
         }
 
     def search_tour_by_name(self, q: str, sigungu: str = "", limit: int = 10) -> list:
@@ -546,7 +582,11 @@ class PoiStore:
                        COALESCE(address_road, address_detail) AS addr,
                        latitude, longitude,
                        detail_json->>'accessible_facilities' AS fac_text,
-                       search_filter_json->'search_filter'->>'tourist_type' AS tourist_type
+                       search_filter_json->'search_filter'->>'tourist_type' AS tourist_type,
+                       search_filter_json->'search_filter'->>'tourist_spot' AS sf_tourist_spot,
+                       search_filter_json->'search_filter'->>'restaurant' AS sf_restaurant,
+                       search_filter_json->'search_filter'->>'shopping' AS sf_shopping,
+                       search_filter_json->'search_filter'->>'accommodation' AS sf_accommodation
                   FROM mv_poi
                  WHERE language_code = 'ko'
                    AND latitude IS NOT NULL AND longitude IS NOT NULL
@@ -639,7 +679,7 @@ class PoiStore:
     def recommend_tour(self, disabilities: list, sigungu: str = "안양",
                        match_mode: str = "all", topk: int = 10,
                        origin_lat: float = None, origin_lng: float = None,
-                       offset: int = 0) -> list:
+                       offset: int = 0, category: str = "tour") -> list:
         """장애 유형별 무장애 관광지 랭킹.
 
         10-TripSense 의 filter_and_rank 와 동일한 판단 기준(요구 편의시설 충족 여부)을
@@ -649,6 +689,9 @@ class PoiStore:
         for d in disabilities or []:
             required.append(set(DISABILITY_REQUIREMENTS.get(d, [])))
         spots = self.list_tour_spots(sigungu=sigungu, limit=10000)
+        if category == "tour":
+            # 관광 분류만 후보로 쓴다(#77) — 종전 동작은 category="all"
+            spots = [s for s in spots if s.get("category", "tour") == "tour"]
 
         scored = []
         for s in spots:
@@ -669,6 +712,8 @@ class PoiStore:
                 score = sum(1 for f in TOUR_FIELDS if fac.get(f)) / len(TOUR_FIELDS)
             item = dict(s)
             item["score"] = round(score, 3)
+            item["tier"] = 1 if score >= RECOMMEND_TOP_TIER_SCORE else 2
+            item["category_label"] = TOUR_CATEGORY_LABEL.get(item.get("category"))
             item["matched"] = [f for f in TOUR_FIELDS if fac.get(f)]
             scored.append(item)
 
@@ -682,9 +727,17 @@ class PoiStore:
                 it["distance_m"] = round(
                     haversine_m(origin_lat, origin_lng, it["lat"], it["lng"]), 1
                 )
-            scored.sort(key=lambda x: (x["distance_m"] is None,
-                                       x["distance_m"] if x["distance_m"] is not None else 0,
-                                       x["name"] or ""))
+            if category == "tour":
+                # 무장애 충족도 상위 등급을 먼저, 같은 등급 안에서 거리순(#77).
+                # 거리만으로 줄 세우면 가까운 저충족 시설이 대표 관광지를 밀어낸다.
+                scored.sort(key=lambda x: (x["score"] < RECOMMEND_TOP_TIER_SCORE,
+                                           x["distance_m"] is None,
+                                           x["distance_m"] if x["distance_m"] is not None else 0,
+                                           x["name"] or ""))
+            else:
+                scored.sort(key=lambda x: (x["distance_m"] is None,
+                                           x["distance_m"] if x["distance_m"] is not None else 0,
+                                           x["name"] or ""))
         else:
             scored.sort(key=lambda x: (-x["score"], x["name"] or ""))
 

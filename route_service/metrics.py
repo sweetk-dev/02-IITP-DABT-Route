@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import contextvars
 import json
+import math
+import re
 import logging
 import os
 import threading
@@ -77,28 +79,51 @@ class Metrics:
                     self._fh = None
 
     # ── 요약 ──
-    def summary(self, since_sec: float = 0.0) -> dict:
-        """경로(path)별 건수·평균·P50·P95(ms). since_sec 이 0 이면 메모리 보유분 전부."""
+    def summary(self, since_sec: float = 0.0, client: str = None) -> dict:
+        """경로(path)별 건수·평균·P50·P95(ms). since_sec 이 0 이면 메모리 보유분 전부.
+
+        백분위는 **정상 응답(HTTP < 400)만** 대상으로 nearest-rank(정렬 후 ceil(p·n) 번째)로
+        구한다(#77). 종전 floor(p·(n−1)) 방식은 표본이 적을 때 P95 를 과소 추정했고(n=2 에서
+        최솟값이 P95 가 됨) 4xx 즉시 응답이 섞여 값을 끌어내렸다. 오류 건수는 error_cnt 로 따로 준다.
+        client 를 주면 X-Client-Tag 가 그 값인 요청만 본다.
+        """
         cutoff = time.time() - since_sec if since_sec and since_sec > 0 else 0
-        buckets = {}
+        buckets, errors = {}, {}
         with self._lock:
-            rows = [r for r in self.recent if r.get("kind") == "request" and r["ts"] >= cutoff]
+            rows = [r for r in self.recent if r.get("kind") == "request" and r["ts"] >= cutoff
+                    and (client is None or r.get("client") == client)]
         for r in rows:
-            buckets.setdefault(r.get("path"), []).append(float(r.get("ms", 0)))
+            path = r.get("path")
+            if int(r.get("status") or 0) >= 400:
+                errors[path] = errors.get(path, 0) + 1
+                buckets.setdefault(path, [])
+                continue
+            buckets.setdefault(path, []).append(float(r.get("ms", 0)))
         out = {}
         for path, xs in buckets.items():
             xs.sort()
             n = len(xs)
             out[path] = {
                 "count": n,
-                "avg_ms": round(sum(xs) / n, 1),
-                "p50_ms": round(xs[int(0.50 * (n - 1))], 1),
-                "p95_ms": round(xs[int(0.95 * (n - 1))], 1),
-                "max_ms": round(xs[-1], 1),
+                "error_cnt": errors.get(path, 0),
+                "avg_ms": round(sum(xs) / n, 1) if n else None,
+                "p50_ms": nearest_rank(xs, 0.50),
+                "p95_ms": nearest_rank(xs, 0.95),
+                "max_ms": round(xs[-1], 1) if n else None,
                 "over_3s": sum(1 for x in xs if x > 3000),
             }
-        return {"since_sec": since_sec, "paths": out, "recent_kept": len(self.recent),
-                "file": self.path or None, "dropped": self.dropped}
+        return {"since_sec": since_sec, "client": client, "paths": out,
+                "percentile": "nearest-rank, HTTP<400 only",
+                "recent_kept": len(self.recent), "file": self.path or None, "dropped": self.dropped}
+
+
+def nearest_rank(sorted_xs: list, p: float):
+    """nearest-rank 백분위 — 정렬된 값의 ceil(p·n) 번째. 빈 목록이면 None."""
+    n = len(sorted_xs)
+    if not n:
+        return None
+    k = max(1, math.ceil(p * n))
+    return round(sorted_xs[k - 1], 1)
 
 
 METRICS = Metrics(enabled=False)
@@ -109,6 +134,20 @@ def configure(settings) -> Metrics:
     METRICS = Metrics(path=getattr(settings, "metrics_log_path", ""),
                       enabled=getattr(settings, "metrics_enabled", True))
     return METRICS
+
+
+_CLIENT_TAG_RE = re.compile(r"[^A-Za-z0-9_.@-]")
+
+
+def client_tag(raw):
+    """요청 헤더 X-Client-Tag 정규화 — 영숫자·일부 기호만, 40자 이내. 비면 None.
+
+    호출 측(12)이 인증 계정명을 넣는다. 로그 오염·주입을 막기 위해 허용 문자 외는 버린다.
+    """
+    if not raw:
+        return None
+    t = _CLIENT_TAG_RE.sub("", str(raw))[:40]
+    return t or None
 
 
 def tag(**kv):

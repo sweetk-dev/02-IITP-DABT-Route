@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.26.0 |
+| 02-IITP-DABT-Route | v1.27.0 |
 
 ## 구조
 
@@ -235,6 +235,27 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
 - 목적지 유형 `transit_station`: 지하철역 — 승강설비(엘리베이터/리프트) 보유 여부로 접근성 판정
 - 목적지 유형 `transit_stop`: 버스 정류장 — 저상버스 정차 여부는 정적 데이터에 없다.
   **v1.19.0 부터 실시간 도착정보(GBIS `lowPlate`)를 서비스가 직접 조회한다** — 아래 "실시간 버스" 참고
+
+### 하차역 출구 · 관광 분류 추천 · 시설 내 화장실 · 요청 출처 태그 (v1.27.0)
+
+- **지하철 leg 의 도보는 역 출구에서 시작·끝난다.** 출구 좌표는 `route_service/transit/station_exits.json`
+  (OpenStreetMap 기여자, ODbL — `railway=subway_entrance` 의 출구 번호)이고, 휠체어 프로필은 출구별 승강기
+  (`poi_station_elevator_unit.exit_no`)가 있는 출구만 후보로 쓴다. 다른 쪽 끝점에서 가까운 출구 2곳의 실제
+  경로를 계산해 짧은 쪽을 고른다. 출구가 선로 양쪽에 있는 역에서 역 중심 기준 계산이 반대편으로 크게 돌던
+  문제를 없앤다(관악역 → 김중업건축박물관: 역 중심 2,144m / 2번 출구 1,289m).
+- 지하철 leg 에 `board_exit`·`alight_exit`·`egress` 를 싣는다. `egress` 는 하차 후 안내를 **두 벌** 준다 —
+  역 안(승강장)이면 `inside`(하차 승강장 쪽 승강기 → 출구 승강기), 이미 나왔으면 `outside`(출구 기준).
+  역 안에서는 측위가 안 되므로 어느 쪽인지는 클라이언트가 이용자에게 묻는다(`question`). 하차 승강장 쪽
+  판정은 DB 문구의 "○○역 방향"과 진행 방향으로 한다. 하차 뒤에는 출구 좌표의 `station_exit` 스텝이 붙는다.
+- `/tour/recommend` 에 `category`(기본 `tour`) — mv_poi `search_filter` 분류로 관광지만 후보로 쓰고
+  (음식점·쇼핑·숙박·축제 제외) **충족도 0.6 이상을 먼저, 같은 등급 안에서 거리순**으로 정렬한다.
+  `category=all` 은 종전(전 분류·순수 거리순). 항목에 `category`·`category_label`·`tier` 를 싣는다.
+- `/toilet/nearby` 가 한국관광공사 무장애 여행정보(`poi_tour_bf_facility.toilet_yn='Y'`)의 **시설 내 장애인화장실**을
+  합친다(`facility_toilet=true`, `source=KTO_BF`). 공중화장실과 80m 이내·이름이 겹치면 공중화장실만 남긴다.
+- `/support/nearby` 항목에 `tel_owner` — 충전기 표준데이터의 전화번호는 설치장소가 아니라 **관리기관** 번호라
+  `manager`(+`tel_owner_name`)로 표시한다.
+- 요청 헤더 `X-Client-Tag`(영숫자·`_.@-`, 40자)를 계측 행의 `client` 로 남긴다. `/meta/latency?client=` 로 한정할 수 있고,
+  백분위는 **정상 응답(HTTP<400)만 nearest-rank** 로 구한다(오류는 `error_cnt`).
 
 ### 긴급대응 지원시설 · 화장실 근접 조회 (v1.26.0)
 

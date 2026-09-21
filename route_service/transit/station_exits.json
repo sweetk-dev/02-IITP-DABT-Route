@@ -1,0 +1,236 @@
+{
+ "_about": "안양 관내 지하철역 출구 좌표. 출처: OpenStreetMap 기여자(ODbL 1.0) railway=subway_entrance 노드의 ref(출구 번호). 2026-09-21 수집. 출구별 승강기 여부는 poi_station_elevator_unit.exit_no 로 판정한다.",
+ "stations": {
+  "인덕원": [
+   {
+    "exit_no": "1",
+    "lat": 37.4021297,
+    "lng": 126.9772144,
+    "wheelchair": null,
+    "osm_node": 3403176432
+   },
+   {
+    "exit_no": "2",
+    "lat": 37.4012348,
+    "lng": 126.9773807,
+    "wheelchair": null,
+    "osm_node": 3403176433
+   },
+   {
+    "exit_no": "3",
+    "lat": 37.4009983,
+    "lng": 126.9771045,
+    "wheelchair": null,
+    "osm_node": 3403176434
+   },
+   {
+    "exit_no": "4",
+    "lat": 37.40096,
+    "lng": 126.9764098,
+    "wheelchair": null,
+    "osm_node": 3403176435
+   },
+   {
+    "exit_no": "5",
+    "lat": 37.4015672,
+    "lng": 126.9763642,
+    "wheelchair": null,
+    "osm_node": 3403176436
+   },
+   {
+    "exit_no": "6",
+    "lat": 37.4020381,
+    "lng": 126.9762408,
+    "wheelchair": null,
+    "osm_node": 3403176437
+   },
+   {
+    "exit_no": "7",
+    "lat": 37.402509,
+    "lng": 126.9757768,
+    "wheelchair": null,
+    "osm_node": 3403176438
+   },
+   {
+    "exit_no": "8",
+    "lat": 37.4028819,
+    "lng": 126.9760906,
+    "wheelchair": null,
+    "osm_node": 3403176439
+   }
+  ],
+  "평촌": [
+   {
+    "exit_no": "1",
+    "lat": 37.3941157,
+    "lng": 126.9638075,
+    "wheelchair": "no",
+    "osm_node": 3403188126
+   },
+   {
+    "exit_no": "2",
+    "lat": 37.3944199,
+    "lng": 126.9636366,
+    "wheelchair": "no",
+    "osm_node": 3403188125
+   },
+   {
+    "exit_no": "3",
+    "lat": 37.3948319,
+    "lng": 126.9646443,
+    "wheelchair": "no",
+    "osm_node": 3403188123
+   },
+   {
+    "exit_no": "4",
+    "lat": 37.394097,
+    "lng": 126.9649496,
+    "wheelchair": null,
+    "osm_node": 3403188124
+   }
+  ],
+  "범계": [
+   {
+    "exit_no": "1",
+    "lat": 37.3902901,
+    "lng": 126.9515644,
+    "wheelchair": null,
+    "osm_node": 3403188127
+   },
+   {
+    "exit_no": "2",
+    "lat": 37.3902101,
+    "lng": 126.9518335,
+    "wheelchair": null,
+    "osm_node": 3403188128
+   },
+   {
+    "exit_no": "3",
+    "lat": 37.3897721,
+    "lng": 126.9518121,
+    "wheelchair": null,
+    "osm_node": 3403188129
+   },
+   {
+    "exit_no": "4",
+    "lat": 37.3900579,
+    "lng": 126.9512366,
+    "wheelchair": null,
+    "osm_node": 3403188130
+   },
+   {
+    "exit_no": "5",
+    "lat": 37.3893684,
+    "lng": 126.9502471,
+    "wheelchair": null,
+    "osm_node": 3403188135
+   },
+   {
+    "exit_no": "6",
+    "lat": 37.3891609,
+    "lng": 126.9500344,
+    "wheelchair": null,
+    "osm_node": 3403188134
+   },
+   {
+    "exit_no": "7",
+    "lat": 37.3896468,
+    "lng": 126.9494107,
+    "wheelchair": null,
+    "osm_node": 6542203016
+   },
+   {
+    "exit_no": "8",
+    "lat": 37.3898449,
+    "lng": 126.9496707,
+    "wheelchair": null,
+    "osm_node": 6542203015
+   },
+   {
+    "exit_no": "4-1",
+    "lat": 37.3896056,
+    "lng": 126.9512264,
+    "wheelchair": null,
+    "osm_node": 3403188131
+   }
+  ],
+  "석수": [
+   {
+    "exit_no": "1",
+    "lat": 37.4343566,
+    "lng": 126.9027149,
+    "wheelchair": null,
+    "osm_node": 3404991298
+   },
+   {
+    "exit_no": "2",
+    "lat": 37.434283,
+    "lng": 126.9021765,
+    "wheelchair": null,
+    "osm_node": 3404991297
+   }
+  ],
+  "관악": [
+   {
+    "exit_no": "1",
+    "lat": 37.4184789,
+    "lng": 126.9087988,
+    "wheelchair": null,
+    "osm_node": 3405090069
+   },
+   {
+    "exit_no": "2",
+    "lat": 37.4188986,
+    "lng": 126.9092237,
+    "wheelchair": null,
+    "osm_node": 3405090068
+   }
+  ],
+  "안양": [
+   {
+    "exit_no": "1",
+    "lat": 37.4013261,
+    "lng": 126.9225719,
+    "wheelchair": "yes",
+    "osm_node": 3405090074
+   },
+   {
+    "exit_no": "2",
+    "lat": 37.4016463,
+    "lng": 126.92325,
+    "wheelchair": "yes",
+    "osm_node": 3405090075
+   },
+   {
+    "exit_no": "3",
+    "lat": 37.4021612,
+    "lng": 126.9228215,
+    "wheelchair": null,
+    "osm_node": 7896020160
+   },
+   {
+    "exit_no": "5",
+    "lat": 37.4005513,
+    "lng": 126.9221567,
+    "wheelchair": null,
+    "osm_node": 7892365604
+   }
+  ],
+  "명학": [
+   {
+    "exit_no": "1",
+    "lat": 37.3854642,
+    "lng": 126.9350199,
+    "wheelchair": null,
+    "osm_node": 3405090084
+   },
+   {
+    "exit_no": "2",
+    "lat": 37.3854743,
+    "lng": 126.9356323,
+    "wheelchair": null,
+    "osm_node": 3405090085
+   }
+  ]
+ }
+}
