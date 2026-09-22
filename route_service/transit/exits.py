@@ -302,6 +302,9 @@ def egress_guide(station_name: str, board_name: str, facilities: dict, exit_sel:
         "inside": inside,
         "outside": outside,
         "question": "지금 역 안(승강장)에 계신가요, 역 밖으로 나오셨나요?",
+        # 승강장 윤곽 — 클라이언트가 "역을 벗어나 걷기 시작했는지"를 위치로 판단할 때 쓴다(v1.29.1).
+        # 승강장 위나 바로 옆의 GPS 는 튀므로 이 윤곽에서 충분히 떨어져야 역 밖으로 본다.
+        "area": platforms_for(name),
     }
 
 

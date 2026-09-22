@@ -183,3 +183,11 @@ def test_walk_hint_uses_platform_outline_when_available(client, monkeypatch):
 def test_walk_hint_falls_back_to_center_without_outline(client):
     r = client.post("/route/plan", json={"origin": NEAR_MYEONGHAK, "destination": DEST})
     assert r.json()["station_nearby"]["basis"] == "center"
+
+
+def test_egress_carries_platform_area():
+    exit2 = {"exit_no": "2", "lat": 37.4189, "lng": 126.9092, "has_elevator": True,
+             "elevator": "(1F) 2번 출구 옆", "lift": None}
+    g = ex.station_start_guide("관악", "south", GWANAK_FAC, exit2)
+    assert len(g["area"]) == 4 and all(len(r) >= 4 for r in g["area"])       # 실제 승강장 윤곽
+    assert ex.egress_guide("범계", "", {}, None)["area"] == []                  # 윤곽 없는 역
