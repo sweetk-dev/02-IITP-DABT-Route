@@ -57,6 +57,7 @@ def test_walk_near_station_offers_question(client):
 def test_walk_far_from_station_has_no_hint(client, monkeypatch):
     import route_service.api.main as m
     monkeypatch.setattr(m, "STATION_NEAR_M", 5.0)
+    monkeypatch.setattr(m, "STATION_FOOTPRINT_NEAR_M", 5.0)
     r = client.post("/route/plan", json={"origin": NEAR_MYEONGHAK, "destination": DEST})
     assert r.status_code == 200 and "station_nearby" not in r.json()
 
@@ -181,8 +182,11 @@ def test_walk_hint_uses_platform_outline_when_available(client, monkeypatch):
 
 
 def test_walk_hint_falls_back_to_center_without_outline(client):
+    import route_service.api.main as m
     r = client.post("/route/plan", json={"origin": NEAR_MYEONGHAK, "destination": DEST})
-    assert r.json()["station_nearby"]["basis"] == "center"
+    assert r.json()["station_nearby"]["basis"] == "exit"            # 윤곽 없음 — 출구 약 26m
+    h = m._station_nearby_hint(37.3918, 126.9510, "wheelchair_electric")   # 출구 100m 밖·중심 111m
+    assert h and h["basis"] == "center"
 
 
 def test_egress_carries_platform_area():
@@ -191,3 +195,21 @@ def test_egress_carries_platform_area():
     g = ex.station_start_guide("관악", "south", GWANAK_FAC, exit2)
     assert len(g["area"]) == 4 and all(len(r) >= 4 for r in g["area"])       # 실제 승강장 윤곽
     assert ex.egress_guide("범계", "", {}, None)["area"] == []                  # 윤곽 없는 역
+
+
+def test_footprint_handles_unclosed_ring(monkeypatch):
+    # 첫 점을 끝에 다시 두지 않은 고리 — 닫는 변(마지막 점 → 첫 점)도 거리에 넣는다
+    ring = [[37.0000, 127.0000], [37.0000, 127.0010], [37.0010, 127.0010], [37.0010, 127.0000]]
+    monkeypatch.setattr(ex, "_PLATFORMS", {"가상": [{"ring": ring}]})
+    monkeypatch.setattr(ex, "_DATA", {"가상": []})
+    d = ex.footprint_distance_m("가상", 37.0005, 126.9998)       # 서쪽 변(닫는 변) 바로 옆 약 18m
+    assert d is not None and d < 25
+
+
+def test_no_outline_station_asks_near_exit(client, monkeypatch):
+    import route_service.api.main as m
+    # 합성 역: 윤곽 없음. 출구 1 (37.3905,126.9511) 에서 약 30m, 역 중심에서는 150m 밖이 되도록 중심 기준을 줄여 본다
+    monkeypatch.setattr(m, "STATION_NEAR_M", 5.0)
+    h = m._station_nearby_hint(37.3907, 126.9513, "wheelchair_electric")
+    assert h and h["station"] == "명학" and h["basis"] == "exit" and h["distance_m"] <= 50
+    assert m._station_nearby_hint(37.3930, 126.9540, "wheelchair_electric") is None

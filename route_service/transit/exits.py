@@ -117,13 +117,22 @@ def footprint_distance_m(name: str, lat: float, lng: float):
         pts = [_xy(lat, lng, a, b) for a, b in ring]
         if len(pts) >= 3 and _inside(0.0, 0.0, pts):
             return 0.0
-        for i in range(len(pts) - 1):
-            d = _seg_dist(0.0, 0.0, *pts[i], *pts[i + 1])
+        n = len(pts)
+        for i in range(n):                  # 닫는 변까지 — 첫 점을 끝에 다시 두지 않은 고리도 처리
+            if i == n - 1 and pts[0] == pts[-1]:
+                break
+            d = _seg_dist(0.0, 0.0, *pts[i], *pts[(i + 1) % n])
             best = d if best is None or d < best else best
     for e in exits_for(name):
         d = haversine_m(lat, lng, e["lat"], e["lng"])
         best = d if best is None or d < best else best
     return best
+
+
+def exit_distance_m(name: str, lat: float, lng: float):
+    """출발점에서 가장 가까운 출구까지 거리(m). 출구 자료가 없으면 None."""
+    ds = [haversine_m(lat, lng, e["lat"], e["lng"]) for e in exits_for(name)]
+    return min(ds) if ds else None
 
 
 def exit_options(name: str, facilities: dict, wheelchair: bool) -> list:
