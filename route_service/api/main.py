@@ -1061,8 +1061,13 @@ def _station_nearby_hint(lat: float, lng: float, profile_id: str):
             if d is not None:
                 ok, basis = d <= STATION_FOOTPRINT_NEAR_M, "platform"
             else:
-                d = transit.haversine_m(lat, lng, s["lat"], s["lng"])
-                ok, basis = d <= STATION_NEAR_M, "center"
+                # 승강장 윤곽이 없는 역(4호선 지하역) — 출구 50m 안이거나 역 중심 150m 안이면 묻는다
+                de = station_exits.exit_distance_m(s["name"], lat, lng)
+                if de is not None and de <= STATION_FOOTPRINT_NEAR_M:
+                    d, ok, basis = de, True, "exit"
+                else:
+                    d = transit.haversine_m(lat, lng, s["lat"], s["lng"])
+                    ok, basis = d <= STATION_NEAR_M, "center"
             if ok and (best is None or d < best[0]):
                 best = (d, s, basis)
         if best is None:
@@ -1072,7 +1077,7 @@ def _station_nearby_hint(lat: float, lng: float, profile_id: str):
         return {
             "station": name,
             "distance_m": round(d),
-            "basis": basis,        # platform = 승강장 윤곽·출구까지 거리 / center = 역 중심까지 거리
+            "basis": basis,        # platform = 승강장 윤곽·출구 / exit = 출구(윤곽 없는 역) / center = 역 중심
             "question": "지금 %s역 안(승강장)에 계신가요, 역 밖에 계신가요?" % name,
             "travel_question": "어느 쪽에서 열차를 타고 오셨나요?",
             "choices": station_exits.arrival_choices(name),
