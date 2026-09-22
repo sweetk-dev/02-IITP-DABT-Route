@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.29.0 |
+| 02-IITP-DABT-Route | v1.29.1 |
 
 ## 구조
 
@@ -243,6 +243,8 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
   줄이면 승강장 위에서도 묻지 않게 되고, 넓히면 역에서 먼 골목에서도 묻는다.
 - 승강장 윤곽은 `station_exits.json` 의 `platforms`(OpenStreetMap 기여자, ODbL — `railway=platform` 면, 1호선
   석수·관악·안양·명학). 승강장 안이면 거리 0, 그 밖이면 윤곽 경계·출구 중 가장 가까운 곳까지 거리다.
+- 하차·역 안 출발 안내(`egress`)에 같은 승강장 윤곽을 `area` 로 싣는다(v1.29.1) — 클라이언트가 이용자가 역을 벗어나
+  걷기 시작했는지 위치로 판단할 때 승강장 위·옆의 GPS 튐을 걸러 내는 데 쓴다. 윤곽이 없는 역은 빈 목록.
 - OSM 에 승강장 면이 없는 역(4호선 평촌·범계·인덕원)은 종전대로 역 중심 150m 로 판정한다. 응답 `station_nearby.basis`
   가 `platform`(승강장·출구 기준) / `center`(역 중심 기준)를 알려 준다.
 
