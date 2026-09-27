@@ -30,6 +30,7 @@ from ..collect import store as collect_store
 from ..engine.overrides import apply_overrides
 from ..poi import store as poi_store
 from ..poi import support as poi_support
+from ..poi import landmarks as poi_landmarks
 from ..transit import gbis_live
 from ..transit import planner as transit
 from ..transit import low_floor as lowfloor
@@ -382,6 +383,8 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
                 "steps": build_steps(G, r["path"], profile),
             }
         )
+    if routes:   # 길안내 중 주변 랜드마크 (#88) — 1안에만 붙인다
+        routes[0]["landmarks"] = poi_landmarks.for_route(poi_store.STORE, routes[0]["geometry"])
 
     payload = {
         "route_id": route_id,
@@ -985,7 +988,10 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         "lat": target["lat"], "lng": target["lng"],
                         "resolved_by": target["source"],
                         "note": _entrance_note(target)},
-        "routes": [{"summary": summary, "geometry": geometry, "steps": steps, "legs": legs}],
+        "routes": [{"summary": summary, "geometry": geometry, "steps": steps, "legs": legs,
+                    # 주변 랜드마크 (#88) — 도보 구간 옆만(버스·지하철 탑승 중에는 말하지 않는다)
+                    "landmarks": poi_landmarks.for_route(
+                        poi_store.STORE, geometry, [l["geometry"] for l in walk_legs if l.get("geometry")])}],
         "support_hint": _support_hint(geometry, profile),
         "low_floor": lf_info,
         "fallback": fallback,
