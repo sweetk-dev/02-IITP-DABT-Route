@@ -199,3 +199,26 @@ def test_dead_end_finds_long_link_with_far_endpoints():
     G.edges["TA", "TB"]["length"] = 160
     rep = rs.connect_dead_ends(G)
     assert rep and rep[0]["t"] == "TB" and rep[0]["split"] and abs(rep[0]["length"] - 6) < 0.5
+
+
+def test_dead_end_near_far_endpoint_not_snapped_beyond_limit():
+    """링크 끝 쪽 비율이어도 실제 거리가 10m 를 넘는 끝점에는 잇지 않는다."""
+    G = _dead_end_graph()
+    G.nodes["TB"].update(_ll(-12, 5))          # 도로 시작점(0,0) 바깥 12m 쪽 — 투영은 끝점, 거리 13m
+    G.edges["TA", "TB"]["length"] = 4
+    assert [r for r in rs.connect_dead_ends(G) if r["t"] == "TB"] == []
+
+
+def test_dead_end_join_blocked_when_it_newly_reaches_other_side():
+    """보강 전에는 닿지 못하던 길 건너 보도에 횡단보도 없이 새로 닿게 하는 연결은 막는다."""
+    G = nx.Graph()
+    G.add_node(1, **_ll(0, 0)); G.add_node(2, **_ll(300, 0))
+    G.add_edge(1, 2, length=300, slope=0.0, link_type="road")
+    for n, xy in {"TN1": (0, 8), "TN2": (60, 8), "TS1": (120, -8), "TS2": (60, -8)}.items():
+        G.add_node(n, **_ll(*xy))
+    G.add_edge(1, "TN1", length=8, slope=0.0, link_type="sidewalk", stitched=True)
+    G.add_edge("TN1", "TN2", length=60, slope=0.0, link_type="sidewalk")
+    G.add_edge("TS1", "TS2", length=60, slope=0.0, link_type="sidewalk")   # 남쪽 보도는 따로 떨어져 있다
+    G.add_node("TS0", **_ll(180, -30)); G.add_edge("TS1", "TS0", length=64, slope=0.0, link_type="sidewalk")
+    rep = rs.connect_dead_ends(G)
+    assert not [r for r in rep if r["t"] == "TS2"], rep

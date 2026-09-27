@@ -158,19 +158,30 @@ def _crossings_on(G, path) -> int:
     return sum(1 for a, b in zip(path[:-1], path[1:]) if G.edges[a, b].get("link_type") == "crossing")
 
 
+def _near_topo(idx, t):
+    pt = idx.XY[t]
+    return [k for k in idx.near_nodes(pt, 2) if _is_topo(k) and k != t and _dist(pt, idx.XY[k]) <= BYPASS_RADIUS_M]
+
+
 def _snapshot(G, idx, t):
     """t 에서 주변 보도 노드까지의 (거리, 횡단보도 수) — G5 비교용. G 는 **보강 전 원본**을 넘긴다
     (앞서 채택한 연결이 만든 지름길을 기준으로 삼으면 연쇄로 차도 횡단이 열린다)."""
-    pt = idx.XY[t]
-    near = [k for k in idx.near_nodes(pt, 2) if _is_topo(k) and k != t and _dist(pt, idx.XY[k]) <= BYPASS_RADIUS_M]
     d, p = _paths_from(G, t)
-    return {k: (d[k], _crossings_on(G, p[k])) for k in near if k in d}
+    return {k: (d[k], _crossings_on(G, p[k])) for k in _near_topo(idx, t) if k in d and k in G}
 
 
-def _creates_bypass(G, t, before) -> bool:
+def _creates_bypass(G, t, before, near) -> bool:
+    """연결 뒤 t→k 가 (1) 보강 전보다 짧아지면서 건너는 횡단보도 수가 줄거나, (2) 보강 전에는 BYPASS_CUTOFF_M 안에
+    닿지 못하던 주변 보도 노드에 횡단보도 없이 새로 닿으면 True."""
     d, p = _paths_from(G, t)
-    for k, (d0, c0) in before.items():
-        if k in d and d[k] + 1.0 < d0 and _crossings_on(G, p[k]) < c0:
+    for k in near:
+        if k not in d:
+            continue
+        if k in before:
+            d0, c0 = before[k]
+            if d[k] + 1.0 < d0 and _crossings_on(G, p[k]) < c0:
+                return True
+        elif _crossings_on(G, p[k]) == 0:
             return True
     return False
 
@@ -201,6 +212,7 @@ def find_restitch(G, margin_m: float = MARGIN_M, max_m: float = STITCH_MAX_M,
     H = G.copy()     # 채택분을 누적해 G2·G4·G5 를 판정한다(새 링크끼리 만드는 지름길도 막는다)
     idx = _Index(H)
     out = []
+    added_per_o = {}
     for u, v, e in list(G.edges(data=True)):
         if not e.get("stitched") or e.get("derived_kind") in ("restitch", "deadend_join"):
             continue
@@ -212,9 +224,8 @@ def find_restitch(G, margin_m: float = MARGIN_M, max_m: float = STITCH_MAX_M,
         lim = min(d0 + margin_m, max_m)
         cands = sorted((_dist(po, idx.XY[t]), t) for t in idx.near_nodes(po)
                        if t != t0 and _is_topo(t) and t not in H[o] and _dist(po, idx.XY[t]) <= lim)
-        added = 0
         for d, t in cands:
-            if added >= max_per_node:
+            if added_per_o.get(o, 0) >= max_per_node:
                 break
             pt = idx.XY[t]
             if idx.crosses_any(po, pt, allow_nodes=(o, t)):
@@ -225,12 +236,12 @@ def find_restitch(G, margin_m: float = MARGIN_M, max_m: float = STITCH_MAX_M,
                     "slope": float(e.get("slope") or 0.0), "d0": round(d0, 2)}
             before = _snapshot(G, idx, t)
             H.add_edge(o, t, length=item["length"], slope=item["slope"], link_type="sidewalk")
-            if _creates_bypass(H, t, before):
+            if _creates_bypass(H, t, before, [k for k in _near_topo(idx, t) if k in G]):
                 H.remove_edge(o, t)
                 continue
             idx.add_edge(o, t)
             out.append(item)
-            added += 1
+            added_per_o[o] = added_per_o.get(o, 0) + 1
     return out
 
 
@@ -273,15 +284,17 @@ def connect_dead_ends(G, max_m: float = DEADEND_MAX_M) -> list:
             continue
         d, a, b, tt, q = best
         target = None
-        if tt <= 0.05 or _dist(q, idx.XY[a]) < 2.0:
+        if _dist(q, idx.XY[a]) < 2.0:
             target = a
-        elif tt >= 0.95 or _dist(q, idx.XY[b]) < 2.0:
+        elif _dist(q, idx.XY[b]) < 2.0:
             target = b
         if target is not None:
             if target in G[t]:
                 continue
             q = idx.XY[target]
             d = _dist(pt, q)
+            if d > max_m:
+                continue
         if idx.crosses_any(pt, q, allow_nodes=(t,) + ((target,) if target is not None else ()),
                            allow_edges=(frozenset((a, b)),)):
             continue
@@ -306,7 +319,7 @@ def connect_dead_ends(G, max_m: float = DEADEND_MAX_M) -> list:
                    link_type="sidewalk", width=None, curb_cut=None, tactile_paving=None, surface=None,
                    link_name=None, geometry=None, topo_source="derived", stitched=True,
                    derived_kind="deadend_join", confidence=CONFIDENCE)
-        if _creates_bypass(G, t, before):          # G5 — 되돌린다
+        if _creates_bypass(G, t, before, [k for k in _near_topo(idx, t) if k in G0]):          # G5 — 되돌린다
             G.remove_edge(t, target)
             if split:
                 G.remove_node(target)
