@@ -100,7 +100,7 @@ def test_health_and_meta(client):
 
 def test_profiles_endpoint(client):
     body = client.get("/profiles").json()
-    assert body["default"] == "wheelchair_manual"
+    assert body["default"] == "wheelchair_electric"
     assert len(body["profiles"]) >= 5
 
 
@@ -121,6 +121,20 @@ def test_plan_to_tour_poi(client):
     assert route["steps"][0]["maneuver"] == "depart"
     assert route["steps"][-1]["maneuver"] == "arrive"
     assert len(route["geometry"]) >= 2
+    assert route["landmarks"] == []                  # 파일 백엔드 — 랜드마크 원천 없음 (#88)
+
+
+def test_plan_attaches_landmarks(client, monkeypatch):
+    from route_service.poi import landmarks as lm
+    monkeypatch.setattr(lm, "fetch_candidates", lambda store, bbox: [])
+    monkeypatch.setattr(lm, "for_route", lambda store, geom, walk=None: [{"kind": "bus_stop", "name": "시험정류장",
+                                                                       "lat": geom[0][0], "lng": geom[0][1], "along_m": 0,
+                                                                       "offset_m": 3, "side": "left",
+                                                                       "speech": "왼쪽에 시험정류장 정류장이 있습니다"}])
+    body = client.post("/route/plan", json={"origin": {"lat": 37.3900, "lng": 126.9500},
+                                            "destination": {"type": "tour", "poi_id": "TBF-1"},
+                                            "profile": "wheelchair_electric"}).json()
+    assert body["routes"][0]["landmarks"][0]["name"] == "시험정류장"
 
 
 def test_plan_unknown_profile_400(client):

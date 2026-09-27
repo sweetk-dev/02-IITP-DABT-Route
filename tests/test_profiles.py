@@ -4,8 +4,10 @@ import pytest
 from route_service.engine.profiles import DEFAULT_PROFILE, get_profile, list_profiles
 
 
-def test_default_profile_is_manual_wheelchair():
-    assert get_profile(None).id == DEFAULT_PROFILE == "wheelchair_manual"
+def test_default_profile_is_electric_wheelchair():
+    """v1.25.0(#73): 기본 프로필은 전동 휠체어 — 실증 기준. 수동은 명시 지정."""
+    assert get_profile(None).id == DEFAULT_PROFILE == "wheelchair_electric"
+    assert get_profile("wheelchair_manual").id == "wheelchair_manual"
 
 
 def test_manual_wheelchair_avoids_steps_and_overpass():

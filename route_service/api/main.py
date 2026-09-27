@@ -13,10 +13,11 @@ from collections import OrderedDict
 
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 from .. import __version__
+from .. import metrics
 from ..config import get_settings
 from ..engine import profiles as prof
 from ..engine.access import BuildingIndex, ManualEntrances, resolve_access_point
@@ -28,9 +29,12 @@ from ..engine.steps import build_steps
 from ..collect import store as collect_store
 from ..engine.overrides import apply_overrides
 from ..poi import store as poi_store
+from ..poi import support as poi_support
+from ..poi import landmarks as poi_landmarks
 from ..transit import gbis_live
 from ..transit import planner as transit
 from ..transit import low_floor as lowfloor
+from ..transit import exits as station_exits
 from .schemas import (
     AccessReportRequest,
     Destination,
@@ -60,6 +64,8 @@ def _apply_overrides_safe() -> dict:
 async def lifespan(_app: FastAPI):
     poi_store.configure(settings)
     collect_store.configure(settings)
+    metrics.configure(settings)
+    logger.info("계측 로그: %s", metrics.METRICS.path or "메모리만")
     gbis_live.LIVE = gbis_live.configure(settings)
     logger.info("GBIS 실시간: %s", "사용" if gbis_live.LIVE.enabled else "인증키 없음(비활성)")
     global BUILDINGS, ENTRANCES
@@ -77,6 +83,7 @@ async def lifespan(_app: FastAPI):
     except Exception as e:
         logger.warning("네트워크 로드 실패(%s) — /meta/network 로 상태 확인", e)
     yield
+    metrics.METRICS.close()
 
 
 app = FastAPI(
@@ -97,6 +104,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _timing(request: Request, call_next):
+    """모든 요청의 서버 내부 처리시간(ms)을 계측한다(#73, 실증 지표 ② 원천).
+
+    응답 헤더 X-Process-Time-Ms 로 즉시 노출하고, 계측 로그에 request 행을 남긴다.
+    핸들러가 metrics.tag() 로 붙인 문맥(profile·mode·route_id 등)을 같은 행에 합친다.
+    """
+    metrics.reset_tags()
+    tag = metrics.client_tag(request.headers.get("x-client-tag"))
+    if tag:
+        metrics.tag(client=tag)       # 요청 출처(실증 계정 등) — 지표 산출 시 요청을 가른다(#77)
+    t0 = time.perf_counter()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        status = response.status_code if response is not None else 500
+        if response is not None:
+            response.headers["X-Process-Time-Ms"] = str(ms)
+        path = request.url.path
+        if not path.startswith(("/docs", "/openapi", "/redoc", "/meta/latency")):
+            metrics.METRICS.write("request", path=path, method=request.method,
+                                  status=status, ms=ms, **metrics.current_tags())
+
 
 # 목적지 접근점(무장애 출입구) 해석용 — 기동 시 로드
 BUILDINGS = BuildingIndex()
@@ -143,6 +178,16 @@ def meta_network():
 @app.get("/profiles", tags=["meta"])
 def get_profiles():
     return {"profiles": prof.list_profiles(), "default": prof.DEFAULT_PROFILE}
+
+
+@app.get("/meta/latency", tags=["meta"], dependencies=[Depends(auth)])
+def meta_latency(since_sec: float = Query(0.0, ge=0, description="0 이면 메모리 보유분 전부"),
+                 client: str = Query(None, description="X-Client-Tag 값으로 한정(실증 계정 등)")):
+    """경로별 처리시간 요약(건수·평균·P50·P95·3초 초과 건수). 실증 중 즉시 확인용(#73).
+
+    정식 산출은 계측 로그 파일(JSONL)을 배치로 집계한다 — 여기는 최근 5,000건 메모리 기준.
+    """
+    return metrics.METRICS.summary(since_sec, client=metrics.client_tag(client))
 
 
 # ────────────────────────── route ──────────────────────────
@@ -338,6 +383,8 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
                 "steps": build_steps(G, r["path"], profile),
             }
         )
+    if routes:   # 길안내 중 주변 랜드마크 (#88) — 1안에만 붙인다
+        routes[0]["landmarks"] = poi_landmarks.for_route(poi_store.STORE, routes[0]["geometry"])
 
     payload = {
         "route_id": route_id,
@@ -352,6 +399,7 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         "snapped": g["snapped"], "snap_dist_m": g["dist_m"], "snap_kind": g["kind"]},
         "routes": routes,
         "fallback": result["fallback"],
+        "support_hint": _support_hint(routes[0]["geometry"] if routes else [], profile),
         "data_quality": {
             "slope_coverage": NET.meta.get("slope_coverage"),
             "link_type_available": NET.meta.get("link_type_available"),
@@ -508,10 +556,18 @@ def _transit_step(leg, boarding: bool) -> dict:
         if boarding:
             instruction = ("%s역에서 %s에 승차합니다 — %d개 역 이동"
                            % (leg["board"]["name"], leg["line"], leg["station_cnt"]))
+            bx = leg.get("board_exit")
+            if bx:
+                instruction += " (%s번 출구%s 이용)" % (bx["exit_no"],
+                                                   " 승강기" if bx.get("has_elevator") else "")
             coord = [leg["board"]["lat"], leg["board"]["lng"]]
             maneuver = "subway_board"
         else:
             instruction = "%s역에서 하차합니다" % leg["alight"]["name"]
+            ax = leg.get("alight_exit")
+            if ax:
+                instruction += " — %s번 출구%s로 나갑니다" % (ax["exit_no"],
+                                                        "(승강기)" if ax.get("has_elevator") else "")
             coord = [leg["alight"]["lat"], leg["alight"]["lng"]]
             maneuver = "subway_alight"
     leg_ref = {"kind": leg["kind"]}
@@ -525,13 +581,33 @@ def _transit_step(leg, boarding: bool) -> dict:
         leg_ref.update({"line": leg.get("line"),
                         "board_station_id": str(leg["board"]["poi_id"]),
                         "alight_station_id": str(leg["alight"]["poi_id"])})
-    return {"maneuver": maneuver, "instruction": instruction,
-            "distance_m": 0 if not boarding else leg["est_distance_m"],
-            "duration_sec": 0 if not boarding else leg["est_duration_sec"],
-            "coord": [round(coord[0], 7), round(coord[1], 7)],
-            "link_type": leg["kind"], "link_name": None,
-            "leg_ref": leg_ref,
-            "warnings": leg["warnings"] if boarding else []}
+    out = {"maneuver": maneuver, "instruction": instruction,
+           "distance_m": 0 if not boarding else leg["est_distance_m"],
+           "duration_sec": 0 if not boarding else leg["est_duration_sec"],
+           "coord": [round(coord[0], 7), round(coord[1], 7)],
+           "link_type": leg["kind"], "link_name": None,
+           "leg_ref": leg_ref,
+           "warnings": leg["warnings"] if boarding else []}
+    if not boarding and leg.get("egress"):
+        out["egress"] = leg["egress"]       # 화면이 역 안/밖을 묻고 해당 문장을 쓴다(#77)
+    return out
+
+
+def _station_exit_step(leg) -> dict:
+    """하차 뒤 출구 통과 스텝 — 좌표가 출구라 역 밖으로 나오면 자연스럽게 다음 스텝으로 넘어간다."""
+    ax = leg.get("alight_exit") if leg.get("kind") == "subway" else None
+    if not ax:
+        return None
+    name = leg["alight"]["name"]
+    return {"maneuver": "station_exit",
+            "instruction": "%s역 %s번 출구입니다. 여기서부터 걸어서 이동합니다" % (name, ax["exit_no"]),
+            "distance_m": 0, "duration_sec": 0,
+            "coord": [round(ax["lat"], 7), round(ax["lng"], 7)],
+            "link_type": "walk", "link_name": None,
+            "leg_ref": {"kind": "subway", "alight_station_id": str(leg["alight"]["poi_id"]),
+                        "exit_no": ax["exit_no"]},
+            "egress": leg.get("egress"),
+            "warnings": []}
 
 
 def _station_brief(poi_id: str, name: str) -> dict:
@@ -632,6 +708,71 @@ def _rank_low_floor(cands: list, judge, profile, origin) -> list:
     return [c for _, c in ranked]
 
 
+_FAC_CACHE = {}
+_FAC_TTL_SEC = 600
+
+
+def _station_facilities_cached(station: dict):
+    """역 설비 — 후보 조합마다 같은 역을 되풀이 조회하지 않도록 10분 캐시."""
+    key = (str(station.get("poi_id")), station.get("name"))
+    hit = _FAC_CACHE.get(key)
+    now = time.time()
+    if hit and now - hit[0] < _FAC_TTL_SEC:
+        return hit[1]
+    try:
+        fac = poi_store.STORE.station_facilities(stn_cd=station.get("poi_id"), name=station["name"])
+    except Exception as e:
+        logger.warning("역 설비 조회 실패 %s: %s", station.get("name"), e)
+        fac = None
+    _FAC_CACHE[key] = (now, fac)
+    return fac
+
+
+def _walk_leg_via_exit(station: dict, direction: str, other, profile, allowed,
+                       other_label: str, to_is_entrance: bool = False):
+    """역 출구 좌표를 도보 leg 의 한쪽 끝으로 쓴다 (#77).
+
+    direction="from": 하차역 출구 → other, "to": other → 승차역 출구.
+    출구 좌표가 없는 역은 종전처럼 역 중심을 쓴다. 후보 출구는 다른 쪽 끝에서 직선으로
+    가까운 2곳만 실제 경로를 계산해 소요시간이 짧은 쪽을 고른다.
+    반환: (leg | None, 선택 출구 | None)
+    """
+    center = (station["lat"], station["lng"])
+    st_label = "%s역" % station["name"]
+    fac = _station_facilities_cached(station)
+    wheel = str(getattr(profile, "id", "")).startswith("wheelchair")
+    opts = station_exits.nearest_exits(
+        station_exits.exit_options(station["name"], fac or {}, wheel), other, 3)
+    best, last_err = None, None
+    for ex in opts:
+        pt = (ex["lat"], ex["lng"])
+        label = "%s %s번 출구" % (st_label, ex["exit_no"])
+        try:
+            if direction == "from":
+                leg = _walk_leg(pt, other, profile, allowed, label, other_label,
+                                to_is_entrance=to_is_entrance)
+            else:
+                leg = _walk_leg(other, pt, profile, allowed, other_label, label)
+        except (SnapError, NoRouteError) as e:
+            last_err = e
+            continue
+        if leg is None and transit.haversine_m(pt[0], pt[1], other[0], other[1]) > 40.0:
+            # 지척이 아닌데 leg 가 없다 = 양 끝이 같은 노드로 스냅됐다. 거리 0 으로 뽑히면
+            # 도보 구간이 통째로 빠진 후보가 이긴다 — 이 출구는 후보에서 뺀다.
+            continue
+        dur = leg["summary"]["duration_sec"] if leg else 0.0
+        if best is None or dur < best[0]:
+            best = (dur, leg, ex)
+    if best is not None:
+        return best[1], best[2]
+    if opts and last_err is not None:
+        logger.info("출구 기준 도보 경로 실패 %s — 역 중심으로 대체: %s", station.get("name"), last_err)
+    if direction == "from":
+        return _walk_leg(center, other, profile, allowed, st_label, other_label,
+                         to_is_entrance=to_is_entrance), None
+    return _walk_leg(other, center, profile, allowed, other_label, st_label), None
+
+
 def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                      mode: str, constraints=None, realtime: bool = False,
                      low_floor=None) -> dict:
@@ -644,8 +785,8 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     origin = (origin_lat, origin_lng)
     tgt = (target["lat"], target["lng"])
 
-    # ── 저상버스 우선 모드(#64): 휠체어 프로필 기본 on ──
-    lf_mode = lowfloor.resolve_mode(low_floor, profile.id)
+    # ── 저상버스 우선 모드(#64): 휠체어 프로필 기본 on. 버스가 없는 walk_subway 는 항상 off(#73) ──
+    lf_mode = lowfloor.resolve_mode(low_floor, profile.id) if transit.uses_bus(mode) else False
     lf_expanded = False
     now_ts = int(time.time())
 
@@ -675,7 +816,9 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     if not cands:
         raise HTTPException(
             status_code=404,
-            detail="조건에 맞는 직결 대중교통 경로를 찾지 못했습니다 — 도보 경로를 이용하세요",
+            detail=("조건에 맞는 지하철 경로를 찾지 못했습니다 — 도보 경로를 이용하세요"
+                    if mode == "walk_subway" else
+                    "조건에 맞는 직결 대중교통 경로를 찾지 못했습니다 — 도보 경로를 이용하세요"),
         )
 
     # 근사 스코어 순 상위 후보를 전부 실계산해 비교한다 — 도보 근사(직선×배율)와
@@ -684,18 +827,41 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     for cand in cands[:8]:      # 근사-실계산 괴리 보정 폭 — 도보 leg 계산은 저렴하다
         try:
             built = []
-            for part in cand["parts"]:
-                if part["kind"] == "walk":
+            parts = cand["parts"]
+            walk_legs_by_idx, exit_by_idx = {}, {}
+            for pi, part in enumerate(parts):   # 1) 도보 leg — 지하철과 맞닿은 쪽은 출구 기준(#77)
+                if part["kind"] != "walk":
+                    continue
+                to_ent = (part["to"][0] == "목적지"
+                          and target.get("source") in ENTRANCE_SOURCES)
+                prev = parts[pi - 1] if pi > 0 else None
+                nxt = parts[pi + 1] if pi + 1 < len(parts) else None
+                if prev is not None and prev["kind"] == "subway":
+                    leg, ex = _walk_leg_via_exit(prev["alight"], "from", part["to"][1], profile,
+                                                 allowed, part["to"][0], to_is_entrance=to_ent)
+                    exit_by_idx[(pi - 1, "alight")] = ex
+                elif nxt is not None and nxt["kind"] == "subway":
+                    leg, ex = _walk_leg_via_exit(nxt["board"], "to", part["frm"][1], profile,
+                                                 allowed, part["frm"][0])
+                    exit_by_idx[(pi + 1, "board")] = ex
+                else:
                     leg = _walk_leg(part["frm"][1], part["to"][1], profile, allowed,
-                                    part["frm"][0], part["to"][0],
-                                    to_is_entrance=(part["to"][0] == "목적지"
-                                                    and target.get("source") in ENTRANCE_SOURCES))
-                    if leg is not None:
-                        built.append(leg)
+                                    part["frm"][0], part["to"][0], to_is_entrance=to_ent)
+                walk_legs_by_idx[pi] = leg
+            for pi, part in enumerate(parts):   # 2) 순서대로 조립
+                if part["kind"] == "walk":
+                    if walk_legs_by_idx.get(pi) is not None:
+                        built.append(walk_legs_by_idx[pi])
                 elif part["kind"] == "bus":
                     built.append(_bus_leg(part))
                 else:
-                    built.append(_subway_leg(part))
+                    sl = _subway_leg(part)
+                    bx, ax = exit_by_idx.get((pi, "board")), exit_by_idx.get((pi, "alight"))
+                    if bx:
+                        sl["board_exit"] = station_exits.exit_brief(bx)
+                    if ax:
+                        sl["alight_exit"] = station_exits.exit_brief(ax)
+                    built.append(sl)
             actual = sum(l["summary"]["total_distance_m"] for l in built
                          if l["kind"] == "walk")
             actual += sum(l.get("stop_cnt", 0) for l in built) * transit.STOP_PENALTY_M
@@ -734,6 +900,12 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
         )
 
     _attach_realtime(legs, realtime)
+    for leg in legs:                      # 하차 후 역 안/밖 안내 (#77)
+        if leg["kind"] == "subway":
+            ax = leg.get("alight_exit")
+            leg["egress"] = station_exits.egress_guide(
+                leg["alight"]["name"], leg["board"]["name"],
+                leg["alight"].get("facilities") or {}, ax)
 
     # ── 통합 요약·geometry·steps ──
     walk_legs = [l for l in legs if l["kind"] == "walk"]
@@ -760,6 +932,9 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
         else:
             steps.append(_transit_step(leg, boarding=True))
             steps.append(_transit_step(leg, boarding=False))
+            ex_step = _station_exit_step(leg)
+            if ex_step:
+                steps.append(ex_step)
     if not steps or steps[-1]["maneuver"] != "arrive":
         last = geometry[-1] if geometry else [target["lat"], target["lng"]]
         steps.append({"maneuver": "arrive", "instruction": "목적지에 도착했습니다.",
@@ -813,7 +988,11 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         "lat": target["lat"], "lng": target["lng"],
                         "resolved_by": target["source"],
                         "note": _entrance_note(target)},
-        "routes": [{"summary": summary, "geometry": geometry, "steps": steps, "legs": legs}],
+        "routes": [{"summary": summary, "geometry": geometry, "steps": steps, "legs": legs,
+                    # 주변 랜드마크 (#88) — 도보 구간 옆만(버스·지하철 탑승 중에는 말하지 않는다)
+                    "landmarks": poi_landmarks.for_route(
+                        poi_store.STORE, geometry, [l["geometry"] for l in walk_legs if l.get("geometry")])}],
+        "support_hint": _support_hint(geometry, profile),
         "low_floor": lf_info,
         "fallback": fallback,
         "data_quality": {
@@ -825,12 +1004,16 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     for leg in legs:                     # 내부 필드 정리
         leg.pop("fallback", None)
     _cache_put(route_id, payload)
+    metrics.tag(route_id=route_id, walk_m=summary["walk_distance_m"],
+                total_m=summary["total_distance_m"])
     return payload
 
 
 @app.post("/route/plan", tags=["route"], dependencies=[Depends(auth)])
 def route_plan(req: PlanRequest):
-    if req.mode in ("walk_bus", "walk_bus_subway"):
+    metrics.tag(profile=req.profile, mode=req.mode or "walk", dest_type=req.destination.type,
+                dest_id=req.destination.poi_id)
+    if req.mode in transit.MODES:
         return _plan_multimodal(
             req.origin.lat, req.origin.lng, req.destination,
             req.profile, req.mode, req.constraints, realtime=req.realtime,
@@ -839,10 +1022,147 @@ def route_plan(req: PlanRequest):
     if req.mode not in ("", "walk", None):
         raise HTTPException(status_code=400,
                             detail="지원하지 않는 mode 입니다: %s" % req.mode)
-    return _plan_core(
-        req.origin.lat, req.origin.lng, req.destination,
-        req.profile, req.alternatives, req.constraints,
-    )
+    if req.origin_station is not None:
+        payload = _plan_from_station(req)
+    else:
+        payload = _plan_core(
+            req.origin.lat, req.origin.lng, req.destination,
+            req.profile, req.alternatives, req.constraints,
+        )
+        hint = _station_nearby_hint(req.origin.lat, req.origin.lng, req.profile)
+        if hint:
+            payload["station_nearby"] = hint
+    _tag_plan_result(payload)
+    return payload
+
+
+# ────────────────────────── 역에서 출발하는 도보 경로 (#79) ──────────────────────────
+# 서비스 밖(예: 서울)에서 전철로 와 역에서 도보 경로를 시작하면, 경로에 지하철 구간이 없어
+# 하차 안내(egress)가 붙지 않는다. 출발점이 역 가까이면 화면이 "역 안/밖"을 묻고, 역 안이면
+# "어느 쪽에서 타고 왔는지"를 물어 origin_station 으로 다시 요청한다. 그러면 출발점을 목적지에
+# 맞는 출구로 옮기고, 내린 승강장 승강기 → 출구 승강기 스텝을 맨 앞에 붙인다.
+# 역 근처 판정 (v1.29.0) — 역 중심 좌표는 역사 건물 쪽에 찍혀 있어 승강장이 통째로 60~140m 밖에
+# 있는 역이 있다(명학 63~104m, 관악 82~139m). 중심점 반경을 줄이면 승강장 위에서도 묻지 않게 되고,
+# 넓히면 역에서 먼 골목에서도 묻는다. 그래서 승강장 윤곽·출구에서 50m 안일 때 묻는다.
+STATION_FOOTPRINT_NEAR_M = 50.0   # 승강장 윤곽·출구에서 이 안이면 묻는다(GPS 오차 여유)
+STATION_NEAR_M = 150.0            # 승강장 윤곽 자료가 없는 역(4호선)만 — 역 중심에서 이 안이면 묻는다
+
+
+def _find_station(name: str):
+    k = station_exits._key(name)
+    for s in poi_store.STORE.stations():
+        if station_exits._key(s.get("name") or "") == k:
+            return s
+    return None
+
+
+def _station_nearby_hint(lat: float, lng: float, profile_id: str):
+    """출발점이 역 가까이면 묻기 위한 정보. 출구 자료가 없는 역은 안내할 수 없으므로 묻지 않는다."""
+    try:
+        best = None
+        for s in poi_store.STORE.stations():
+            if not station_exits.exits_for(s["name"]):
+                continue
+            d = station_exits.footprint_distance_m(s["name"], lat, lng)
+            if d is not None:
+                ok, basis = d <= STATION_FOOTPRINT_NEAR_M, "platform"
+            else:
+                # 승강장 윤곽이 없는 역(4호선 지하역) — 출구 50m 안이거나 역 중심 150m 안이면 묻는다
+                de = station_exits.exit_distance_m(s["name"], lat, lng)
+                if de is not None and de <= STATION_FOOTPRINT_NEAR_M:
+                    d, ok, basis = de, True, "exit"
+                else:
+                    d = transit.haversine_m(lat, lng, s["lat"], s["lng"])
+                    ok, basis = d <= STATION_NEAR_M, "center"
+            if ok and (best is None or d < best[0]):
+                best = (d, s, basis)
+        if best is None:
+            return None
+        d, st, basis = best
+        name = station_exits._key(st["name"])
+        return {
+            "station": name,
+            "distance_m": round(d),
+            "basis": basis,        # platform = 승강장 윤곽·출구 / exit = 출구(윤곽 없는 역) / center = 역 중심
+            "question": "지금 %s역 안(승강장)에 계신가요, 역 밖에 계신가요?" % name,
+            "travel_question": "어느 쪽에서 열차를 타고 오셨나요?",
+            "choices": station_exits.arrival_choices(name),
+        }
+    except Exception as e:                  # 힌트는 부가 정보 — 실패해도 경로는 그대로 준다
+        logger.warning("역 근처 판정 실패: %s", e)
+        return None
+
+
+def _plan_from_station(req: PlanRequest) -> dict:
+    os_ = req.origin_station
+    travel = (os_.travel or "").strip().lower() or None
+    if travel is not None and travel not in station_exits.TRAVELS:
+        raise HTTPException(status_code=400, detail="origin_station.travel 은 north | south 입니다")
+    st = _find_station(os_.name)
+    if st is None:
+        raise HTTPException(status_code=404, detail="역을 찾을 수 없습니다: %s" % os_.name)
+    profile = _profile_or_400(req.profile)
+    fac = _station_facilities_cached(st) or {}
+    wheel = str(getattr(profile, "id", "")).startswith("wheelchair")
+    opts = station_exits.exit_options(st["name"], fac, wheel)
+    name = station_exits._key(st["name"])
+    metrics.tag(start="station_inside", start_station=name, travel=travel)
+    if not opts:
+        # 출구 좌표가 없는 역 — 현재 위치에서 계획하고 역 안 문장만 붙인다
+        payload = _plan_core(req.origin.lat, req.origin.lng, req.destination,
+                             req.profile, req.alternatives, req.constraints)
+        chosen = None
+    else:
+        target = _resolve_destination(req.destination, profile)
+        # 목적지에서 직선으로 가까운 순. 성공한 출구 2곳까지만 실제 경로를 비교하고,
+        # 가까운 출구가 보행망에서 막혀 있으면 다음 출구로 넘어간다
+        best, last_err, ok = None, None, 0
+        for ex in station_exits.nearest_exits(opts, (target["lat"], target["lng"]), len(opts)):
+            if ok >= 2:
+                break
+            try:
+                p = _plan_core(ex["lat"], ex["lng"], req.destination,
+                               req.profile, req.alternatives, req.constraints)
+            except HTTPException as e:
+                last_err = e
+                continue
+            ok += 1
+            dur = p["routes"][0]["summary"]["duration_sec"] if p.get("routes") else float("inf")
+            if best is None or dur < best[0]:
+                best = (dur, p, ex)
+        if best is None:
+            raise last_err or HTTPException(status_code=422, detail="역 출구에서 경로를 만들 수 없습니다")
+        _, payload, chosen = best
+    brief = station_exits.exit_brief(chosen) if chosen else None
+    guide = station_exits.station_start_guide(name, travel, fac, brief)
+    if brief:
+        how = "승강기" if brief.get("elevator") else ("휠체어리프트" if brief.get("lift") else None)
+        ins = ("%s역 안에서 출발합니다. %s번 출구%s로 나간 뒤 걸어서 이동합니다"
+               % (name, brief["exit_no"], "(%s)" % how if how else ""))
+        coord = [round(brief["lat"], 7), round(brief["lng"], 7)]
+        payload["origin"]["label"] = "%s역 %s번 출구" % (name, brief["exit_no"])
+    else:
+        ins = "%s역 안에서 출발합니다. 출구로 나간 뒤 걸어서 이동합니다" % name
+        coord = [payload["origin"]["lat"], payload["origin"]["lng"]]
+    step = {"maneuver": "station_start", "instruction": ins,
+            "distance_m": 0, "duration_sec": 0, "coord": coord,
+            "link_type": "walk", "link_name": None, "egress": guide, "warnings": []}
+    for r in payload.get("routes") or []:
+        r["steps"] = [dict(step)] + list(r.get("steps") or [])
+        for i, s_ in enumerate(r["steps"]):      # 스텝 번호 계약 유지 — 앞에 붙인 만큼 다시 매긴다
+            s_["idx"] = i
+    payload["station_start"] = {"station": name, "travel": guide.get("travel"),
+                                "exit": brief, "egress": guide}
+    return payload
+
+
+def _tag_plan_result(payload: dict):
+    try:
+        summ = payload["routes"][0]["summary"]
+        metrics.tag(route_id=payload.get("route_id"), total_m=summ.get("total_distance_m"),
+                    walk_m=summ.get("walk_distance_m", summ.get("total_distance_m")))
+    except (KeyError, IndexError, TypeError):
+        pass
 
 
 @app.post("/route/reroute", tags=["route"], dependencies=[Depends(auth)])
@@ -852,9 +1172,18 @@ def route_reroute(req: RerouteRequest):
         geom = ROUTE_CACHE[req.route_id]["routes"][0]["geometry"]
         off = off_route_distance_m(geom, req.current.lat, req.current.lng)
 
+    metrics.tag(profile=req.profile, mode="walk", prev_route_id=req.route_id, reason=req.reason)
     payload = _plan_core(req.current.lat, req.current.lng, req.destination, req.profile, 1, None)
     payload["off_route"] = bool(off is not None and off > settings.off_route_threshold_m)
     payload["off_route_dist_m"] = round(off, 1) if off is not None else None
+    _tag_plan_result(payload)
+    # 재탐색 이벤트(#73) — 지표 ① 산출 시 route_id 계보(이전→신규)와 이탈 거리를 추적한다
+    metrics.METRICS.write(
+        "reroute", prev_route_id=req.route_id, route_id=payload.get("route_id"),
+        off_route=payload["off_route"], off_route_dist_m=payload["off_route_dist_m"],
+        reason=req.reason, profile=req.profile,
+        current=[round(req.current.lat, 6), round(req.current.lng, 6)],
+    )
     return payload
 
 
@@ -987,7 +1316,7 @@ def tour_spot_detail(poi_id: str):
 
 
 @app.get("/tour/bf-spots/{poi_id}/entrance", tags=["tour"], dependencies=[Depends(auth)])
-def tour_spot_entrance(poi_id: str, profile: str = Query("wheelchair_manual")):
+def tour_spot_entrance(poi_id: str, profile: str = Query(prof.DEFAULT_PROFILE)):
     """무장애 접근 지점. 실측 출입구 > 건물 접근점 > 시설 대표점 순으로 해석한다."""
     p = _profile_or_400(profile)
     manual = ENTRANCES.get(poi_id)
@@ -1015,18 +1344,89 @@ def tour_spot_entrance(poi_id: str, profile: str = Query("wheelchair_manual")):
 
 @app.post("/tour/recommend", tags=["tour"], dependencies=[Depends(auth)])
 def tour_recommend(req: RecommendRequest):
+    if req.category not in poi_store.RECOMMEND_CATEGORIES:
+        raise HTTPException(status_code=400, detail="지원하지 않는 category 입니다: %s" % req.category)
     items = poi_store.STORE.recommend_tour(
         req.disabilities, req.sigungu, req.match_mode, req.topk,
         origin_lat=req.origin_lat, origin_lng=req.origin_lng, offset=req.offset,
+        category=req.category,
     )
     # total 은 클라이언트가 무한스크롤 종료를 판단하는 근거 — offset+topk 로는 알 수 없다.
     total = len(poi_store.STORE.recommend_tour(
         req.disabilities, req.sigungu, req.match_mode, 10000,
         origin_lat=req.origin_lat, origin_lng=req.origin_lng, offset=0,
+        category=req.category,
     ))
+    # 추천 스냅샷(#73) — 지표 ③ MAP 산출용. 순위·점수만 남긴다(본문은 결정적이라 재현 가능)
+    metrics.METRICS.write(
+        "recommend", disabilities=req.disabilities, sigungu=req.sigungu,
+        match_mode=req.match_mode, topk=req.topk, offset=req.offset, category=req.category,
+        client=metrics.current_tags().get("client"),
+        origin=([round(req.origin_lat, 6), round(req.origin_lng, 6)]
+                if req.origin_lat is not None and req.origin_lng is not None else None),
+        total=total,
+        items=[{"poi_id": str(it.get("poi_id")), "score": it.get("score"),
+                "distance_m": it.get("distance_m")} for it in items],
+    )
+    metrics.tag(sigungu=req.sigungu, result_cnt=len(items))
     return {"source": poi_store.STORE.source, "count": len(items),
             "total": total, "offset": req.offset,
             "has_more": req.offset + len(items) < total, "items": items}
+
+
+# ────────────────────────── 긴급대응·화장실 (#75) ──────────────────────────
+def _support_hint(geometry: list, profile) -> dict:
+    """전동 휠체어 경로에 붙는 한 줄 요약 — 경로 1km 회랑 안의 충전기 수와 최근접 1곳.
+
+    수동·시각장애 등 다른 프로필에는 붙이지 않는다(배터리 개념이 없다). 조회 실패는
+    경로 계획을 깨지 않는다 — None 을 두고 로그만 남긴다.
+    """
+    if getattr(profile, "id", "") != "wheelchair_electric":
+        return None
+    try:
+        return poi_support.charge_hint(poi_store.STORE, geometry)
+    except Exception as e:                       # DB 미가용 등
+        logger.warning("충전기 요약 조회 실패(%s) — 요약 없이 응답", e)
+        return None
+
+
+@app.get("/support/nearby", tags=["support"], dependencies=[Depends(auth)])
+def support_nearby(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    types: str = Query("charge,repair,calltaxi", description="charge | repair | calltaxi (콤마 구분)"),
+    radius_m: float = Query(2000, ge=50, le=20000),
+    limit: int = Query(5, ge=1, le=50, description="유형별 최대 건수"),
+):
+    """긴급대응 지원시설 근접 조회 — 전동보장구 충전기·보장구 수리·장애인콜택시.
+
+    거리순이며 운영시간이 비어 있으면 `open_hours_status=unknown`(전화 확인 권장)이다.
+    좌표 의심 표시(`coord_suspect`)가 있는 행은 같은 좌표에 여러 시설이 겹친 경우다.
+    """
+    tlist = [t.strip() for t in types.split(",") if t.strip()]
+    bad = [t for t in tlist if t not in poi_support.SUPPORT_TYPES]
+    if bad:
+        raise HTTPException(status_code=400, detail="지원하지 않는 유형: %s" % ",".join(bad))
+    items = poi_support.support_near(poi_store.STORE, lat, lng, tlist, radius_m, limit)
+    by_type = {t: sum(1 for i in items if i["support_type"] == t) for t in tlist}
+    metrics.tag(support_types=",".join(tlist), result_cnt=len(items))
+    return {"source": poi_store.STORE.source, "radius_m": radius_m, "count": len(items),
+            "count_by_type": by_type, "items": items}
+
+
+@app.get("/toilet/nearby", tags=["support"], dependencies=[Depends(auth)])
+def toilet_nearby(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    radius_m: float = Query(800, ge=50, le=5000),
+    limit: int = Query(5, ge=1, le=30),
+    accessible_only: bool = Query(True, description="장애인 대·소변기 보유분만"),
+):
+    """반경 내 공중화장실 — 기본은 장애인 화장실 보유분만, 거리순. 역사 화장실은 `/transit/station/facilities`."""
+    items = poi_support.toilets_near(poi_store.STORE, lat, lng, radius_m, limit, accessible_only)
+    metrics.tag(result_cnt=len(items))
+    return {"source": poi_store.STORE.source, "radius_m": radius_m,
+            "accessible_only": accessible_only, "count": len(items), "items": items}
 
 
 # ────────────────────────── transit ──────────────────────────
@@ -1034,7 +1434,7 @@ def tour_recommend(req: RecommendRequest):
 def transit_access_points(
     lat: float = Query(...), lng: float = Query(...),
     radius_m: float = Query(800, ge=50, le=3000),
-    profile: str = Query("wheelchair_manual"),
+    profile: str = Query(prof.DEFAULT_PROFILE),
     limit: int = Query(20, ge=1, le=100),
 ):
     """휠체어로 접근 가능한 정류장·역. 대중교통 환승 계산은 하지 않는다."""

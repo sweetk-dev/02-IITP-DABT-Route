@@ -223,3 +223,60 @@ def test_no_transit_candidates_404(client):
 def test_unknown_mode_400(client):
     r = _plan(client, "taxi")
     assert r.status_code == 400
+
+
+# ── 3. walk_subway 모드 (#73, v1.25.0) ─────────────────────────
+def test_walk_subway_mode_excludes_bus():
+    """지하철 전용 모드는 정류장 조회조차 하지 않는다 — 버스 후보가 섞이면 안 된다."""
+    called = []
+
+    def _stops(la, ln, r):
+        called.append((la, ln, r))
+        return _mk_stops()
+
+    cands = tp.search((37.3901, 126.9501), (37.3909, 126.9511), "walk_subway",
+                      stops_near=_stops, stations=STATIONS)
+    assert called == [], "walk_subway 가 정류장을 조회했다"
+    assert cands, "지하철 후보 없음"
+    assert all(p["kind"] != "bus" for c in cands for p in c["parts"])
+    sub = [p for p in cands[0]["parts"] if p["kind"] == "subway"][0]
+    assert sub["line"] == "1호선" and sub["station_cnt"] == 1
+
+
+def test_walk_subway_station_radius_is_3km():
+    """실증 유형 ②·③ — 역에서 3km 안의 목적지도 지하철 조합이 나와야 한다.
+    walk_bus_subway 의 700m 반경은 그대로다."""
+    far_target = (37.3908 + 0.02, 126.9510)          # 명학역 북쪽 약 2.2km
+    subway_only = tp.search((37.3901, 126.9501), far_target, "walk_subway",
+                            stops_near=lambda la, ln, r: [], stations=STATIONS)
+    assert subway_only, "3km 반경에서 지하철 후보가 나와야 한다"
+    mixed = tp.search((37.3901, 126.9501), far_target, "walk_bus_subway",
+                      stops_near=lambda la, ln, r: [], stations=STATIONS)
+    assert mixed == [], "walk_bus_subway 반경(700m)이 넓어졌다"
+    assert tp.station_radius_for("walk_subway") == 3000
+    assert tp.station_radius_for("walk_bus_subway") == 700
+
+
+def test_walk_leg_over_5km_is_dropped():
+    """도보 leg 한 구간이 5km 를 넘는 조합은 후보에서 뺀다(실증 '도보 5km 이내')."""
+    very_far = (37.3908 + 0.05, 126.9510)             # 명학역 북쪽 약 5.5km
+    cands = tp.search((37.3901, 126.9501), very_far, "walk_subway",
+                      stops_near=lambda la, ln, r: [], stations=STATIONS)
+    assert cands == []
+
+
+def test_walk_subway_api_contract(client):
+    r = _plan(client, "walk_subway", origin=(37.3901, 126.9501))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["mode"] == "walk_subway"
+    kinds = [l["kind"] for l in body["routes"][0]["legs"]]
+    assert "subway" in kinds and "bus" not in kinds
+    assert body["low_floor"]["mode"] is False, "지하철 전용 모드에서 저상 판정이 켜졌다"
+    assert body["routes"][0]["summary"]["transit"]["bus_cnt"] == 0
+
+
+def test_walk_subway_no_candidates_404(client):
+    r = _plan(client, "walk_subway", origin=(37.5000, 127.1000))
+    assert r.status_code in (404, 422)
+    assert "지하철" in r.json()["detail"] or "도보" in r.json()["detail"]

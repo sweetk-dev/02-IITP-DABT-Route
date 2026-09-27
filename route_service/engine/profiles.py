@@ -119,11 +119,14 @@ PROFILES = {
     ),
 }
 
-DEFAULT_PROFILE = "wheelchair_manual"
+# v1.25.0(#73): 기본 프로필을 전동 휠체어로 변경 — 3차년도 실증(전동 이용자) 기준.
+# 수동 이용자에게는 전동 기준 경사(하드 10°)가 위험하므로 클라이언트는 현재 프로필을
+# 화면에 상시 표시하고 선택 UI 를 제공해야 한다(12 v1.48.0).
+DEFAULT_PROFILE = "wheelchair_electric"
 
 
 def get_profile(profile_id):
-    """프로필 조회. 미지정/미등록이면 기본 프로필(수동 휠체어)."""
+    """프로필 조회. 미지정/미등록이면 기본 프로필(전동 휠체어)."""
     if not profile_id:
         return PROFILES[DEFAULT_PROFILE]
     p = PROFILES.get(profile_id)

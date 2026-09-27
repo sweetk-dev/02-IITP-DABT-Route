@@ -2,12 +2,21 @@
 """제약형 멀티모달 후보 탐색 (#36).
 
 시각표 없는 정적 데이터(정류장·노선-정류장 순번·안양 관내 역)만으로
-"도보+버스", "도보+버스+지하철" 조합의 뼈대를 찾는다.
+"도보+버스", "도보+지하철", "도보+버스+지하철" 조합의 뼈대를 찾는다.
 
 제약 (3차년도 실증 범위):
   · 버스는 **직결 1회 승차만** — 버스↔버스 환승 없음
   · 지하철은 안양 관내 노선 내 이동만 — 노선 간 환승 없음
   · 소요시간은 정거장 수 기반 추정 — 대기 시간 미포함
+  · 도보 leg 는 한 구간 MAX_WALK_LEG_M 를 넘지 않는다(#73, 실증 "도보 5km 이내")
+
+모드 (#73 에서 walk_subway 신설):
+  · walk_bus         — 직결 버스만
+  · walk_subway      — 지하철만. 버스 조합은 만들지 않는다. 역 탐색 반경은
+                       STATION_RADIUS_SUBWAY_ONLY_M(3km) — 실증 유형 ②·③("역에서 가급적 3km")
+  · walk_bus_subway  — 버스·지하철·버스→지하철 전부. 역 반경은 종전 STATION_RADIUS_M(700m)
+                       그대로 둔다(버스와 경쟁하는 조합에서 반경을 넓히면 먼 역까지 걷는
+                       지하철 후보가 근거리 버스를 밀어낼 수 있다)
 
 여기서는 교통 수단 조합(어느 정류장에서 어떤 노선을 타고 어디서 내리는지)만
 정하고, 도보 leg 의 실제 경로 계산은 호출자(api.main)가 보행 그래프로 수행한다.
@@ -25,8 +34,24 @@ WALK_DETOUR = 1.35              # 도보 직선→실경로 근사 배율
 
 STOP_RADIUS_M = 450             # 출발/도착 인근 정류장 탐색 반경
 STOP_NEAR_STATION_M = 350       # 역 환승용 정류장 탐색 반경
-STATION_RADIUS_M = 700          # 인근 역 탐색 반경
+STATION_RADIUS_M = 700          # 인근 역 탐색 반경 (walk_bus_subway)
+STATION_RADIUS_SUBWAY_ONLY_M = 3000   # walk_subway 전용 역 탐색 반경 (#73)
 MAX_CANDIDATE_STOPS = 6
+MAX_WALK_LEG_M = 5000           # 도보 leg 상한(직선×배율 근사 기준, #73)
+
+MODES = ("walk_bus", "walk_subway", "walk_bus_subway")
+
+
+def uses_bus(mode: str) -> bool:
+    return mode in ("walk_bus", "walk_bus_subway")
+
+
+def uses_subway(mode: str) -> bool:
+    return mode in ("walk_subway", "walk_bus_subway")
+
+
+def station_radius_for(mode: str) -> float:
+    return float(STATION_RADIUS_SUBWAY_ONLY_M if mode == "walk_subway" else STATION_RADIUS_M)
 
 # 스코어 환산(도보 m 단위) — 낮을수록 좋다
 STOP_PENALTY_M = 150            # 버스 한 정거장
@@ -148,7 +173,7 @@ def search(origin, target, mode, stops_near, stations, stop_radius_m=None,
     """조합 후보를 스코어 오름차순으로 반환.
 
     origin/target: (lat, lng)
-    mode: walk_bus | walk_bus_subway
+    mode: walk_bus | walk_subway | walk_bus_subway
     stops_near(lat, lng, radius_m) -> 정류장 목록(routes 포함)
     stations: 안양 관내 역 목록(list_transit 의 정규화 형식 + line 판정은 이름 기반)
     stop_radius_m / max_stops: 출발·도착 인근 정류장 탐색 반경·개수(기본 450m·6개).
@@ -159,14 +184,24 @@ def search(origin, target, mode, stops_near, stations, stop_radius_m=None,
     cands = []
     radius = float(stop_radius_m or STOP_RADIUS_M)
     k = int(max_stops or MAX_CANDIDATE_STOPS)
+    bus_ok, subway_ok = uses_bus(mode), uses_subway(mode)
 
-    stops_o = nearest(stops_near(o[0], o[1], radius), o[0], o[1], radius, k)
-    stops_t = nearest(stops_near(t[0], t[1], radius), t[0], t[1], radius, k)
+    stops_o = stops_t = []
+    if bus_ok:
+        stops_o = nearest(stops_near(o[0], o[1], radius), o[0], o[1], radius, k)
+        stops_t = nearest(stops_near(t[0], t[1], radius), t[0], t[1], radius, k)
+
+    def _legs_ok(*walks):
+        return all(w <= MAX_WALK_LEG_M for w in walks)
 
     # ── 직결 버스 ──
-    for p in _direct_bus_pairs(stops_o, stops_t, origin=o, target=t, route_ok=route_ok):
-        walk = (_walk_est(o, (p["board"]["lat"], p["board"]["lng"]))
-                + _walk_est((p["alight"]["lat"], p["alight"]["lng"]), t))
+    for p in (_direct_bus_pairs(stops_o, stops_t, origin=o, target=t, route_ok=route_ok)
+              if bus_ok else []):
+        w1 = _walk_est(o, (p["board"]["lat"], p["board"]["lng"]))
+        w2 = _walk_est((p["alight"]["lat"], p["alight"]["lng"]), t)
+        if not _legs_ok(w1, w2):
+            continue
+        walk = w1 + w2
         score = walk + p["stop_cnt"] * STOP_PENALTY_M + TRANSIT_LEG_PENALTY_M
         cands.append({
             "score": score,
@@ -177,9 +212,10 @@ def search(origin, target, mode, stops_near, stations, stop_radius_m=None,
             ],
         })
 
-    if mode == "walk_bus_subway":
-        st_o = nearest(stations, o[0], o[1], STATION_RADIUS_M, 3)
-        st_t = nearest(stations, t[0], t[1], STATION_RADIUS_M, 3)
+    if subway_ok:
+        st_radius = station_radius_for(mode)
+        st_o = nearest(stations, o[0], o[1], st_radius, 3)
+        st_t = nearest(stations, t[0], t[1], st_radius, 3)
 
         # ── 지하철만 (도보+지하철) ──
         for d1, s1 in st_o:
@@ -188,7 +224,11 @@ def search(origin, target, mode, stops_near, stations, stop_radius_m=None,
                 if not hop:
                     continue
                 line, n = hop
-                walk = _walk_est(o, (s1["lat"], s1["lng"])) + _walk_est((s2["lat"], s2["lng"]), t)
+                w1 = _walk_est(o, (s1["lat"], s1["lng"]))
+                w2 = _walk_est((s2["lat"], s2["lng"]), t)
+                if not _legs_ok(w1, w2):
+                    continue
+                walk = w1 + w2
                 score = walk + n * STATION_PENALTY_M + TRANSIT_LEG_PENALTY_M
                 cands.append({
                     "score": score,
@@ -199,6 +239,7 @@ def search(origin, target, mode, stops_near, stations, stop_radius_m=None,
                     ],
                 })
 
+    if bus_ok and subway_ok:
         # ── 버스 → 지하철 (직결 버스로 노선 내 어느 역까지 이동 후 승차) ──
         for _, s2 in st_t:
             line2, i2 = _line_of(s2.get("name") or "")
@@ -213,9 +254,12 @@ def search(origin, target, mode, stops_near, stations, stop_radius_m=None,
                 for p in _direct_bus_pairs(stops_o, stops_s1, origin=o,
                                             target=(s1["lat"], s1["lng"]), route_ok=route_ok):
                     line, n = hop
-                    walk = (_walk_est(o, (p["board"]["lat"], p["board"]["lng"]))
-                            + _walk_est((p["alight"]["lat"], p["alight"]["lng"]), (s1["lat"], s1["lng"]))
-                            + _walk_est((s2["lat"], s2["lng"]), t))
+                    w1 = _walk_est(o, (p["board"]["lat"], p["board"]["lng"]))
+                    w2 = _walk_est((p["alight"]["lat"], p["alight"]["lng"]), (s1["lat"], s1["lng"]))
+                    w3 = _walk_est((s2["lat"], s2["lng"]), t)
+                    if not _legs_ok(w1, w2, w3):
+                        continue
+                    walk = w1 + w2 + w3
                     score = (walk + p["stop_cnt"] * STOP_PENALTY_M + n * STATION_PENALTY_M
                              + 2 * TRANSIT_LEG_PENALTY_M)
                     cands.append({

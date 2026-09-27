@@ -50,6 +50,10 @@ class Settings:
     max_alternatives: int = int(os.environ.get("MAX_ALTERNATIVES", "2"))
     off_route_threshold_m: float = float(os.environ.get("OFF_ROUTE_THRESHOLD_M", "30"))
 
+    # 계측 로그(#73) — 요청 처리시간·재탐색·추천 스냅샷을 JSONL 로 append. 빈 문자열이면 메모리만.
+    metrics_enabled: bool = os.environ.get("METRICS_ENABLED", "true").lower() not in ("0", "false", "no")
+    metrics_log_path: str = os.environ.get("METRICS_LOG_PATH", "data/metrics/events.jsonl")
+
 
 _settings = None
 
