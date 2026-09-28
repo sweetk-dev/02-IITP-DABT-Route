@@ -9,6 +9,8 @@
 시설 내 장애인화장실을 합친다(#77). 공중화장실 표준데이터는 지자체가 공중·개방화장실로
 지정한 곳만 담아서, 박물관·공연장처럼 관람객에게만 여는 화장실(김중업건축박물관 등)이
 빠진다. 두 원천에 같은 시설이 있으면 공중화장실 쪽을 남긴다(칸 수·운영시간이 있다).
+여기에 편의시설 실태조사의 공공건물 장애인 화장실(청사·도서관·병원 등, v1.31.0)을 더한다 —
+``buildings.toilets_near``.
 
 충전기 표준데이터의 전화번호는 설치장소가 아니라 **관리기관** 번호다(안양 만안구 13곳은
 온누리 부흥센터, 동안구 12곳은 밀알보장구수리센터). 응답의 ``tel_owner`` 로 구분한다.
@@ -23,6 +25,7 @@ import math
 import re
 
 from ..engine.geo import haversine_m
+from . import buildings as poi_buildings
 
 SUPPORT_TYPES = ("charge", "repair", "calltaxi")
 SUPPORT_LABEL = {"charge": "전동보장구 충전기", "repair": "보장구 수리", "calltaxi": "장애인콜택시"}
@@ -193,6 +196,14 @@ def toilets_near(store, lat: float, lng: float, radius_m: float = 800.0, limit: 
         if any(_same_place(it, p) for p in out):
             continue
         out.append(it)
+    # 공공건물의 장애인 화장실(v1.31.0) — 청사·도서관·병원 등은 장애인 등이 이용 가능한 화장실이
+    # 의무다(장애인등편의법 시행령 별표 2). 통합DB 의 편의시설 실태조사에 이미 있는데 쓰지 않았다.
+    # 앞의 두 원천과 같은 곳이면 칸 수·운영시간이 있는 쪽을 남긴다.
+    if accessible_only:
+        for it in poi_buildings.toilets_near(store, lat, lng, radius_m):
+            if any(_same_place(it, p) for p in out):
+                continue
+            out.append(it)
     out.sort(key=lambda x: x["dist_m"])
     return out[:limit]
 
@@ -202,10 +213,11 @@ def _nkey(name) -> str:
 
 
 def _same_place(fac: dict, pub: dict) -> bool:
-    """시설 내 화장실과 공중화장실이 같은 곳인가 — 80m 이내 + 이름 포함 관계."""
+    """시설 내 화장실과 앞서 담은 화장실이 같은 곳인가 — 80m 이내 + 이름 포함 관계."""
     if haversine_m(fac["lat"], fac["lng"], pub["lat"], pub["lng"]) > 80:
         return False
-    a, b = _nkey(fac.get("facility_name")), _nkey(pub.get("name"))
+    a = _nkey(fac.get("facility_name"))
+    b = _nkey(pub.get("facility_name") or pub.get("name"))
     return bool(a and b and (a in b or b in a))
 
 

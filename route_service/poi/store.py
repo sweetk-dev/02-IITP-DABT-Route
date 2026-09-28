@@ -349,6 +349,57 @@ class PoiStore:
             self._cache[merged_key] = out
         return self._bbox_filter(out, bbox)[:limit]
 
+    def list_food(self, sigungu: str = "안양") -> list:
+        """지역의 음식점 POI(mv_poi ``search_filter.restaurant``) — 무장애 정보가 없어도 남긴다.
+
+        무장애 관광지 목록(``list_tour_spots``)은 세 소스 어디에도 속성이 없는 행을 버린다.
+        음식점은 속성 보유가 드물어(안양 89곳 중 6곳, 2026-09-28 실측) 같은 규칙이면 거의
+        다 빠진다. 여기서는 전부 남기고 ``facilities`` 로 "확인됨 / 정보 없음" 을 가른다.
+        """
+        if self.backend == "none":
+            return []
+        variants = sigungu_variants(sigungu)
+        key = "food:%s" % "|".join(variants or [])
+        if key in self._cache:
+            return self._cache[key]
+        if self.backend == "file":
+            rows = [r for r in self._load_file("tour_bf.json")
+                    if tour_category(r)[0] == "food"]
+            out = [self._normalize_tour(r) for r in rows]
+            if variants:
+                out = [r for r in out if _addr_in_sigungu(r.get("addr"), variants)]
+        else:
+            params, sg_clause = {}, ""
+            if variants:
+                ors = []
+                for i, v in enumerate(variants):
+                    ors.append(
+                        "COALESCE(address_road, '') LIKE '%%' || :sg{0} || '%%'"
+                        " OR COALESCE(address_detail, '') LIKE '%%' || :sg{0} || '%%'".format(i)
+                    )
+                    params["sg%d" % i] = v
+                sg_clause = "AND (%s)" % " OR ".join(ors)
+            rows = self._query(
+                """
+                SELECT poi_id,
+                       title AS name,
+                       COALESCE(address_road, address_detail) AS addr,
+                       latitude, longitude,
+                       detail_json->>'accessible_facilities' AS fac_text,
+                       search_filter_json->'search_filter'->>'restaurant' AS sf_restaurant
+                  FROM mv_poi
+                 WHERE language_code = 'ko'
+                   AND latitude IS NOT NULL AND longitude IS NOT NULL
+                   AND COALESCE(search_filter_json->'search_filter'->>'restaurant', '') <> ''
+                   {sg}
+                """.format(sg=sg_clause),
+                params,
+            )
+            out = [self._normalize_tour(r) for r in rows]
+            out = self._apply_overlays(out, variants, keep_empty=True)
+        self._cache[key] = out
+        return out
+
     @staticmethod
     def _bbox_filter(rows: list, bbox) -> list:
         if not bbox:
@@ -463,12 +514,14 @@ class PoiStore:
                 best[key] = (rank, idx, row, meta)
         return {idx: (row, meta) for _, idx, row, meta in best.values()}
 
-    def _apply_overlays(self, spots: list, variants) -> list:
+    def _apply_overlays(self, spots: list, variants, keep_empty: bool = False) -> list:
         """mv_poi 기반 결과에 한국관광공사·한국사회보장정보원 속성을 덧씌운다.
 
         병합 규칙: 어느 소스든 Y 면 Y(합집합). 다른 소스가 N 이면 값은 유지하되
         ``facility_conflicts`` 로 남긴다 — 상충 자체가 현장 검증 대상이다.
         세 소스 어디에도 정보가 없는 POI 는 무장애 후보가 아니므로 제외한다.
+        ``keep_empty`` 는 정보가 없는 POI 도 남긴다 — 음식점 조회처럼 "정보 없음"을
+        그대로 알려 주는 용도(v1.31.0). 무장애 관광지 추천은 종전대로 제외한다.
         """
         if self.backend != "db" or not variants:
             # file/none 백엔드는 픽스처를 그대로 쓴다 — 종전에도 속성 필터가 없었다.
@@ -476,6 +529,8 @@ class PoiStore:
             return spots
         bf_rows, facl_rows = self._overlay_rows(variants)
         if not bf_rows and not facl_rows:
+            if keep_empty:
+                return spots
             return [s for s in spots if any((s.get("facilities") or {}).values())]
         bf_assign = self._assign_overlay(spots, bf_rows, "fclt_name", BF_MATCH_M)
         facl_assign = self._assign_overlay(spots, facl_rows, "facl_name", FACL_MATCH_M)
@@ -512,7 +567,7 @@ class PoiStore:
                     elif sources[field] and "kowsi" not in sources[field]:
                         conflicts.append({"field": field, "yes": list(sources[field]), "no": "kowsi"})
 
-            if not any(fac.values()):
+            if not any(fac.values()) and not keep_empty:
                 continue
             merged = dict(spot)
             merged["facilities"] = fac

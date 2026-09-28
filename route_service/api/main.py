@@ -31,6 +31,9 @@ from ..engine.overrides import apply_overrides
 from ..poi import store as poi_store
 from ..poi import support as poi_support
 from ..poi import landmarks as poi_landmarks
+from ..poi import buildings as poi_buildings
+from ..poi import directory as poi_directory
+from ..poi import food as poi_food
 from ..transit import gbis_live
 from ..transit import planner as transit
 from ..transit import low_floor as lowfloor
@@ -1427,6 +1430,74 @@ def toilet_nearby(
     metrics.tag(result_cnt=len(items))
     return {"source": poi_store.STORE.source, "radius_m": radius_m,
             "accessible_only": accessible_only, "count": len(items), "items": items}
+
+
+# ────────────────────────── 음식점·건물 편의시설·명부 (v1.31.0) ──────────────────────────
+@app.get("/food/nearby", tags=["support"], dependencies=[Depends(auth)])
+def food_nearby(
+    lat: float = Query(None),
+    lng: float = Query(None),
+    sigungu: str = Query("안양"),
+    radius_m: float = Query(3000, ge=100, le=20000),
+    limit: int = Query(5, ge=1, le=30),
+    accessible_only: bool = Query(False, description="휠체어 출입이 확인된 곳만"),
+):
+    """휠체어로 갈 수 있는 음식점 — 관광 음식점(경기관광공사) + 편의시설 실태조사의 음식점 건물.
+
+    `entry_status` 는 yes(턱 없는 출입구 확인) / no(턱 있음) / unknown(자료 없음) 3상태다.
+    yes 를 먼저, 같은 상태 안에서 가까운 순. `total`·`confirmed` 로 반경 안 전체 수와 확인된 수를 준다.
+    """
+    res = poi_food.food_near(poi_store.STORE, lat, lng, sigungu, radius_m, limit, accessible_only)
+    metrics.tag(sigungu=sigungu, result_cnt=res["count"])
+    return {"source": poi_store.STORE.source, "radius_m": radius_m if lat is not None else None,
+            "sigungu": sigungu, **res}
+
+
+@app.get("/facility/accessibility", tags=["support"], dependencies=[Depends(auth)])
+def facility_accessibility(
+    q: str = Query("", description="건물 이름(예: 안양시청, 만안구보건소)"),
+    lat: float = Query(None),
+    lng: float = Query(None),
+    radius_m: float = Query(300, ge=20, le=3000),
+    limit: int = Query(5, ge=1, le=30),
+):
+    """건물 편의시설(장애인편의시설 실태조사) — 이름 또는 근처로 찾는다.
+
+    항목별 yes/no/unknown(`status`)과 판정 근거(`basis`: column | text)를 준다. 주거·공장은 제외한다.
+    """
+    if not q.strip() and (lat is None or lng is None):
+        raise HTTPException(status_code=400, detail="q 또는 lat·lng 가 필요합니다")
+    items = poi_buildings.search(poi_store.STORE, q, lat, lng, radius_m, limit)
+    metrics.tag(result_cnt=len(items))
+    return {"source": poi_store.STORE.source, "q": q or None, "count": len(items),
+            "survey_note": poi_buildings.SURVEY_NOTE, "items": items}
+
+
+@app.get("/directory/providers", tags=["directory"], dependencies=[Depends(auth)])
+def directory_providers(
+    service: str = Query("", description="주간활동 / 방과후 / 발달재활 / 언어 / 거주 / 활동지원 / 직업재활 …"),
+    district: str = Query("", description="구 이름(만안구·동안구)"),
+    q: str = Query("", description="기관 이름 일부"),
+    sigungu: str = Query("안양"),
+    limit: int = Query(10, ge=1, le=50),
+):
+    """장애인 서비스 제공기관 명부 — 서비스 종류·구·이름으로 좁힌다(좌표 없음)."""
+    res = poi_directory.providers(poi_store.STORE, service, district, q, sigungu, limit)
+    metrics.tag(result_cnt=res["count"])
+    return {"source": poi_store.STORE.source, **res}
+
+
+@app.get("/directory/workplaces", tags=["directory"], dependencies=[Depends(auth)])
+def directory_workplaces(
+    sigungu: str = Query("안양"),
+    q: str = Query("", description="업종·회사 이름 낱말(예: 카페, 제조)"),
+    district: str = Query(""),
+    limit: int = Query(10, ge=1, le=50),
+):
+    """장애인 표준사업장(한국장애인고용공단 인증) — 시·군·구, 업종 낱말, 구로 좁힌다."""
+    res = poi_directory.workplaces(poi_store.STORE, sigungu, q, district, limit)
+    metrics.tag(sigungu=sigungu, result_cnt=res["count"])
+    return {"source": poi_store.STORE.source, **res}
 
 
 # ────────────────────────── transit ──────────────────────────
