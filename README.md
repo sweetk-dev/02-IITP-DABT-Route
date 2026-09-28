@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.30.0 |
+| 02-IITP-DABT-Route | v1.31.0 |
 
 ## 구조
 
@@ -135,6 +135,10 @@ curl -s localhost:18100/meta/network
 | GET | `/tour/bf-spots/{id}` | 관광지 상세 (편의시설 Y/N) |
 | GET | `/tour/bf-spots/{id}/entrance` | **무장애 접근 지점** — 실측 출입구 > 건물 접근점 > 시설 대표점 |
 | POST | `/tour/recommend` | 장애 유형별 관광지 추천 랭킹 — `origin_lat/lng` 지정 시 **거리 오름차순**, `offset` 페이징(`total`/`has_more` 반환) |
+| GET | `/food/nearby` | **휠체어로 갈 수 있는 음식점** — 관광 음식점 + 편의시설 실태조사 음식점 건물, 출입 3상태(yes/no/unknown) |
+| GET | `/facility/accessibility` | **건물 편의시설** — 이름(옛 이름 포함)·근처로 찾아 출입구·승강기·화장실·주차를 3상태로 |
+| GET | `/directory/providers` | 장애인 서비스 제공기관 명부(주간활동·발달재활·거주시설 등) — 서비스·구·이름 필터 |
+| GET | `/directory/workplaces` | 장애인 표준사업장(한국장애인고용공단 인증) — 시·군·구·업종 필터 |
 | GET | `/transit/access-points` | 휠체어 접근 가능한 정류장·역 (역 화장실·경사로 유무는 3상태) |
 | GET | `/transit/bus/arrivals` | **정류장 실시간 도착정보** — 노선별 1·2번째 차량의 도착 예정·정거장 수·**저상 여부**, `next_low_floor` |
 | GET | `/transit/bus/locations` | **노선 실시간 차량 위치** — 운행 차량의 현재 정류장(좌표 조인)·저상 여부 |
@@ -258,6 +262,34 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
   ("석수·서울 쪽에서 타고 왔어요")을 쓴다. 서버는 목적지에서 가까운 휠체어 출구 2곳의 실제 경로를 계산해 짧은
   쪽 **출구에서** 계획하고, 맨 앞에 `station_start` 스텝(내린 승강장 승강기 → 출구 승강기, `egress.inside`)을 붙인다.
   응답 최상위 `station_start` 에 역·방향·출구·안내를 싣는다. 방향을 모르면 승강장 설비를 '모름'으로 두고 위치만 알린다.
+
+### 음식점 · 건물 편의시설 · 공공건물 화장실 · 명부 (v1.31.0)
+
+통합DB 에 적재돼 있으나 쓰지 않던 데이터를 조회 API 로 연다.
+
+- `GET /food/nearby?lat&lng&sigungu=안양&radius_m=3000&limit=5&accessible_only=false` — 원천 둘.
+  ① `mv_poi` 의 관광 음식점(`search_filter.restaurant`, 안양 89곳) — 무장애 속성은 경기관광공사·한국관광공사·
+  편의시설 실태조사 3소스 결합(v1.24.0 규칙)을 쓰되, **정보가 없는 곳도 남긴다**(관광지 추천은 종전대로 제외).
+  ② 편의시설 실태조사의 일반음식점·휴게음식점 건물 중 이름이 있는 곳 — 건물 단위·사용승인 시점 기록이라
+  `survey_note` 로 "현재 영업 여부 확인 필요"를 싣고, ①과 같은 곳이면 뺀다.
+  `entry_status` 는 접근로·경사로 확인 여부 3상태(yes/no/unknown). yes 먼저, 같은 상태 안에서 거리순.
+  `total`·`confirmed`·`unknown` 으로 반경 안 전체 수와 확인된 수를 준다.
+  카카오·네이버는 편의시설 항목을 API 로 주지 않고, 구글 Places 의 휠체어 항목은 약관상 비구글 지도와 함께
+  쓸 수 없어 원천에 넣지 않았다.
+- `GET /facility/accessibility?q=&lat&lng&radius_m=300` — `poi_facility_accessibility`(안양 1,649) 항목별
+  yes/no/unknown(`status`). **Y/N 칸이 비어 있고 실태조사 원문(`eval_info_raw`)에 설치 시설이 적혀 있으면
+  원문으로 보완**하고 `basis=text` 로 표시한다(예: 박달복합청사 — 원문에 장애인사용가능화장실, 칸은 비어 있음).
+  "주민센터·행정복지센터·동사무소"는 옛 이름으로도 찾는다. 주거·공장은 제외.
+- `/toilet/nearby` 가 **공공건물의 장애인 화장실**을 합친다 — 청사·행정복지센터·보건소·우체국·도서관·병원 등
+  장애인등편의법 시행령 별표 2 에서 장애인 등이 이용 가능한 화장실이 의무인 공공건물 가운데 방문객이 쓸 수
+  있는 유형만(학교·어린이집·업무시설 제외). `building_toilet=true`, `open_time="건물 운영시간 내"`,
+  `source=KOWSI_FACL`. 공중화장실·관광시설과 같은 곳이면 앞의 원천을 남긴다.
+- `GET /directory/providers?service=&district=&q=` — `selfdiag_provider`(안양 명부)에 `emp_dis_dev_support_org`
+  (발달장애인 지원기관의 제공 서비스 10종)를 이름으로 합친다. 같은 기관의 여러 서비스 행은 하나로 묶는다.
+- `GET /directory/workplaces?sigungu=안양&q=` — `emp_dis_std_workplace`. 두 명부는 정기 갱신이 아니라
+  적재일을 `base_date` 로 준다.
+- 파일 백엔드: `facility_accessibility.json`, `selfdiag_provider.json`, `dev_support_org.json`,
+  `std_workplace.json`(DB 컬럼명 그대로). 음식점은 `tour_bf.json` 의 `category=food` 행.
 
 ### 하차역 출구 · 관광 분류 추천 · 시설 내 화장실 · 요청 출처 태그 (v1.27.0)
 
