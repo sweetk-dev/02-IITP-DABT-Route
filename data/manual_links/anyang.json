@@ -1,0 +1,82 @@
+{
+  "version": "anyang-manual-2026-09-29",
+  "about": "현장·외부 지도 대조로 확인한 보행 링크. 좌표 출처 OSM(출구 노드)·카카오맵 대조(2026-09-29). 사전답사에서 실측 후 confidence 를 올린다.",
+  "links": [
+    {
+      "id": "GWANAK-01",
+      "from": {
+        "lat": 37.4184789,
+        "lon": 126.9087988,
+        "snap_m": 5,
+        "node_type": "entrance"
+      },
+      "to": {
+        "node": 3903318504
+      },
+      "link_type": "sidewalk",
+      "link_name": "만안로",
+      "slope": 0.5,
+      "width": null,
+      "confidence": 0.8,
+      "source": "OSM 출구 노드 3405090069 + 카카오맵 대조 2026-09-29",
+      "note": "관악역 1번 출구 → 역사 앞 만안로(서측). 출구 노드를 그래프에 고정한다"
+    },
+    {
+      "id": "GWANAK-02",
+      "from": {
+        "lat": 37.4188986,
+        "lon": 126.9092237,
+        "snap_m": 5,
+        "node_type": "entrance"
+      },
+      "to": {
+        "node": 3903318504
+      },
+      "link_type": "sidewalk",
+      "link_name": "만안로",
+      "slope": 0.5,
+      "width": null,
+      "confidence": 0.8,
+      "source": "OSM 출구 노드 3405090068 + 카카오맵 대조 2026-09-29",
+      "note": "관악역 2번 출구 → 역사 아래를 지나는 만안로(동측 보도). 2번 출구가 서쪽·만안교 방면과 이어지는 핵심 링크"
+    },
+    {
+      "id": "GWANAK-03",
+      "from": {
+        "lat": 37.4188986,
+        "lon": 126.9092237,
+        "snap_m": 5
+      },
+      "to": {
+        "node": 4696341341
+      },
+      "link_type": "sidewalk",
+      "link_name": null,
+      "slope": 0.3,
+      "width": null,
+      "confidence": 0.8,
+      "source": "카카오맵 대조 2026-09-29",
+      "note": "관악역 2번 출구 앞 광장 → 경수대로1273번길(동측 이면도로). 김중업·예술공원 방면"
+    },
+    {
+      "id": "GWANAK-04",
+      "from": {
+        "lat": 37.4184789,
+        "lon": 126.9087988,
+        "snap_m": 5
+      },
+      "to": {
+        "lat": 37.4188986,
+        "lon": 126.9092237,
+        "snap_m": 5
+      },
+      "link_type": "elevator",
+      "link_name": "관악역 역사 통로",
+      "slope": 0.0,
+      "width": null,
+      "confidence": 0.6,
+      "source": "카카오맵 역사 통로 표시 + OSM building layer=1(선상역사) 2026-09-29",
+      "note": "1번 출구 ↔ 2번 출구 역사(2층) 통로 — 양쪽 승강기. ⚠️ 사전답사 확인: 개찰 밖 자유통로인지, 승강기 운행. 아니면 이 링크를 제거한다"
+    }
+  ]
+}
