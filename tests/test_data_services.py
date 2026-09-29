@@ -129,6 +129,21 @@ def test_food_confirmed_first_unknown_kept(client):
     assert b["items"][0]["facilities"] == ["접근로·경사로", "장애인 화장실"]
 
 
+def test_food_toilet_pairing(client):
+    """v1.33.0 — 식당마다 자체 장애인 화장실(own) 또는 200m 안 접근 가능 화장실(nearby)을 붙인다."""
+    r = client.get("/food/nearby", params={"lat": BASE[0], "lng": BASE[1], "radius_m": 1000})
+    b = r.json()
+    assert b["toilet_radius_m"] == 200
+    by = {i["name"]: i["toilet"] for i in b["items"]}
+    assert by["경사로식당"]["status"] == "own" and by["경사로식당"]["nearby"] is None     # 공원 화장실 267m 밖
+    assert by["흥부가"]["status"] == "nearby" and by["흥부가"]["nearby"]["name"] == "공원 공중화장실"
+    assert 30 <= by["흥부가"]["nearby"]["dist_m"] <= 60 and by["흥부가"]["nearby"]["open_time"] == "24시간"
+    assert by["가까운식당"]["status"] == "nearby"
+    r = client.get("/food/nearby", params={"lat": BASE[0], "lng": BASE[1], "radius_m": 1000, "toilet_radius_m": 0})
+    assert all(i["toilet"]["nearby"] is None for i in r.json()["items"])
+    assert [i["toilet"]["status"] for i in r.json()["items"]] == ["own", "none", "none"]
+
+
 def test_food_accessible_only_and_no_origin(client):
     r = client.get("/food/nearby", params={"lat": BASE[0], "lng": BASE[1], "accessible_only": "true"})
     assert [i["entry_status"] for i in r.json()["items"]] == ["yes", "yes"]

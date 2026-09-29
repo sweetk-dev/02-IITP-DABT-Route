@@ -25,6 +25,7 @@ from .store import SOURCE_LABELS, SAME_BUILDING_M, _name_match_rank, _norm_name
 
 FOOD_FACL_TYPES = ("일반음식점", "휴게음식점·제과점")
 ENTRY_ORDER = {"yes": 0, "unknown": 1, "no": 2}
+TOILET_PAIR_RADIUS_M = 200.0      # 식당 ↔ 접근 가능 화장실 짝짓기 반경 (v1.33.0)
 
 
 def _listing_entry(spot: dict) -> str:
@@ -99,6 +100,32 @@ def _dup(b: dict, items: list) -> bool:
         if d <= 150 and _name_match_rank(nb, it.get("name")) is not None:
             return True
     return False
+
+
+def attach_toilets(store, items: list, radius_m: float = TOILET_PAIR_RADIUS_M) -> list:
+    """식당마다 가장 가까운 접근 가능 화장실을 붙인다 (v1.33.0, #96).
+
+    소규모 일반음식점은 장애인등편의법상 편의시설 설치 의무 대상이 아니라 식당 자체 장애인 화장실
+    자료가 거의 없다. 대신 "식당 + 반경 200m 안 접근 가능 화장실(공중·시설 내·공공건물 안)" 을
+    짝지어 준다. ``toilet.status`` — own(식당 무장애 속성에 장애인 화장실) / nearby(반경 안 있음) /
+    none(둘 다 없음). ``toilet.nearby`` 는 가장 가까운 1곳(이름·거리·운영시간·원천).
+    """
+    from . import support as poi_support
+    for it in items:
+        own = "장애인 화장실" in (it.get("facilities") or [])
+        info = {"status": "own" if own else "none", "nearby": None, "radius_m": radius_m}
+        it["toilet"] = info
+        if it.get("lat") is None or it.get("lng") is None or radius_m <= 0:
+            continue
+        near = poi_support.toilets_near(store, it["lat"], it["lng"], radius_m, 1, True)
+        if near:
+            t = near[0]
+            info["nearby"] = {"name": t.get("name"), "dist_m": t.get("dist_m"), "source": t.get("source"),
+                              "open_time": t.get("open_time_detail") or t.get("open_time"),
+                              "lat": t.get("lat"), "lng": t.get("lng")}
+            if not own:
+                info["status"] = "nearby"
+    return items
 
 
 def food_near(store, lat: float = None, lng: float = None, sigungu: str = "안양",
