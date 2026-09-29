@@ -1441,13 +1441,19 @@ def food_nearby(
     radius_m: float = Query(3000, ge=100, le=20000),
     limit: int = Query(5, ge=1, le=30),
     accessible_only: bool = Query(False, description="휠체어 출입이 확인된 곳만"),
+    toilet_radius_m: float = Query(poi_food.TOILET_PAIR_RADIUS_M, ge=0, le=1000,
+                                   description="식당마다 붙이는 접근 가능 화장실 탐색 반경. 0 이면 붙이지 않는다"),
 ):
     """휠체어로 갈 수 있는 음식점 — 관광 음식점(경기관광공사) + 편의시설 실태조사의 음식점 건물.
 
     `entry_status` 는 yes(턱 없는 출입구 확인) / no(턱 있음) / unknown(자료 없음) 3상태다.
     yes 를 먼저, 같은 상태 안에서 가까운 순. `total`·`confirmed` 로 반경 안 전체 수와 확인된 수를 준다.
+    v1.33.0: 항목마다 `toilet` — 식당 자체 장애인 화장실(own) 또는 반경 `toilet_radius_m` 안 가장 가까운
+    접근 가능 화장실(nearby) — 을 붙인다. 소규모 식당은 화장실 자료가 없어 "근처 화장실"이 판단 근거다.
     """
     res = poi_food.food_near(poi_store.STORE, lat, lng, sigungu, radius_m, limit, accessible_only)
+    poi_food.attach_toilets(poi_store.STORE, res["items"], toilet_radius_m)
+    res["toilet_radius_m"] = toilet_radius_m
     metrics.tag(sigungu=sigungu, result_cnt=res["count"])
     return {"source": poi_store.STORE.source, "radius_m": radius_m if lat is not None else None,
             "sigungu": sigungu, **res}
