@@ -335,6 +335,9 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
                 "link_type": s["_link_type"],
                 "link_name": s["_link_name"],
                 "warnings": s["_warnings"],
+                # 횡단보도 링크의 관리번호(안양시 좌표본) — 한 횡단보도가 여러 링크로 나뉘어 있을 때
+                # 클라이언트가 같은 횡단보도의 조각을 묶어 한 번만 안내하게 한다 (v1.33.1, #98)
+                "crosswalk_id": (s["_data"].get("cw_mgmt_no") if s["_link_type"] == "crossing" else None),
             }
         )
 

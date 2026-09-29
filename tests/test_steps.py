@@ -45,3 +45,20 @@ def test_josa_selection_for_road_names(store):
     assert _josa("달안로", "을", "를") == "를"           # 받침 없음
     assert _josa("경수대로", "을", "를") == "를"
     assert _josa(None, "을", "를") == "를"
+
+
+def test_crossing_step_carries_crosswalk_id():
+    """v1.33.1 — crossing 스텝은 cw_mgmt_no 를 crosswalk_id 로 싣고, 그 밖의 스텝은 None."""
+    import networkx as nx
+    from route_service.engine.steps import build_steps
+    from route_service.engine.profiles import get_profile
+    G = nx.Graph()
+    G.add_node(1, lat=37.39, lon=126.95); G.add_node(2, lat=37.39, lon=126.9505)
+    G.add_node(3, lat=37.39, lon=126.9507); G.add_node(4, lat=37.39, lon=126.9512)
+    G.add_edge(1, 2, length=44, slope=0.5, link_type="sidewalk")
+    G.add_edge(2, 3, length=18, slope=0.2, link_type="crossing", cw_mgmt_no="2024120776")
+    G.add_edge(3, 4, length=44, slope=0.5, link_type="sidewalk")
+    out = build_steps(G, [1, 2, 3, 4], get_profile("wheelchair_electric"))
+    ids = [(x["maneuver"], x.get("crosswalk_id")) for x in out if x["maneuver"] in ("crossing", "depart", "arrive")]
+    assert ("crossing", "2024120776") in ids
+    assert all(cid is None for m, cid in ids if m != "crossing")
