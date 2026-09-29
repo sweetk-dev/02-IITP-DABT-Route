@@ -1,6 +1,6 @@
 {
   "version": "anyang-manual-2026-09-29",
-  "about": "현장·외부 지도 대조로 확인한 보행 링크. 좌표 출처 OSM(출구 노드)·카카오맵 대조(2026-09-29). 사전답사에서 실측 후 confidence 를 올린다.",
+  "about": "현장·외부 지도 대조로 확인한 보행 링크. 좌표 출처 OSM(출구 노드)·카카오맵 대조(2026-09-29). 목록 순서대로 적용되며 앞 항목이 만든 노드에 뒤 항목이 스냅된다. 사전답사에서 실측 후 confidence 를 올린다.",
   "links": [
     {
       "id": "GWANAK-01",
@@ -66,17 +66,60 @@
         "snap_m": 5
       },
       "to": {
+        "lat": 37.418575,
+        "lon": 126.908905,
+        "snap_m": 2,
+        "node_type": "unknown"
+      },
+      "link_type": "elevator",
+      "link_name": "관악역 1번 출구 승강기",
+      "slope": 0.0,
+      "width": null,
+      "confidence": 0.6,
+      "source": "카카오맵 역사 통로 표시 + OSM building layer=1(선상역사) 2026-09-29",
+      "note": "1번 출구 ↔ 역사 2층 대합실(서측 승강기). ⚠️ 사전답사 확인: 개찰 밖 자유통로 여부·승강기 운행. 아니면 04·05·06 을 제거한다"
+    },
+    {
+      "id": "GWANAK-05",
+      "from": {
+        "lat": 37.418575,
+        "lon": 126.908905,
+        "snap_m": 2
+      },
+      "to": {
+        "lat": 37.4188,
+        "lon": 126.90913,
+        "snap_m": 2,
+        "node_type": "unknown"
+      },
+      "link_type": "sidewalk",
+      "link_name": "관악역 대합실 통로",
+      "slope": 0.0,
+      "width": null,
+      "surface": "indoor",
+      "confidence": 0.6,
+      "source": "카카오맵 역사 통로 표시 2026-09-29",
+      "note": "역사 2층 대합실 수평 통로(서측 승강기 ↔ 동측 승강기). 실내"
+    },
+    {
+      "id": "GWANAK-06",
+      "from": {
+        "lat": 37.4188,
+        "lon": 126.90913,
+        "snap_m": 2
+      },
+      "to": {
         "lat": 37.4188986,
         "lon": 126.9092237,
         "snap_m": 5
       },
       "link_type": "elevator",
-      "link_name": "관악역 역사 통로",
+      "link_name": "관악역 2번 출구 승강기",
       "slope": 0.0,
       "width": null,
       "confidence": 0.6,
-      "source": "카카오맵 역사 통로 표시 + OSM building layer=1(선상역사) 2026-09-29",
-      "note": "1번 출구 ↔ 2번 출구 역사(2층) 통로 — 양쪽 승강기. ⚠️ 사전답사 확인: 개찰 밖 자유통로인지, 승강기 운행. 아니면 이 링크를 제거한다"
+      "source": "카카오맵 역사 통로 표시 2026-09-29",
+      "note": "역사 2층 대합실(동측 승강기) ↔ 2번 출구"
     }
   ]
 }
