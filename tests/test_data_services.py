@@ -144,6 +144,27 @@ def test_food_toilet_pairing(client):
     assert [i["toilet"]["status"] for i in r.json()["items"]] == ["own", "none", "none"]
 
 
+def test_food_toilet_pairing_single_query_and_unknown(monkeypatch):
+    """DB 는 한 번만 부르고, 좌표 없는 식당은 unknown 이다."""
+    from route_service.poi import food as poi_food
+    calls = []
+
+    def fake_toilets_near(store, lat, lng, radius_m, limit, accessible_only):
+        calls.append((round(lat, 4), round(lng, 4), round(radius_m), limit))
+        return [{"name": "화장실A", "lat": 37.3906, "lng": 126.95, "source": "PUBLIC_TOILET", "open_time": "24시간"}]
+    monkeypatch.setattr(poi_food.poi_support, "toilets_near", fake_toilets_near)
+    items = [{"name": "a", "lat": 37.3905, "lng": 126.95, "facilities": []},
+             {"name": "b", "lat": 37.3910, "lng": 126.95, "facilities": ["장애인 화장실"]},
+             {"name": "c", "lat": None, "lng": None, "facilities": []},
+             {"name": "d", "lat": 37.4200, "lng": 126.95, "facilities": None}]
+    poi_food.attach_toilets(None, items, 200)
+    assert len(calls) == 1 and calls[0][3] == 500
+    assert items[0]["toilet"]["status"] == "nearby" and items[0]["toilet"]["nearby"]["dist_m"] == 11
+    assert items[1]["toilet"]["status"] == "own" and items[1]["toilet"]["nearby"]["name"] == "화장실A"
+    assert items[2]["toilet"]["status"] == "unknown" and items[2]["toilet"]["nearby"] is None
+    assert items[3]["toilet"]["status"] == "none"                      # 3.3km 밖 — 반경 안 화장실 없음
+
+
 def test_food_accessible_only_and_no_origin(client):
     r = client.get("/food/nearby", params={"lat": BASE[0], "lng": BASE[1], "accessible_only": "true"})
     assert [i["entry_status"] for i in r.json()["items"]] == ["yes", "yes"]

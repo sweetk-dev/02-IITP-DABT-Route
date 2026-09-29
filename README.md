@@ -431,8 +431,8 @@ python scripts/restitch_boundary.py --graph data/network_anyang_hybrid_r2.gpickl
 소규모 일반음식점은 장애인등편의법상 편의시설 설치 의무 대상이 아니라 식당 자체 장애인 화장실 자료가 사실상 없다.
 휠체어 이용자에게는 "들어갈 수 있는가"만큼 "화장실을 쓸 수 있는가"가 식당 선택 기준이므로, `/food/nearby` 는
 항목마다 `toilet` 을 붙인다 — `status` own(식당 무장애 속성에 장애인 화장실) / nearby(반경 `toilet_radius_m`, 기본 200m 안
-가장 가까운 접근 가능 화장실 — 공중·시설 내·공공건물 안) / none. `nearby` 에는 이름·거리·운영시간·원천이 들어간다.
-`toilet_radius_m=0` 이면 붙이지 않는다.
+가장 가까운 접근 가능 화장실 — 공중·시설 내·공공건물 안) / none / unknown(좌표 없음). `nearby` 에는 이름·거리·운영시간·원천이 들어간다.
+`toilet_radius_m=0` 이면 붙이지 않는다. 화장실 조회는 목록 전체를 덮는 원으로 **1회**만 하고 식당별 최근접은 메모리에서 고른다.
 
 ### 수동 확인 링크 — 선상역사 통로·출구 앞 보도 (v1.32.0)
 
