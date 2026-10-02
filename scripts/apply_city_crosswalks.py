@@ -274,6 +274,11 @@ def main():
         lst = a.get("cw_mgmt_nos") or []
         lst.append(r["mgmt_no"])
         a["cw_mgmt_nos"] = lst
+        # 횡단보도 위치·건너는 거리 — 직진 통과 때 가는 길을 가로막는 것만 골라 알리는 데 쓴다
+        pts = a.get("cw_points") or []
+        pts.append({"id": r["mgmt_no"], "lat": round(float(r["lat"]), 7), "lon": round(float(r["lon"]), 7),
+                    "length_m": (float(r["length"]) if r["length"] else None)})
+        a["cw_points"] = pts
         if r["curb_cut"] is not None:
             prev = a.get("cw_curb_cut")
             a["cw_curb_cut"] = bool(r["curb_cut"]) if prev is None else (prev and bool(r["curb_cut"]))
