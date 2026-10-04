@@ -7,7 +7,7 @@
 """
 from .extract import extract_sheet, SIDEWALK_AREA, SIDEWALK_LINE, OVERPASS, ROAD_CENTER
 from .centerline import poly_to_centerlines
-from .dissolve import dissolve_polys, grid_centerlines
+from .dissolve import grid_centerlines
 from .topology import build_topology
 
 __all__ = ["extract_sheet", "poly_to_centerlines", "build_topology", "grid_centerlines",

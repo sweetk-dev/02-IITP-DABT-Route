@@ -84,15 +84,6 @@ def _seg_intersect(p1, p2, p3, p4) -> bool:
     return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
 
 
-def _pt_seg_dist(px, py, x1, y1, x2, y2) -> float:
-    dx, dy = x2 - x1, y2 - y1
-    L2 = dx * dx + dy * dy
-    if L2 <= 0:
-        return math.hypot(px - x1, py - y1)
-    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L2))
-    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
-
-
 def dem_crs_warning(crs):
     """DEM 좌표계가 EPSG:5186 이 아니면 경고 문구, 맞거나 알 수 없으면 None.
 

@@ -84,7 +84,6 @@ def next_cwx_id(G, last: int):
 
 
 def _load_crosswalks(path, to_5186):
-    import numpy as np
     with open(path, "r", encoding="utf-8") as f:
         gj = json.load(f)
     recs = []

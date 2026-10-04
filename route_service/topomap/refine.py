@@ -278,7 +278,6 @@ def apply(G, adopted: list, min_confidence: float = 0.0) -> int:
         if c["confidence"] < min_confidence or G.has_edge(c["a"], c["b"]):
             continue
         base = dict(G[c["a"]][c["m"]])
-        za, zb = base.get("elev_start"), base.get("elev_end")
         data = {k: v for k, v in base.items() if k not in ("geometry", "cw_mgmt_no", "cw_length_m", "stitched", "bridged")}
         data.update({"length": float(c["straight_m"]), "geometry": None,
                      "slope": float(c.get("slope_deg") or 0.0),
@@ -307,7 +306,6 @@ GAP_MAX_M = 20.0
 GAP_RATIO_MIN = 4.0
 GAP_CONFIDENCE = 0.65
 MINOR_ROAD_SUFFIX = ("길",)
-MAJOR_ROAD_SUFFIX = ("대로", "로")
 
 
 def _is_minor_road(name) -> bool:

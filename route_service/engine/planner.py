@@ -9,11 +9,9 @@
 """
 from __future__ import annotations
 
-import uuid
-
 import networkx as nx
 
-from .geo import (haversine_m, lead_bearing, path_length_m,
+from .geo import (haversine_m, lead_bearing,
                   point_segment_dist_m, trail_bearing, turn_angle)
 from .graph import edge_coords
 from .profiles import Profile

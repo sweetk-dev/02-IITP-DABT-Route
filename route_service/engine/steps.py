@@ -350,7 +350,6 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
         return []
 
     raw = []
-    coord_cursor = 0
     for u, v in zip(path[:-1], path[1:]):
         data = G[u][v]
         coords = edge_coords(G, u, v)
