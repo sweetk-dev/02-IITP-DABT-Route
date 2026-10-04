@@ -222,3 +222,54 @@ def test_dead_end_join_blocked_when_it_newly_reaches_other_side():
     G.add_node("TS0", **_ll(180, -30)); G.add_edge("TS1", "TS0", length=64, slope=0.0, link_type="sidewalk")
     rep = rs.connect_dead_ends(G)
     assert not [r for r in rep if r["t"] == "TS2"], rep
+
+
+# ---- 분할 노드 ID (VARCHAR(20) 제한) ----
+
+def _dead_end_graph_long_ids():
+    """_dead_end_graph 와 같은 배치인데 도로 노드가 10자리 OSM ID 다."""
+    G = nx.Graph()
+    a, b = 3903318504, 4696341341
+    G.add_node(a, **_ll(0, 0))
+    G.add_node(b, **_ll(300, 0))
+    G.add_node("TA", **_ll(-10, 8))
+    G.add_node("TB", **_ll(40, 8))
+    G.add_edge(a, b, length=300, slope=1.0, link_type="road", link_name="예술공원로")
+    G.add_edge(a, "TA", length=12.8, slope=1.0, link_type="sidewalk", stitched=True)
+    G.add_edge("TA", "TB", length=50, slope=0.5, link_type="sidewalk")
+    return G, a, b
+
+
+def test_split_node_id_fits_db_column_with_ten_digit_ids():
+    """10자리 노드 ID 둘을 나눠도 분할 노드 ID 는 20자를 넘지 않는다."""
+    G, a, b = _dead_end_graph_long_ids()
+    rep = rs.connect_dead_ends(G)
+    assert len(rep) == 1 and rep[0]["split"]
+    s = rep[0]["target"]
+    assert isinstance(s, str) and s.startswith("S") and len(s) <= rs.MAX_NODE_ID_LEN == 20
+    assert G.has_edge(a, s) and G.has_edge(s, b) and G.nodes[s]["node_type"] == "split"
+    assert all(len(str(n)) <= 20 for n in G.nodes)
+
+
+def test_split_node_id_is_deterministic_and_order_independent():
+    G1, a, b = _dead_end_graph_long_ids()
+    G2, _, _ = _dead_end_graph_long_ids()
+    assert rs.connect_dead_ends(G1)[0]["target"] == rs.connect_dead_ends(G2)[0]["target"]
+    E = nx.Graph()
+    assert rs.split_node_id(E, a, b) == rs.split_node_id(E, b, a) == rs.split_node_id(E, str(b), str(a))
+    assert rs.split_node_id(E, a, b) != rs.split_node_id(E, a, b + 1)
+
+
+def test_split_node_id_avoids_existing_nodes():
+    """같은 링크 쌍의 ID 가 이미 그래프에 있으면 다른 ID 를 낸다. 이전 꼴("S<a>_<b>") 노드와도 공존한다."""
+    G = nx.Graph()
+    a, b = 3903318504, 4696341341
+    first = rs.split_node_id(G, a, b)
+    G.add_node(first)
+    G.add_node("S%s_%s" % (a, b))            # 이전 방식으로 만들어진 노드
+    second = rs.split_node_id(G, a, b)
+    G.add_node(second)
+    third = rs.split_node_id(G, a, b)
+    assert len({first, second, third}) == 3
+    assert all(len(x) <= 20 and x not in ("S%s_%s" % (a, b),) for x in (first, second, third))
+    assert rs.split_node_id(G, a, b) == third, "같은 그래프 상태면 같은 ID"

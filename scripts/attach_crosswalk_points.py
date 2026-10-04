@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from route_service.topomap import graphio  # noqa: E402
 
 
 def attach(G, features) -> dict:
@@ -54,7 +60,14 @@ def main():
     ap.add_argument("--graph", required=True)
     ap.add_argument("--crosswalks", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--overwrite-input", action="store_true",
+                    help="--graph 와 같은 경로에 저장하는 것을 허용한다(원본은 <경로>.bak 으로 남긴다)")
     args = ap.parse_args()
+    # 출력이 입력과 같은 경로면 계산 전에 멈춘다 — 입력 그래프를 그 자리에서 덮어쓰면 되돌릴 수 없다.
+    try:
+        graphio.check_output_path(args.out, args.graph, args.overwrite_input)
+    except graphio.GraphIOError as e:
+        ap.error(str(e))
     with open(args.graph, "rb") as f:
         G = pickle.load(f)
     with open(args.crosswalks, "r", encoding="utf-8") as f:
@@ -62,8 +75,8 @@ def main():
     before = (G.number_of_nodes(), G.number_of_edges())
     stat = attach(G, feats)
     assert before == (G.number_of_nodes(), G.number_of_edges())
-    with open(args.out, "wb") as f:
-        pickle.dump(G, f)
+    # 임시 파일에 쓴 뒤 교체한다 — 쓰는 도중 중단돼도 잘린 그래프 파일이 남지 않는다.
+    graphio.save_graph(G, args.out, input_path=args.graph, overwrite_input=args.overwrite_input)
     print("노드 %d곳에 횡단보도 %d건 기록 (원천에 없는 번호 %d / 길이 미기재 %d)"
           % (stat["nodes"], stat["points"], stat["missing"], stat["no_length"]))
     print("저장: %s  노드 %d / 링크 %d" % ((args.out,) + before))

@@ -130,7 +130,7 @@ class NetworkStore:
         self._meta = {}
         self._node_ids = []
         self._node_coords = []
-        self._components = {}     # (profile_id, max_slope) -> 최대 연결요소 노드 집합
+        self._components = {}     # _component_key(profile, max_slope) -> 최대 연결요소 노드 집합
 
     # ---- 로드 ----
     def load(self, path: str, version: str = "unknown", region: str = "") -> dict:
@@ -141,13 +141,17 @@ class NetworkStore:
         if not isinstance(G, nx.Graph):
             raise TypeError("network pickle 이 networkx.Graph 가 아닙니다")
         G = normalize_graph(G)
+        # 색인·메타를 먼저 다 만든 뒤에 한꺼번에 교체한다. 교체 도중에 예외가 나면(좌표 없는 노드 등
+        # 형식이 맞지 않는 파일) 새 그래프와 옛 색인이 섞인 상태로 남으므로, 실패 시에는 아무것도
+        # 바꾸지 않고 종전 그래프를 그대로 둔다.
+        node_ids = list(G.nodes())
+        node_coords = [(G.nodes[n]["lat"], G.nodes[n]["lon"]) for n in node_ids]
+        meta = self._build_meta(G, path, version, region)
         with self._lock:
             self._G = G
-            self._node_ids = list(G.nodes())
-            self._node_coords = [
-                (G.nodes[n]["lat"], G.nodes[n]["lon"]) for n in self._node_ids
-            ]
-            self._meta = self._build_meta(G, path, version, region)
+            self._node_ids = node_ids
+            self._node_coords = node_coords
+            self._meta = meta
             self._components = {}
         return self._meta
 
@@ -217,6 +221,53 @@ class NetworkStore:
         """(node_ids, coords) — 스냅용."""
         return self._node_ids, self._node_coords
 
+    @staticmethod
+    def _component_key(profile, max_slope_deg: float) -> tuple:
+        """연결요소 캐시 키 — 통행 가능 판정(`planner.edge_passable`)이 읽는 프로필 값 전부.
+
+        프로필 id 와 경사 상한만으로 키를 만들면, 요청 제약으로 `replace(profile, avoid=...)` 처럼
+        id 는 같고 판정 값만 다른 프로필이 들어왔을 때 그 결과가 기본 프로필의 캐시 자리에 들어가
+        (또는 기본 프로필 결과가 제약 요청에 쓰여) 스냅 후보 집합이 서로 뒤바뀐다.
+        `edge_passable` 이 읽는 필드는 avoid · min_width_m · requires_curb_cut ·
+        derived_min_confidence 와 인자 max_slope_deg 이다 — 그 함수가 읽는 필드가 늘면 여기도 늘린다.
+        avoid 는 순서·중복이 판정에 영향을 주지 않으므로 정렬한 튜플로 넣는다.
+        """
+        return (
+            profile.id,
+            round(float(max_slope_deg), 2),
+            tuple(sorted(str(a) for a in (profile.avoid or ()))),
+            float(getattr(profile, "min_width_m", 0.0) or 0.0),
+            bool(getattr(profile, "requires_curb_cut", False)),
+            float(getattr(profile, "derived_min_confidence", 0.0) or 0.0),
+        )
+
+    def invalidate_components(self) -> None:
+        """연결요소 캐시를 비운다 — 링크 통행성(blocked·curb_cut·width 등)을 바꾼 뒤 부른다."""
+        with self._lock:
+            self._components = {}
+
+    def update_graph(self, fn):
+        """그래프 속성을 고치는 함수 `fn(G)` 를 저장소 락 아래에서 실행하고 연결요소 캐시를 비운다.
+
+        오버라이드(통행 불가 승인·폭·턱낮춤 보정)의 적용·철회는 링크 통행성을 바꾼다. 캐시를
+        그대로 두면 `reachable_nodes` 가 바뀌기 전 연결요소를 계속 돌려줘, 막힌 링크 너머의
+        고립 조각에 스냅되거나 다시 열린 구간이 스냅 후보에서 빠진다.
+        같은 락을 쓰는 `load` · `reachable_nodes` 와는 서로 겹치지 않는다(연결요소 계산 도중
+        속성이 바뀌거나, 그래프 교체와 적용이 엇갈리는 것을 막는다). 경로 탐색 요청 전체를
+        이 락으로 감싸지는 않는다 — 요청은 그래프 사본으로 탐색하며, 락은 수정 구간에만 건다.
+
+        인자 fn: 그래프(nx.Graph)를 받아 제자리에서 고치는 함수. 반환값은 그대로 돌려준다.
+        실패 시: fn 이 올린 예외는 그대로 전파하되, 일부만 적용됐을 수 있으므로 캐시는 비운다.
+        그래프가 로드되지 않았으면 RuntimeError.
+        """
+        with self._lock:
+            if self._G is None:
+                raise RuntimeError("네트워크가 로드되지 않았습니다")
+            try:
+                return fn(self._G)
+            finally:
+                self._components = {}
+
     def reachable_nodes(self, profile, max_slope_deg: float) -> set:
         """프로필 제약을 적용했을 때 **서로 오갈 수 있는 최대 덩어리**의 노드 집합.
 
@@ -227,7 +278,7 @@ class NetworkStore:
         """
         import networkx as nx
 
-        key = (profile.id, round(float(max_slope_deg), 2))
+        key = self._component_key(profile, max_slope_deg)
         with self._lock:
             if key in self._components:
                 return self._components[key]

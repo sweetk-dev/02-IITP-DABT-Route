@@ -244,6 +244,10 @@ def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
         n = len(_uturn_edges(G, cand))
         if n < best_n:
             best_n, best_path = n, cand
+        else:
+            # 나아지지 않았으면 그만둔다. best_path 가 그대로면 다음 회차의 페널티 집합도 그대로여서
+            # 같은 탐색이 같은 결과로 남은 횟수만큼 되풀이될 뿐이다(A* 비용만 든다).
+            break
     primary = best_path
 
     routes = [primary]

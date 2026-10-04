@@ -22,7 +22,8 @@ from __future__ import annotations
 from ..engine.geo import haversine_m
 from . import buildings as poi_buildings
 from . import support as poi_support
-from .store import SOURCE_LABELS, SAME_BUILDING_M, _name_match_rank, _norm_name
+from .store import (SOURCE_LABELS, SAME_BUILDING_M, _addr_in_sigungu, _name_match_rank, _norm_name,
+                    sigungu_variants)
 
 FOOD_FACL_TYPES = ("일반음식점", "휴게음식점·제과점")
 ENTRY_ORDER = {"yes": 0, "unknown": 1, "no": 2}
@@ -154,15 +155,19 @@ def food_near(store, lat: float = None, lng: float = None, sigungu: str = "안�
     휠체어 출입이 확인된 곳 수 — "정보가 있는 곳이 몇 곳뿐" 을 정직하게 말하는 근거다.
     """
     items = [_from_listing(s) for s in store.list_food(sigungu)]
-    rows = poi_buildings.fetch_rows(store, types=FOOD_FACL_TYPES)
-    variants_ok = (sigungu or "").strip()
+    # 지역 대조는 관광 음식점 목록(store.list_food)과 같은 규칙을 쓴다 — 지역명에 행정단위
+    # 접미사를 붙인 토큰("안양시"/"안양군"/"안양구")이 주소에 있을 때만 그 지역으로 본다.
+    # 지역명 그대로의 부분일치("안양" in 주소)는 다른 시·군의 "안양면"·"안양동" 주소까지 포함한다.
+    # db 백엔드는 같은 토큰을 SQL 조건으로도 넘겨 전국 행을 읽지 않는다.
+    variants = sigungu_variants(sigungu)
+    rows = poi_buildings.fetch_rows(store, types=FOOD_FACL_TYPES, addr_variants=variants)
     for r in rows:
         b = poi_buildings.normalize(r)
         if b["lat"] is None or not b["named"]:
             continue
         if b["facl_type"] not in FOOD_FACL_TYPES:
             continue
-        if variants_ok and variants_ok not in (b["addr"] or ""):
+        if variants and not _addr_in_sigungu(b["addr"], variants):
             continue
         if _dup(b, items):
             continue

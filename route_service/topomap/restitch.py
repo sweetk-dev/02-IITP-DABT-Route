@@ -41,6 +41,13 @@ NO_JOIN_TYPES = ("crossing", "steps", "elevator", "underpass", "overpass")
 _KY = 110_540.0
 _CELL = 30.0
 
+# 분할 노드 ID — DB 의 mv_pednet_node.node_id / mv_pednet_link.f_node·t_node 가 VARCHAR(20) 이다
+# (scripts/sql/pednet_schema.sql). manual_links.MAX_NODE_ID_LEN 과 같은 제한.
+MAX_NODE_ID_LEN = 20
+# "S" + SHA-1 16진수 앞 15자 = 16자. 15자(60비트)면 분할 노드가 10만 개여도 우연히 겹칠 확률이
+# 10^-8 수준이고, 겹치더라도 split_node_id 가 그래프를 보고 피한다. 20자 한도까지 4자 여유를 둔다.
+_SPLIT_HASH_LEN = 15
+
 
 def _is_topo(n) -> bool:
     return str(n).startswith("T")
@@ -143,6 +150,33 @@ class _Index:
             if segments_cross(p, q, self.XY[a], self.XY[b]):
                 return True
         return False
+
+
+def split_node_id(G, a, b) -> str:
+    """링크 a–b 를 나눌 때 새로 만드는 노드의 ID. 20자 이하, 같은 입력이면 항상 같은 값.
+
+    두 끝점 ID 를 그대로 이어 "S<a>_<b>" 로 만들면 OSM 노드 ID(10자리) 둘일 때 22자가 되어
+    DB 컬럼 VARCHAR(20) 에 들어가지 않는다(적재 단계에서 오류). 그래서 정렬한 두 ID 를 이은 문자열의
+    SHA-1 앞부분을 쓴다 — 실행 환경·순서와 무관하게 결정적이다(파이썬 내장 hash 는 실행마다 달라 쓰지 않는다).
+
+    충돌 회피: 만든 ID 가 이미 그래프에 있으면(같은 링크 쌍을 다시 나누는 경우, 또는 해시가 겹친 경우)
+    일련번호 2, 3, … 을 해시 입력에 섞어 다음 후보를 만든다. 이전 방식으로 만들어진 "S<a>_<b>" 꼴
+    노드가 그래프에 남아 있어도 문제없다 — 그 ID 는 '_' 를 포함하고 새 ID 는 16진수뿐이라 꼴이 겹치지
+    않으며, 설령 같더라도 위 검사로 피한다.
+
+    인자: G(그래프), a·b(나눌 링크의 두 끝 노드 ID — 순서 무관).
+    반환: G 에 없는 새 노드 ID 문자열.
+    """
+    import hashlib
+    lo, hi = sorted((str(a), str(b)))
+    i = 1
+    while True:
+        seed = "%s|%s" % (lo, hi) if i == 1 else "%s|%s|%d" % (lo, hi, i)
+        nid = "S" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:_SPLIT_HASH_LEN]
+        assert len(nid) <= MAX_NODE_ID_LEN
+        if nid not in G:
+            return nid
+        i += 1
 
 
 def _w(a, b, e):
@@ -302,11 +336,7 @@ def connect_dead_ends(G, max_m: float = DEADEND_MAX_M) -> list:
         before = _snapshot(G0, idx, t)
         split = target is None
         if split:
-            target = "S%s_%s" % tuple(sorted((str(a), str(b))))
-            i = 1
-            while target in G:
-                i += 1
-                target = "S%s_%s_%d" % (tuple(sorted((str(a), str(b)))) + (i,))
+            target = split_node_id(G, a, b)      # 20자 이하·결정적·기존 노드와 겹치지 않음
             G.add_node(target, lat=q[1] / _KY, lon=q[0] / idx.kx, node_type="split")
             L = float(e.get("length") or _dist(idx.XY[a], idx.XY[b]))
             G.remove_edge(a, b)

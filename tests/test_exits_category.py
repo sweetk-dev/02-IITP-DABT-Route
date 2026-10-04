@@ -290,3 +290,55 @@ def test_nearest_rank_percentile_and_error_split():
     ])
     s = m.summary()["paths"]["/x"]
     assert s["count"] == 2 and s["error_cnt"] == 1 and s["p95_ms"] == 300.0 and s["p50_ms"] == 100.0
+
+
+# ── 하차 안내 판정은 역 설비 전체로 ─────────────────────────────
+def test_egress_uses_full_facility_list_not_truncated_brief(client, tmp_path):
+    """출구 승강기가 6대를 넘는 역 — 목록 뒤쪽의 승강장 승강기도 하차 안내에 쓰인다."""
+    import route_service.api.main as m
+    elevators = [{"exit_no": str(i), "detail_loc": "%d번 출입구 옆" % i} for i in range(1, 8)]
+    elevators += [{"exit_no": "내부", "detail_loc": "(1F) 안양역 방향 승강장 1-1"},
+                  {"exit_no": "내부", "detail_loc": "(1F) 금정역 방향 승강장 10-4"}]
+    (tmp_path / "poi" / "station_facilities.json").write_text(json.dumps([
+        {"stn_cd": "ST-M", "stn_name": "명학", "elevator_cnt": 9, "dis_toilet_yn": "Y", "elevators": elevators},
+    ], ensure_ascii=False), encoding="utf-8")
+    m.poi_store.STORE._cache.clear()
+    m._FAC_CACHE.clear()
+    r = client.post("/route/plan", json={
+        "origin": {"lat": 37.3901, "lng": 126.9501},
+        "destination": {"type": "tour", "poi_id": "TBF-1"},
+        "profile": "wheelchair_electric", "mode": "walk_subway"})
+    assert r.status_code == 200, r.text
+    sub = [l for l in r.json()["routes"][0]["legs"] if l["kind"] == "subway"][0]
+    assert sub["alight"]["name"] == "명학"
+    eg = sub["egress"]
+    assert any("금정역 방향" in line for line in eg["inside"]), eg["inside"]
+    assert [p["side"] for p in eg["platform"]] == ["opposite", "arrival"]
+    # 응답의 설비 요약은 종전대로 6건까지만 싣는다
+    assert len(sub["alight"]["facilities"]["elevators"]) == 6
+    assert sub["alight"]["facilities"]["elevator_cnt"] == 9
+
+
+def test_station_facility_lookup_failure_is_cached_only_briefly(client, monkeypatch):
+    """조회 실패는 30초만 기억한다 — 성공 결과는 10분."""
+    import route_service.api.main as m
+    m._FAC_CACHE.clear()
+    st = {"poi_id": "ST-M", "name": "명학"}
+    calls = []
+    real = m.poi_store.STORE.station_facilities
+
+    def flaky(stn_cd="", name=""):
+        calls.append(name)
+        if len(calls) == 1:
+            raise RuntimeError("db down")
+        return real(stn_cd=stn_cd, name=name)
+    monkeypatch.setattr(m.poi_store.STORE, "station_facilities", flaky)
+    assert m._station_facilities_cached(st) is None
+    assert m._station_facilities_cached(st) is None and len(calls) == 1, "바로 다시 조회하지는 않는다"
+    key = ("ST-M", "명학")
+    m._FAC_CACHE[key] = (m._FAC_CACHE[key][0] - (m._FAC_FAIL_TTL_SEC + 1), None)     # 31초 경과
+    fac = m._station_facilities_cached(st)
+    assert fac and len(calls) == 2, "실패는 짧게만 캐시하고 다시 조회한다"
+    m._FAC_CACHE[key] = (m._FAC_CACHE[key][0] - (m._FAC_FAIL_TTL_SEC + 1), fac)      # 성공은 31초 뒤에도 유효
+    assert m._station_facilities_cached(st) is fac and len(calls) == 2
+    assert m._FAC_FAIL_TTL_SEC < m._FAC_TTL_SEC

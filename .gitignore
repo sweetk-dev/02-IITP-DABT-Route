@@ -43,6 +43,11 @@ data/dem/
 data/terrain/
 data/poi/*.json
 results/
+# 수치지형도 파생 레이어 (scripts/build_topomap_layers.py 산출 — 보도 면형·장애물 geojson)
+data/topomap_layers/
+# 주행 GPS 트랙·분석 산출 (scripts/analyze_tracks.py 입력/출력 — 위치 원자료)
+tracks*.json
+track_analysis*.json
 
 # 계측 로그(#73) — 볼륨에 append 되는 이벤트 파일
 data/metrics/

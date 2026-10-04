@@ -113,3 +113,38 @@ def test_repo_links_file_is_valid():
     ids = [l["id"] for l in links]
     assert len(ids) == len(set(ids)) and len(ids) >= 6
     ml.validate_links(links)          # 레포 목록은 항상 검사를 통과해야 한다
+
+
+def test_validate_rejects_swapped_or_far_geometry():
+    """geometry 가 [lon, lat] 로 뒤집히거나 끝점에서 멀리 떨어진 점을 담으면 거부한다."""
+    import pytest
+    base = {"id": "G-01", "from": {"lat": 37.4184789, "lon": 126.9087988},
+            "to": {"lat": 37.4188986, "lon": 126.9092237}, "link_type": "sidewalk"}
+    ok = dict(base, geometry=[[37.4186, 126.9089], [37.4188, 126.9091]])
+    ml.validate_links([ok])
+    swapped = dict(base, geometry=[[126.9089, 37.4186], [126.9091, 37.4188]])       # [lon, lat]
+    with pytest.raises(ml.ManualLinkError, match="좌표 범위 밖"):
+        ml.validate_links([swapped])
+    far = dict(base, geometry=[[37.4186, 126.9089], [37.5186, 126.9089]])           # 약 11km 밖
+    with pytest.raises(ml.ManualLinkError, match="끝점에서"):
+        ml.validate_links([far])
+    not_number = dict(base, geometry=[["a", "b"]])
+    with pytest.raises(ml.ManualLinkError):
+        ml.validate_links([not_number])
+    # 두 끝점이 모두 node 참조면 geometry 첫 점을 기준으로 흩어짐만 본다
+    by_node = {"id": "G-02", "from": {"node": 1}, "to": {"node": 2}}
+    ml.validate_links([dict(by_node, geometry=[[37.4186, 126.9089], [37.4188, 126.9091]])])
+    with pytest.raises(ml.ManualLinkError, match="끝점에서"):
+        ml.validate_links([dict(by_node, geometry=[[37.4186, 126.9089], [37.9, 126.9089]])])
+    with pytest.raises(ml.ManualLinkError, match="좌표 범위 밖"):
+        ml.validate_links([dict(by_node, geometry=[[126.9089, 37.4186]])])
+
+
+def test_valid_geometry_still_applies():
+    G = _graph()
+    p = G.nodes[1]
+    rep = ml.apply_manual_links(G, [{"id": "G-03", "from": {"node": 1}, "to": {"node": 3},
+                                     "geometry": [[p["lat"], p["lon"]]]}])
+    ml.validate_links([{"id": "G-03", "from": {"node": 1}, "to": {"node": 3},
+                        "geometry": [[p["lat"], p["lon"]]]}])
+    assert rep[0]["status"] == "added" and G.edges[1, 3]["geometry"] == [(p["lat"], p["lon"])]

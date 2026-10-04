@@ -91,7 +91,15 @@ def main():
     ap.add_argument("--src-5k", help="1:5,000 도엽 폴더 (8자리 도엽번호, 폴백)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--radius", type=float, default=MATCH_RADIUS)
+    ap.add_argument("--overwrite-input", action="store_true",
+                    help="--graph 와 같은 경로에 저장하는 것을 허용한다(원본은 <경로>.bak 으로 남긴다)")
     args = ap.parse_args()
+    # 출력이 입력과 같은 경로면 도엽을 읽기 전에 멈춘다 — 입력 그래프를 그 자리에서 덮어쓰면 되돌릴 수 없다.
+    from route_service.topomap import graphio
+    try:
+        graphio.check_output_path(args.out, args.graph, args.overwrite_input)
+    except graphio.GraphIOError as e:
+        ap.error(str(e))
 
     from pyproj import Transformer
     from shapely.geometry import Point
@@ -179,8 +187,8 @@ def main():
         d["topo_source"] = tier
 
     print("[3/3] 저장")
-    with open(args.out, "wb") as f:
-        pickle.dump(G, f)
+    # 임시 파일에 쓴 뒤 교체한다 — 쓰는 도중 중단돼도 잘린 그래프 파일이 남지 않는다.
+    graphio.save_graph(G, args.out, input_path=args.graph, overwrite_input=args.overwrite_input)
     print(f"  링크 {stat['edges']} / 기존 폭 보유 {stat['had_width']}"
           f" / 폭 신규 채움 {stat['filled_width']} / 재질 채움 {stat['filled_surface']}")
     print(f"  매칭 계층: {stat['by_tier']}")

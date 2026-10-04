@@ -147,8 +147,14 @@ _COLS = ("facl_id, facl_name, facl_type, addr, latitude, longitude, entrance_ram
          "guide_facility_yn, eval_info_raw, base_dt")
 
 
-def fetch_rows(store, lat=None, lng=None, radius_m=None, name_q: str = "", types=None) -> list:
-    """실태조사 행. 좌표가 있으면 bbox, 이름이 있으면 ILIKE, 유형 목록이 있으면 그 유형만."""
+def fetch_rows(store, lat=None, lng=None, radius_m=None, name_q: str = "", types=None,
+               addr_variants=None) -> list:
+    """실태조사 행. 좌표가 있으면 bbox, 이름이 있으면 ILIKE, 유형 목록이 있으면 그 유형만.
+
+    addr_variants: 주소에 들어 있어야 하는 시·군·구 토큰 목록(`store.sigungu_variants` 결과,
+    예 ["안양시", "안양군", "안양구"]). db 백엔드에서는 SQL 조건으로 걸러 전국 행을 읽지 않는다.
+    file 백엔드는 걸러 주지 않으므로 호출 측이 같은 토큰으로 한 번 더 대조한다.
+    """
     if store.backend == "none":
         return []
     if store.backend == "file":
@@ -167,6 +173,12 @@ def fetch_rows(store, lat=None, lng=None, radius_m=None, name_q: str = "", types
     if types:
         params["types"] = list(types)
         where.append("facl_type = ANY(:types)")
+    if addr_variants:
+        ors = []
+        for i, v in enumerate(addr_variants):
+            params["ad%d" % i] = v
+            ors.append("COALESCE(addr, '') LIKE '%%' || :ad{0} || '%%'".format(i))
+        where.append("(%s)" % " OR ".join(ors))
     try:
         return store._query("SELECT %s FROM poi_facility_accessibility WHERE %s"
                             % (_COLS, " AND ".join(where)), params)

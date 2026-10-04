@@ -18,7 +18,8 @@
                 앞 항목이 만든 노드에도 스냅되므로 **목록 순서가 결과를 정한다** — 같은 지점을 여러 링크가 쓰면
                 그 지점을 만드는 항목을 먼저 둔다. 스냅은 거리만 본다(층·선로 구분 없음) — 반경을 작게 둔다
   geometry    : [[lat, lon], ...] — 이 레포의 링크 geometry 규약(GeoJSON 의 [lon, lat] 이 아니다)
-목록은 load_links() 에서 validate_links() 로 검사한다(필수 키·link_type·좌표 범위·id 중복·노드 ID 길이 20자).
+목록은 load_links() 에서 validate_links() 로 검사한다(필수 키·link_type·좌표 범위·id 중복·노드 ID 길이 20자·
+geometry 좌표 범위와 끝점 대비 거리).
 링크 속성
   topo_source="manual", manual_id, confidence, source, note — 정제 링크(derived)와 달리
   프로필별 활성 하한(derived_min_confidence)을 받지 않는다. 사람이 확인한 링크이기 때문이다.
@@ -35,6 +36,11 @@ DEFAULT_SNAP_M = 5.0
 _KY = 110_540.0
 LINK_TYPES = ("sidewalk", "crossing", "elevator", "ramp", "road", "steps", "overpass", "underpass")
 MAX_NODE_ID_LEN = 20          # mv_pednet_node.node_id VARCHAR(20)
+# geometry 의 각 점이 끝점(또는 geometry 첫 점)에서 떨어질 수 있는 최대 거리(m).
+# 수동 링크는 역 통로·광장·끊긴 보도를 잇는 짧은 연결이고, 보행망에서 가장 긴 링크도 수백 m 다
+# (접합 보강 설명에 나오는 가장 긴 도로 링크가 746m). 1km 를 넘는 점은 자릿수 오타나 다른 지점의
+# 좌표를 붙여 넣은 것으로 본다. 이런 점이 들어가면 링크 길이(_length)가 수 km~수천 km 로 계산된다.
+GEOMETRY_MAX_FROM_ENDPOINT_M = 1000.0
 
 
 class ManualLinkError(ValueError):
@@ -81,6 +87,42 @@ def validate_links(links: list) -> None:
         geom = it.get("geometry")
         if geom is not None and (not isinstance(geom, list) or any(len(pt) != 2 for pt in geom)):
             raise ManualLinkError("%s: geometry 는 [[lat, lon], ...]" % lid)
+        if geom:
+            _check_geometry(it, lid, geom)
+
+
+def _check_geometry(it: dict, lid: str, geom: list) -> None:
+    """geometry 좌표를 검사한다 — 문제가 있으면 ManualLinkError.
+
+    이 레포의 geometry 규약은 [lat, lon] 인데 GeoJSON 은 [lon, lat] 이라 순서를 뒤집어 넣기 쉽다.
+    점 개수만 보면 뒤집힌 값도 통과하고, 그대로 적용되면 링크 길이가 수천 km 로 계산되며 지도에도
+    엉뚱한 곳에 그려진다. 두 가지를 본다.
+      1) 좌표 범위: 위도 −90~90, 경도 −180~180. 국내 좌표(위도 33~39, 경도 124~132)는 순서가
+         뒤집히면 위도 자리에 124 이상이 와서 여기서 걸린다.
+      2) 끝점 대비 거리: 각 점이 기준점에서 GEOMETRY_MAX_FROM_ENDPOINT_M 안에 있어야 한다.
+         기준점은 lat/lon 으로 준 끝점(from·to)이다. 두 끝점이 모두 node 참조라 좌표를 알 수 없으면
+         geometry 첫 점을 기준으로 삼아 점들이 서로 흩어져 있지 않은지만 본다(그래프 없이 하는 검사라
+         노드 좌표는 쓰지 않는다).
+    """
+    pts = []
+    for i, pt in enumerate(geom):
+        try:
+            lat, lon = float(pt[0]), float(pt[1])
+        except (TypeError, ValueError):
+            raise ManualLinkError("%s: geometry[%d] 가 숫자 쌍이 아니다: %r" % (lid, i, pt))
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ManualLinkError("%s: geometry[%d] 좌표 범위 밖 (%s, %s) — 순서는 [lat, lon] 이다"
+                                  % (lid, i, lat, lon))
+        pts.append((lat, lon))
+    refs = [(float(ep["lat"]), float(ep["lon"])) for ep in (it["from"], it["to"])
+            if "node" not in ep]
+    if not refs:
+        refs = [pts[0]]
+    for i, (lat, lon) in enumerate(pts):
+        d = min(haversine_m(lat, lon, r[0], r[1]) for r in refs)
+        if d > GEOMETRY_MAX_FROM_ENDPOINT_M:
+            raise ManualLinkError("%s: geometry[%d] (%s, %s) 가 끝점에서 %.0fm 떨어져 있다(상한 %.0fm) — "
+                                  "순서는 [lat, lon] 이다" % (lid, i, lat, lon, d, GEOMETRY_MAX_FROM_ENDPOINT_M))
 
 
 def _node_id(G, lid: str, side: str):
