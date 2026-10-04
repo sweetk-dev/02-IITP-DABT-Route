@@ -20,8 +20,6 @@ WALL = "wall"
 FENCE = "fence"
 FURNITURE = "street_furniture"
 
-# 신설 링크가 이 분류와 교차하면 무조건 배제한다 (설계서 H3·H4).
-BLOCKING = (STAIRS, WALL, FENCE)
 # 관통 길이가 이 값 이상이면 "링크가 계단을 지난다"고 본다.
 STAIRS_CROSS_MIN_M = 3.0
 # 재분류 판정 가드 (실측 2026-09-04)

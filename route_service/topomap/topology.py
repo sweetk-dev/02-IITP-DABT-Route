@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import math
-from collections import defaultdict
 
 from shapely.geometry import LineString, Point
 
@@ -172,7 +171,6 @@ def build_topology(feats: list[dict], to_wgs84, tol: float = SNAP_TOL,
         cpts = [coords[i] for i in sorted(coords)]
         cids = sorted(coords)
         ct = cKDTree(cpts)
-        seq = len(edges)
         for i, j in ct.query_pairs(bridge_gap):
             a, b = cids[i], cids[j]
             if G.has_edge(a, b):

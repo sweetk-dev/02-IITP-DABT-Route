@@ -799,19 +799,6 @@ class PoiStore:
                 return r
         return None
 
-    def get_entrance(self, poi_id: str):
-        """무장애 출입구 좌표. 없으면 시설 대표 좌표로 대체(fallback 표기)."""
-        spot = self.get_tour_spot(poi_id)
-        if spot is None:
-            return None
-        ent = spot.get("entrance")
-        if ent and ent.get("lat") is not None:
-            return {"lat": float(ent["lat"]), "lng": float(ent["lng"]),
-                    "source": "accessible_entrance"}
-        if spot["lat"] is None:
-            return None
-        return {"lat": spot["lat"], "lng": spot["lng"], "source": "facility_centroid"}
-
     def recommend_tour(self, disabilities: list, sigungu: str = "안양",
                        match_mode: str = "all", topk: int = 10,
                        origin_lat: float = None, origin_lng: float = None,
@@ -1293,9 +1280,7 @@ class PoiStore:
         return out
 
     def resolve_destination(self, dest_type: str, poi_id: str):
-        """목적지 유형별 좌표 해석. tour 는 무장애 출입구 우선."""
-        if dest_type == "tour":
-            return self.get_entrance(poi_id)
+        """목적지 유형별 좌표 해석(역·정류장). tour 는 호출부(api/main.py)가 출입구 해석까지 직접 처리한다."""
         pool = (self._stations() if dest_type == "transit_station"
                 else self._stops(poi_id=poi_id))
         for s in pool:

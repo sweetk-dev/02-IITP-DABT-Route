@@ -29,7 +29,6 @@ REASONS = {
     "blocked": "통행 불가(공사 등)",
     "etc": "기타",
 }
-REPORT_STATUSES = ("new", "confirmed", "rejected", "applied")
 OVERRIDE_ATTRS = ("warning", "curb_cut", "tactile_paving", "width", "passable")
 # 승인제 속성 — 관리자 액션(apply)으로만 생성 가능
 APPROVAL_ONLY_ATTRS = ("curb_cut", "tactile_paving", "width", "passable")

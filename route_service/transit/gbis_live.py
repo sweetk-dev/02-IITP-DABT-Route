@@ -28,6 +28,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from ..engine.geo import haversine_m
+
 logger = logging.getLogger("route_api.gbis")
 
 ARRIVAL_PATH = "/busarrivalservice/v2/getBusArrivalListv2"
@@ -142,16 +144,6 @@ def _str(v):
         return None
     s = str(v).strip()
     return s or None
-
-
-def _dist_m(lat1, lon1, lat2, lon2) -> float:
-    import math
-    r = 6371008.8
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp = p2 - p1
-    dl = math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
 
 
 class GbisLive:
@@ -274,7 +266,7 @@ class GbisLive:
             # 형상이 순환·왕복이면 같은 정류장 근처를 두 번 지난다 — 후보를 전부 모아 승차<하차 인 가장 짧은 쌍을 고른다
             out = []
             for i, (a, b) in enumerate(line):
-                d = _dist_m(lat, lng, a, b)
+                d = haversine_m(lat, lng, a, b)
                 if d <= max_snap_m:
                     out.append((i, d))
             return out

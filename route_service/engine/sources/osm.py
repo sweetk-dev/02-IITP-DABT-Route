@@ -40,7 +40,6 @@ def classify_link(tags: dict) -> str:
     footway = _as_str(tags.get("footway")) or ""
     bridge = _as_str(tags.get("bridge")) or ""
     tunnel = _as_str(tags.get("tunnel")) or ""
-    conveying = _as_str(tags.get("conveying")) or ""
 
     if hw == "steps":
         # 에스컬레이터(highway=steps + conveying)도 계단으로 분류한다. "ramp" 로 두면 휠체어

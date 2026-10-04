@@ -263,10 +263,6 @@ def _platform_by_direction(d, facilities: dict) -> list:
     return out
 
 
-def _kind_ko(kind: str) -> str:
-    return "승강기" if kind == "elevator" else "휠체어리프트"
-
-
 def egress_guide(station_name: str, board_name: str, facilities: dict, exit_sel: dict,
                  travel: str = None) -> dict:
     """하차 후 안내 — 역 안(승강장) 기준 문장 목록과 역 밖(출구) 기준 문장.

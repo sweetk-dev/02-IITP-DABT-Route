@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import Polygon
 from shapely.ops import unary_union
 from shapely.strtree import STRtree
 
@@ -33,34 +33,6 @@ def _to_polygon(points, parts):
     return None if poly.is_empty else poly
 
 
-def dissolve_polys(records: list[dict]) -> tuple[list, STRtree, list[dict]]:
-    """records: [{'points':..., 'parts':..., 'attrs':{...}, 'sheet':...}]
-
-    반환: (스트립 폴리곤 목록, 원본 STRtree, 원본 record 목록)
-    """
-    polys, srcs = [], []
-    for r in records:
-        p = _to_polygon(r["points"], r["parts"])
-        if p is None:
-            continue
-        polys.append(p)
-        srcs.append(r)
-    if not polys:
-        return [], None, []
-    merged = unary_union([p.buffer(SNAP_BUFFER) for p in polys])
-    strips = list(merged.geoms) if merged.geom_type == "MultiPolygon" else [merged]
-    strips = [s.buffer(-SNAP_BUFFER) for s in strips]
-    out = []
-    for s in strips:
-        if s.is_empty:
-            continue
-        if s.geom_type == "MultiPolygon":
-            out.extend([g for g in s.geoms if not g.is_empty and g.area > 1.0])
-        elif s.area > 1.0:
-            out.append(s)
-    return out, STRtree(polys), srcs
-
-
 def grid_centerlines(poly_records: list[dict], cell: float = 800.0,
                      pad: float = 60.0, verbose: bool = True) -> list[dict]:
     """보도 폴리곤 레코드 -> 중심선 피처 목록 (격자 분할 스켈레톤화).
@@ -74,7 +46,6 @@ def grid_centerlines(poly_records: list[dict], cell: float = 800.0,
     이웃 셀의 골격과 경계에서 정확히 만나고, 끝점 스냅으로 이어진다.
     """
     from .centerline import poly_to_centerlines
-    from .extract import _mk, SIDEWALK_AREA
     from shapely.geometry import box
 
     polys, srcs = [], []

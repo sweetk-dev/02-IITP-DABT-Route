@@ -108,10 +108,6 @@ class _Index:
         self.XY[v] = p
         self.nodes.setdefault(self._c(p), set()).add(v)
 
-    def remove_node(self, v):
-        p = self.XY.pop(v)
-        self.nodes[self._c(p)].discard(v)
-
     def add_edge(self, a, b):
         k = frozenset((a, b))
         for c in self._cells(a, b):
