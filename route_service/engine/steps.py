@@ -78,10 +78,31 @@ def _maneuver_from_angle(angle: float) -> str:
     return "sharp_left" if a >= SHARP else "left"
 
 
+def _maneuver_from_carried(angle: float) -> str:
+    """짧은 링크를 거치며 누적된 회전각(정규화하지 않은 합, 양수=우) → maneuver.
+
+    - 합이 ±180° 이내면 `_maneuver_from_angle` 과 같다(종전 동작).
+    - 합의 절댓값이 180° 를 넘으면(같은 쪽으로 연달아 꺾은 경우) ±180° 로 접어 좌우를 뒤집지 않는다.
+      예: 우 120° → 8m 링크 → 우 120° 는 합 240° 이고, 접으면 −120°(급좌회전)가 되지만
+      이용자는 실제로 오른쪽으로 두 번 돈다. "급좌회전"을 들으면 반대쪽으로 돌게 된다.
+      · 접은 값이 유턴 기준(150° 이상)이면 결과적으로 되돌아 나가는 것이므로 유턴(좌우 구분 없음).
+      · 그 밖에는 누적된 방향 그대로의 급회전(sharp_right / sharp_left) — 기존 maneuver 체계에서
+        "그 방향으로 크게 돈다"를 나타내는 가장 큰 값이다.
+    """
+    if abs(angle) <= 180.0:
+        return _maneuver_from_angle(angle)
+    folded = (angle + 180.0) % 360.0 - 180.0
+    if abs(folded) >= 150.0:
+        return "uturn"
+    return "sharp_right" if angle > 0 else "sharp_left"
+
+
 def _edge_warnings(data: dict, profile: Profile) -> list:
     out = []
     slope = float(data["slope"])
-    short = float(data.get("length") or 0.0) < SHORT_LINK_M
+    # 가상 링크(출발·도착 투영으로 잘린 링크)는 원 링크 길이로 본다 — 긴 급경사 링크의 일부를
+    # 짧게 지난다고 "짧은 구간 경사 추정"으로 낮춰 말하지 않는다(planner.slope_ref_length 와 같은 기준).
+    short = float(data.get("orig_length") or data.get("length") or 0.0) < SHORT_LINK_M
     if slope > profile.max_slope_deg:
         if short:
             out.append("짧은 구간 경사 추정 %.1f도" % slope)   # 격자 보간 오차 가능 — 확정 표현을 피한다 (v1.20.0)
@@ -382,10 +403,9 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
         else:
             turn_here = turn_angle(prev_out, seg["in_bearing"])
             pending_angle += turn_here
-            # 이월각을 더한 뒤 ±180° 범위로 되돌린다. 짧은 링크를 사이에 두고 같은 쪽으로 두 번
-            # 꺾으면 합이 180° 를 넘는데(예: 우 120° + 우 120° = 240°), 실제 진행 방향 변화는
-            # 좌 120° 다. 되돌리지 않으면 150° 이상이라는 이유로 유턴으로 안내된다.
-            pending_angle = (pending_angle + 180.0) % 360.0 - 180.0
+            # 이월각은 ±180° 로 접지 않고 합 그대로 들고 간다. 짧은 링크를 사이에 두고 같은 쪽으로
+            # 두 번 꺾으면 합이 180° 를 넘는데(예: 우 120° + 우 120° = 240°), 접으면 −120° 가 되어
+            # 실제로는 오른쪽으로 도는 길이 "급좌회전"으로 안내된다. 판정은 _maneuver_from_carried 가 한다.
             if special:
                 # 특수 링크는 링크 종류로 안내한다(종전과 동일). 이월각은 여기서 정리한다.
                 maneuver = "straight"
@@ -394,7 +414,7 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
                 # 짧은 링크의 회전은 안내하지 않고 다음으로 이월 — 아래 merge 로 앞 스텝에 흡수된다.
                 maneuver = "straight"
             else:
-                maneuver = _maneuver_from_angle(pending_angle)
+                maneuver = _maneuver_from_carried(pending_angle)
                 pending_angle = 0.0
 
         # 노드 부착 횡단보도 안내 — 경로 중간 노드(seg 시작점).

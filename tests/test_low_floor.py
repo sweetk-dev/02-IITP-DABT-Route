@@ -11,7 +11,7 @@ import datetime
 import json
 import os
 import sys
-import time
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -397,20 +397,15 @@ def test_gbis_incomplete_read_and_non_dict_json_are_unavailable_not_exception():
 
 
 class _FakeLive(gbis_live.GbisLive):
-    """조회마다 delay 초가 걸리는 가짜 실시간 — mode 'fail'(실패)·'ok'(저상 확인)·'raise'(예외)."""
+    """조회 메서드를 통째로 바꾼 가짜 실시간 — mode 'fail'(실패)·'ok'(저상 확인)·'raise'(예외)."""
 
-    def __init__(self, delay=0.0, mode="fail"):
+    def __init__(self, mode="fail"):
         super().__init__(api_key="k")
-        self.delay, self.mode = delay, mode
+        self.mode = mode
         self.arr_calls, self.loc_calls, self.line_calls = [], [], []
-
-    def _wait(self):
-        if self.delay:
-            time.sleep(self.delay)
 
     def arrivals(self, station_id, route_id=None, route_meta=None):
         self.arr_calls.append(str(station_id))
-        self._wait()
         if self.mode == "raise":
             raise RuntimeError("boom")
         if self.mode == "fail":
@@ -424,13 +419,91 @@ class _FakeLive(gbis_live.GbisLive):
 
     def locations(self, route_id, stop_index=None):
         self.loc_calls.append(str(route_id))
-        self._wait()
         return {"status": "unavailable", "reason": "down", "route_id": str(route_id), "vehicles": [], "low_floor_cnt": 0}
 
     def route_line(self, route_id):
         self.line_calls.append(str(route_id))
-        self._wait()
         return []
+
+
+class _Clock:
+    """가짜 단조 시계 — 벽시계 sleep 없이 "조회 한 건이 d 초 걸렸다"를 흉내 낸다.
+
+    시각은 스레드마다 따로 흐른다. 예산(LiveBudget)은 조회를 실행한 스레드에서 시작·끝 시각을 읽어
+    걸린 시간을 재므로, 동시 조회(작업 스레드 여러 개)에서도 건별 소요가 정확히 delay 로 잡힌다.
+    """
+
+    def __init__(self):
+        self._tl = threading.local()
+
+    def __call__(self):
+        return getattr(self._tl, "t", 0.0)
+
+    def sleep(self, sec):
+        self._tl.t = self() + float(sec)
+
+
+LOW_STOP = 4            # busy_client 의 승차 후보 중 저상 차량이 오는 정류장(BS-4, 노선 R4) — 가까운 순 5번째
+
+
+class _FakeGbis:
+    """`GbisLive(fetch=...)` 에 넣는 가짜 외부 API — 실제 캐시·타임아웃 상한 경로를 그대로 탄다.
+
+    조회 한 건에 delay 초(가짜 시계)가 걸린다. 걸린 타임아웃(설정 3초와 예산 상한 중 작은 값)보다
+    오래 걸리면 타임아웃만큼 기다린 뒤 TimeoutError 를 올린다(mode="timeout" 이면 항상).
+    BS-4 에만 저상 차량이 오고, 나머지 정류장은 일반 차량 2대 + 노선에 운행 중인 저상 차량 없음이다.
+    """
+    TIMEOUT_SEC = 3.0   # GbisLive 기본 timeout_sec 과 같다
+
+    def __init__(self, clock, delay=0.0, mode="ok"):
+        self.clock, self.delay, self.mode = clock, delay, mode
+        self.calls = []
+
+    def kinds(self):
+        return ["arr" if "busarrivalservice" in u else "loc" if "buslocationservice" in u else "line"
+                for u in self.calls]
+
+    def __call__(self, url):
+        self.calls.append(url)
+        cap = gbis_live._TIMEOUT_CAP.get()
+        timeout = self.TIMEOUT_SEC if cap is None else min(self.TIMEOUT_SEC, float(cap))
+        if self.mode == "timeout" or self.delay > timeout:
+            self.clock.sleep(timeout)
+            raise TimeoutError("timed out")
+        self.clock.sleep(self.delay)
+        q = url.split("?", 1)[1]
+        if "busarrivalservice" in url:
+            sid = [p for p in q.split("&") if p.startswith("stationId=")][0].split("=")[1]
+            i = int(sid.split("-")[1])
+            low = (1, 1) if i == LOW_STOP else (0, 0)
+            return _arrival_body(sid, "R%d" % i, str(i), low, (15, 20))
+        rid = [p for p in q.split("&") if p.startswith("routeId=")][0].split("=")[1]
+        if "buslocationservice" in url:
+            return _location_body(rid, [0, 0])
+        if rid == "R%d" % LOW_STOP:      # 노선형상 — 승차(BS-4)·하차(BS-D) 정류장을 지나는 선
+            return {"response": {"msgHeader": {"resultCode": 0}, "msgBody": {"busRouteLineList": [
+                {"lineSeq": 1, "x": 126.9502, "y": 37.39008}, {"lineSeq": 2, "x": 126.9507, "y": 37.3899},
+                {"lineSeq": 3, "x": 126.9512, "y": 37.3900}]}}}
+        return {"response": {"msgHeader": {"resultCode": 4}, "msgBody": None}}
+
+
+def _use_fake_gbis(client, monkeypatch, delay=0.0, mode="ok", budget_sec=None):
+    """busy_client 에 가짜 외부 API 와 가짜 시계를 건다. 반환: (fake, 이 요청들이 만든 예산 목록)."""
+    clock = _Clock()
+    fake = _FakeGbis(clock, delay, mode)
+    client.main.gbis_live.LIVE = gbis_live.GbisLive(api_key="k", fetch=fake, cache_ttl_sec=60)
+    budgets = []
+    real = gbis_live.LiveBudget
+
+    def make(*a, **kw):
+        kw.setdefault("clock", clock)
+        if budget_sec is not None:
+            kw.setdefault("budget_sec", budget_sec)
+        b = real(*a, **kw)
+        budgets.append(b)
+        return b
+    monkeypatch.setattr(client.main.gbis_live, "LiveBudget", make)
+    return fake, budgets
 
 
 N_BOARD_STOPS = 8
@@ -488,12 +561,6 @@ def busy_client(tmp_path, monkeypatch):
         yield c
 
 
-def _timed_plan(client, **extra):
-    t0 = time.perf_counter()
-    r = _plan(client, **extra)
-    return r, time.perf_counter() - t0
-
-
 def _count_searches(client, monkeypatch):
     radii = []
     orig = client.main.transit.search
@@ -506,37 +573,175 @@ def _count_searches(client, monkeypatch):
 
 
 def test_plan_time_is_bounded_when_realtime_times_out(busy_client, monkeypatch):
-    """실시간이 건당 0.25초씩 걸리며 전부 실패 — 정류장 수만큼 쌓이지 않고, 확장 탐색도 하지 않는다."""
-    live = _FakeLive(delay=0.25, mode="fail")
-    busy_client.main.gbis_live.LIVE = live
+    """외부 API 가 응답하지 않을 때 — 첫 묶음(동시 4건)이 타임아웃되면 남은 조회를 하지 않는다."""
+    fake, budgets = _use_fake_gbis(busy_client, monkeypatch, mode="timeout")
     radii = _count_searches(busy_client, monkeypatch)
-    r, elapsed = _timed_plan(busy_client, realtime=True)
+    r = _plan(busy_client, realtime=True)
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["low_floor"]["tier"] == 0 and body["low_floor"]["expanded_radius"] is False
     assert body["routes"][0]["summary"]["warnings"][0].startswith("실시간 저상버스 정보를 확인하지 못했습니다")
-    n_calls = len(live.arr_calls) + len(live.loc_calls) + len(live.line_calls)
-    assert len(live.arr_calls) == gbis_live.CONSECUTIVE_FAIL_LIMIT, live.arr_calls
-    assert live.loc_calls == []
-    # 실시간 조회 누적은 예산 + 최소 타임아웃을 넘지 않는다 — 조회 수 × 0.25초(정류장 8곳이면 2초 이상)가 아니다
-    assert n_calls * 0.25 <= gbis_live.REQUEST_BUDGET_SEC + gbis_live.MIN_CALL_TIMEOUT_SEC
-    assert elapsed < 1.5, "계획 소요 %.2fs (실시간 조회 %d회)" % (elapsed, n_calls)
+    assert fake.kinds() == ["arr"] * gbis_live.PARALLEL_CALLS, fake.kinds()
+    # 실시간 조회에 쓴 시간은 "조회 수 × 타임아웃"(4 × 3초)이 아니라 한 묶음의 타임아웃 한 번이다
+    assert len(budgets) == 1
+    assert budgets[0].spent_sec <= gbis_live.REQUEST_BUDGET_SEC + gbis_live.MIN_CALL_TIMEOUT_SEC
+    assert budgets[0].spent_sec == pytest.approx(3.0)
     assert radii == [None], "실시간을 못 받았을 때는 반경 확장 탐색을 하지 않는다: %s" % radii
     bus = _bus(r)
     assert bus["realtime"]["status"] == "unavailable" and bus["realtime"]["items"] == []
+    assert bus["geometry_source"] == "stops"
 
 
-def test_plan_time_is_bounded_when_realtime_is_slow_but_alive(busy_client, monkeypatch):
-    """응답은 오지만 느린 경우 — 누적 시간이 예산을 넘으면 남은 조회를 생략한다."""
-    monkeypatch.setattr(gbis_live, "REQUEST_BUDGET_SEC", 0.5)
-    live = _FakeLive(delay=0.2, mode="ok")
-    busy_client.main.gbis_live.LIVE = live
-    r, elapsed = _timed_plan(busy_client)
+@pytest.mark.parametrize("delay", [0.15, 0.30, 0.50])
+def test_slow_but_alive_realtime_still_picks_low_floor_stop(busy_client, monkeypatch, delay):
+    """외부 API 가 정상이지만 느릴 때(건당 0.15~0.5초)도 저상 차량이 오는 정류장(BS-4)을 고른다.
+
+    후보 6곳의 도착정보 2묶음 + 위치정보 5노선 2묶음 + 선택 경로의 노선형상 1건 = 조회 5회 분량의
+    시간에 끝난다. 후보별로 도착정보·위치정보·노선형상을 차례로 조회하면 17회 분량이 들어, 예산 안에
+    BS-4 의 도착정보를 받지 못하고 가까운 일반버스 정류장이 선택된다.
+    """
+    fake, budgets = _use_fake_gbis(busy_client, monkeypatch, delay=delay)
+    r = _plan(busy_client, realtime=True)
     assert r.status_code == 200, r.text
-    n_calls = len(live.arr_calls) + len(live.loc_calls) + len(live.line_calls)
-    assert n_calls == 3, "0.2초 × 3회에서 예산 0.5초를 넘긴다: %d" % n_calls
-    assert elapsed < 1.5, "계획 소요 %.2fs" % elapsed
-    assert r.json()["low_floor"]["tier"] == 1, "예산 안에 확인된 저상 후보는 그대로 쓴다"
+    body, bus = r.json(), _bus(r)
+    assert body["low_floor"]["tier"] == 1
+    assert bus["board"]["poi_id"] == "BS-%d" % LOW_STOP and bus["route"]["route_id"] == "R%d" % LOW_STOP
+    assert bus["low_floor"]["tier"] == 1 and bus["low_floor"]["source"] == "arrivals"
+    # 선택된 leg 의 실시간 정보는 판정에 쓴 응답과 같은 것(캐시)이다 — "실시간 불가"가 아니다
+    assert bus["realtime"]["status"] == "success"
+    assert bus["realtime"]["next_low_floor"]["route_id"] == "R%d" % LOW_STOP
+    assert bus["geometry_source"] == "gbis_line", "선택된 경로의 지도선은 예산이 남으면 노선형상으로 그린다"
+    kinds = fake.kinds()
+    assert kinds == ["arr"] * 6 + ["loc"] * 5 + ["line"], kinds
+    assert not any("routeId=R%d" % LOW_STOP in u for u in fake.calls if "buslocationservice" in u), \
+        "도착정보로 저상이 확인된 노선은 위치정보를 조회하지 않는다"
+    assert budgets[0].spent_sec == pytest.approx(5 * delay)
+    assert budgets[0].spent_sec <= gbis_live.REQUEST_BUDGET_SEC
+
+
+def test_budget_used_up_mid_way_keeps_confirmed_candidates_and_cached_realtime(busy_client, monkeypatch):
+    """예산이 도중에 끝나는 경우(예산 0.5초, 건당 0.2초) — 받은 응답까지로 판정하고 남은 조회는 생략한다."""
+    fake, budgets = _use_fake_gbis(busy_client, monkeypatch, delay=0.2, budget_sec=0.5)
+    r = _plan(busy_client, realtime=True)
+    assert r.status_code == 200, r.text
+    bus = _bus(r)
+    # 도착정보 2묶음(0.4초) → 위치정보 첫 묶음(0.6초)에서 예산을 넘긴다. 남은 위치정보·노선형상은 생략.
+    assert fake.kinds() == ["arr"] * 6 + ["loc"] * 4, fake.kinds()
+    assert budgets[0].spent_sec == pytest.approx(0.6)
+    assert r.json()["low_floor"]["tier"] == 1 and bus["board"]["poi_id"] == "BS-%d" % LOW_STOP
+    assert bus["realtime"]["status"] == "success", "예산이 끝났어도 캐시에 있는 도착정보는 붙인다"
+    assert bus["geometry_source"] == "stops", "노선형상은 예산이 없으면 조회하지 않고 정류장 직선으로 둔다"
+    assert budgets[0].cache_hit_cnt >= 1
+
+
+def test_healthy_realtime_ranking_matches_candidate_by_candidate_judging(busy_client, monkeypatch):
+    """지연이 없으면 미리 받기(동시 조회)를 거친 판정·정렬이 후보를 하나씩 순서대로 조회한 것과 같다."""
+    m = busy_client.main
+    profile = m._profile_or_400("wheelchair_manual")
+    origin, tgt = (37.3900, 126.9500), (37.3909, 126.9511)
+
+    def ranked(prefetch: bool):
+        fake, _ = _use_fake_gbis(busy_client, monkeypatch)
+        cands = m.transit.search(origin, tgt, "walk_bus",
+                                 stops_near=lambda la, ln, rad: m.poi_store.STORE.stops_near(la, ln, rad),
+                                 stations=[], route_ok=m.transit.low_bus_route_ok)
+        judge = low_floor.LowFloorJudge(m.gbis_live.LIVE, m.poi_store.STORE, now=1)
+        if not prefetch:
+            judge.prefetch = lambda items: None          # 후보별 순차 조회만 남긴다
+        out = m._rank_low_floor(cands, judge, profile, origin)
+        return [(c["parts"][1]["board"]["poi_id"], c["low_floor"]["tier"], c["low_floor"]["source"],
+                 c["low_floor"].get("wait_sec")) for c in out], fake
+    a, fake_a = ranked(True)
+    b, fake_b = ranked(False)
+    assert a == b and len(a) == tp.MAX_CANDIDATE_STOPS
+    assert a[0][:2] == ("BS-%d" % LOW_STOP, 1) and {t for _s, t, _src, _w in a[1:]} == {3}
+    assert sorted(fake_a.calls) == sorted(fake_b.calls), "조회 대상도 같다(순서만 도착정보 먼저)"
+    k = fake_a.kinds()
+    assert k == sorted(k), "도착정보를 전부 받은 뒤에 위치정보를 받는다: %s" % k
+
+
+def test_route_line_is_queried_only_for_selected_leg_and_cached_line_is_used_for_candidates(busy_client, monkeypatch):
+    fake, budgets = _use_fake_gbis(busy_client, monkeypatch)
+    assert _bus(_plan(busy_client))["geometry_source"] == "gbis_line"
+    assert fake.kinds().count("line") == 1 and "routeId=R%d" % LOW_STOP in fake.calls[-1]
+    # 두 번째 요청 — 형상이 캐시에 있으므로 조회 없이 후보 단계에서 바로 쓴다
+    n = len(fake.calls)
+    assert _bus(_plan(busy_client))["geometry_source"] == "gbis_line"
+    assert fake.calls[n:] == [], "20초 캐시 안의 같은 요청은 외부 조회를 하지 않는다"
+    assert budgets[1].spent_sec == 0.0 and budgets[1].cache_hit_cnt >= 6
+
+
+def test_cached_responses_are_used_after_budget_is_exhausted():
+    """예산이 끝난 판정기도 캐시에 있는 응답은 쓴다 — 캐시에 없는 대상만 생략한다."""
+    calls = []
+
+    def fetch(url):
+        calls.append(url)
+        if "busarrivalservice" in url:
+            return _arrival_body("S1", "R6", "6", (0, 0), (15, 20))
+        return _location_body("R6", [0, 1])
+    live = gbis_live.GbisLive(api_key="k", fetch=fetch, cache_ttl_sec=60)
+    first = low_floor.LowFloorJudge(live, _Store({"R6": 40}))
+    j1 = first.judge(_part(seq_from=5), 60)
+    assert len(calls) == 2
+    spent = gbis_live.LiveBudget()
+    spent.spent_sec = spent.budget_sec                    # 예산을 다 쓴 요청
+    judge = low_floor.LowFloorJudge(live, _Store({"R6": 40}), budget=spent)
+    j2 = judge.judge(_part(seq_from=5), 60)
+    assert (j2["tier"], j2["source"], j2["stops_away"]) == (j1["tier"], j1["source"], j1["stops_away"])
+    assert j2["tier"] in (2, 3) and len(calls) == 2, "캐시 적중은 외부 조회가 아니다"
+    assert judge.realtime_unavailable is False and spent.cache_hit_cnt == 2 and spent.spent_sec == spent.budget_sec
+    assert judge.judge(_part(station="S9"), 60)["tier"] == 0 and len(calls) == 2
+    assert judge.arrivals("S9").get("skipped") is True
+
+
+def test_timeout_under_shortened_cap_is_not_cached():
+    """예산 때문에 줄어든 타임아웃으로 난 실패는 전역 캐시에 남기지 않는다 — 직후의 단독 조회가 정상 조회된다."""
+    state = {"down": True, "n": 0}
+
+    def fetch(url):
+        state["n"] += 1
+        if state["down"]:
+            raise TimeoutError("timed out")
+        return _arrival_body("S1", "R6", "6", (1, 1), (5, 9))
+    live = gbis_live.GbisLive(api_key="k", fetch=fetch, timeout_sec=3.0, cache_ttl_sec=60)
+    b = gbis_live.LiveBudget(budget_sec=3.0)
+    b.spent_sec = 2.8                                     # 남은 예산 0.2초 → 타임아웃 상한 0.5초(최소값)
+    assert b.call(live.arrivals, "S1")["status"] == "unavailable"
+    state["down"] = False
+    assert live.arrivals("S1")["status"] == "success", "줄어든 타임아웃의 실패가 캐시돼 있으면 조회 없이 불가가 된다"
+    assert state["n"] == 2
+    # 정상 타임아웃(3초)으로 난 실패는 종전대로 짧게 캐시한다 — 장애 중 폴링이 외부를 두드리지 않게
+    state["down"] = True
+    assert live.arrivals("S2")["status"] == "unavailable"
+    assert gbis_live.LiveBudget(budget_sec=3.0).call(live.arrivals, "S3")["status"] == "unavailable"   # 상한 3초 = 정상값
+    state["down"] = False
+    assert live.arrivals("S2")["status"] == "unavailable" and live.arrivals("S3")["status"] == "unavailable"
+    assert state["n"] == 4
+
+
+def test_call_many_charges_slowest_call_and_caps_timeout_in_workers():
+    """동시 조회 한 묶음은 건별 합이 아니라 가장 오래 걸린 한 건만큼 예산을 쓴다."""
+    from concurrent.futures import ThreadPoolExecutor
+    clock = _Clock()
+    b = gbis_live.LiveBudget(budget_sec=3.0, clock=clock)
+    b.spent_sec = 1.0
+    caps = []
+
+    def job(sec, boom=False):
+        def run():
+            caps.append(gbis_live._TIMEOUT_CAP.get())
+            clock.sleep(sec)
+            if boom:
+                raise RuntimeError("boom")
+            return {"status": "success", "sec": sec}
+        return run
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        out = b.call_many(pool, [job(0.2), job(0.7), job(0.1, boom=True), job(0.4)])
+    assert [o.get("sec") if isinstance(o, dict) else type(o).__name__ for o in out] == [0.2, 0.7, "RuntimeError", 0.4]
+    assert b.spent_sec == pytest.approx(1.7)
+    assert caps == [pytest.approx(2.0)] * 4, "작업 스레드에도 남은 예산이 타임아웃 상한으로 걸린다"
+    assert gbis_live._TIMEOUT_CAP.get() is None
 
 
 def test_plan_with_healthy_realtime_queries_every_candidate(busy_client):
@@ -567,3 +772,66 @@ def test_realtime_exception_does_not_break_plan(busy_client):
         assert r.status_code == 200, r.text
         rt = _bus(r)["realtime"]
         assert rt["status"] == "unavailable" and rt["items"] == [] and rt["next_low_floor"] is None
+
+
+def test_batch_failure_count_does_not_depend_on_result_order():
+    """동시에 보낸 묶음에서 일부만 실패하면 순서와 무관하게 다음 조회를 계속한다.
+
+    정류장 두 곳만 오류인 부분 장애에서 "성공, 성공, 실패, 실패" 순서로 결과가 오면 건별 집계는
+    연속 실패 2건이 되어 남은 정류장·위치정보 조회를 전부 생략했다. 묶음에 성공이 하나라도 있으면
+    연속 실패를 0 으로 본다.
+    """
+    from route_service.transit import gbis_live, low_floor
+
+    calls = []
+
+    class _Live:
+        enabled = True
+
+        def arrivals(self, sid, route_meta=None):
+            calls.append(sid)
+            if sid in ("S3", "S4"):
+                return {"status": "unavailable", "reason": "boom", "items": []}
+            return {"status": "success", "items": []}
+
+        def locations(self, rid):
+            calls.append("loc:" + rid)
+            return {"status": "success", "vehicles": []}
+
+    class _Store:
+        def stop_route_meta(self, key):
+            return {}
+
+    judge = low_floor.LowFloorJudge(_Live(), _Store(), budget=gbis_live.LiveBudget())
+    items = [({"board": {"poi_id": "S%d" % i, "lat": 37.0, "lng": 127.0},
+               "route": {"route_id": "R%d" % i, "name": str(i)}}, float(i)) for i in range(1, 7)]
+    judge.prefetch(items)
+    # 첫 묶음(S1~S4)의 뒤 두 건이 실패했어도 둘째 묶음(S5·S6)까지 조회한다
+    assert {"S5", "S6"} <= set(calls)
+
+
+def test_prefetch_swallows_unexpected_errors(monkeypatch):
+    """미리 받기 단계의 예외는 경로 계획을 실패시키지 않는다(판정 단계에서 개별 처리)."""
+    from route_service.transit import gbis_live, low_floor
+
+    class _Live:
+        enabled = True
+
+        def arrivals(self, sid, route_meta=None):
+            return {"status": "success", "items": []}
+
+        def locations(self, rid):
+            return {"status": "success", "vehicles": []}
+
+    class _Store:
+        def stop_route_meta(self, key):
+            return {}
+
+    def _boom(*a, **k):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(low_floor, "ThreadPoolExecutor", _boom)
+    judge = low_floor.LowFloorJudge(_Live(), _Store(), budget=gbis_live.LiveBudget())
+    items = [({"board": {"poi_id": "S%d" % i, "lat": 37.0, "lng": 127.0},
+               "route": {"route_id": "R%d" % i, "name": str(i)}}, float(i)) for i in range(1, 4)]
+    judge.prefetch(items)       # 예외가 올라오지 않아야 한다

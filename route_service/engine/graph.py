@@ -42,6 +42,14 @@ LINK_TYPES = (
     "underpass", "ramp", "elevator", "unknown",
 )
 
+# 연결요소 캐시(NetworkStore._components) 항목 수 상한.
+# 키는 (프로필 id, 경사 상한, avoid, 최소 폭, 턱낮춤 요구, 정제 링크 하한) 조합이다. 기본 프로필 5종 ×
+# 경사 단계(하드·완화) 2~3개에 요청 제약(avoid·경사 상한 지정) 변형 몇 개면 평소 10여 개다.
+# 요청 제약의 경사 상한·최소 폭은 임의 실수라 조합 수에 끝이 없으므로 상한을 둔다. 항목 하나가
+# 노드 id 집합(수만 개)이라 크게 잡지 않는다 — 넘치면 먼저 들어온 것부터 버리고, 버려진 조합은
+# 다음 요청 때 다시 계산한다(결과는 같고 계산 시간만 든다).
+COMPONENT_CACHE_MAX = 32
+
 EDGE_DEFAULTS = {
     "length": 0.0,
     "slope": 0.0,
@@ -231,11 +239,16 @@ class NetworkStore:
         `edge_passable` 이 읽는 필드는 avoid · min_width_m · requires_curb_cut ·
         derived_min_confidence 와 인자 max_slope_deg 이다 — 그 함수가 읽는 필드가 늘면 여기도 늘린다.
         avoid 는 순서·중복이 판정에 영향을 주지 않으므로 정렬한 튜플로 넣는다.
+
+        avoid 는 요청 제약(constraints.avoid)으로 임의 문자열이 들어올 수 있다. 그대로 키에 넣으면
+        요청마다 다른 문자열로 캐시 항목이 끝없이 늘어난다. 그래프의 link_type 은 로드할 때
+        LINK_TYPES 안의 값으로 맞춰지고(`normalize_graph`) 그 뒤에 얹는 링크도 같은 값만 쓰므로, 그 밖의 문자열은 어떤 링크와도 일치하지
+        않아 판정에 영향이 없다 — 알려진 링크 유형과의 교집합만 키에 넣는다(판정 결과는 같다).
         """
         return (
             profile.id,
             round(float(max_slope_deg), 2),
-            tuple(sorted(str(a) for a in (profile.avoid or ()))),
+            tuple(sorted({str(a) for a in (profile.avoid or ())} & set(LINK_TYPES))),
             float(getattr(profile, "min_width_m", 0.0) or 0.0),
             bool(getattr(profile, "requires_curb_cut", False)),
             float(getattr(profile, "derived_min_confidence", 0.0) or 0.0),
@@ -292,6 +305,9 @@ class NetworkStore:
                     H.add_edge(u, v)
             comps = list(nx.connected_components(H))
             main = max(comps, key=len) if comps else set()
+            # 항목 수 상한 — dict 는 넣은 순서를 지키므로 맨 앞이 가장 먼저 들어온 항목이다.
+            while len(self._components) >= COMPONENT_CACHE_MAX:
+                self._components.pop(next(iter(self._components)))
             self._components[key] = main
             return main
 

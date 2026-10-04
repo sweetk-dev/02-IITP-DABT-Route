@@ -4,6 +4,7 @@
   1) 캐시 키는 통행 가능 판정이 읽는 프로필 값 전부를 포함한다 — id 가 같아도 avoid·폭·턱낮춤·
      정제 링크 신뢰도 하한이 다르면 서로 다른 결과를 돌려준다
   2) 오버라이드 적용·철회로 링크 통행성이 바뀌면 캐시를 비운다
+  3) 요청 제약의 avoid 에 든 임의 문자열은 키에 넣지 않고, 항목 수에는 상한이 있다
 """
 from dataclasses import replace
 
@@ -52,6 +53,34 @@ def test_cache_key_covers_every_field_edge_passable_reads():
     a = st.reachable_nodes(replace(base, avoid=("steps", "overpass")), 8.0)
     b = st.reachable_nodes(replace(base, avoid=("overpass", "steps")), 8.0)
     assert a is b
+
+
+def test_unknown_avoid_strings_do_not_add_cache_entries():
+    """알려진 링크 유형이 아닌 avoid 문자열은 어떤 링크와도 일치하지 않는다 — 같은 캐시 항목을 쓴다."""
+    st = _store()
+    base = st.reachable_nodes(WM, 8.0)
+    for i in range(50):
+        got = st.reachable_nodes(replace(WM, avoid=tuple(WM.avoid) + ("x-%d" % i, "STEPS ")), 8.0)
+        assert got is base
+    assert len(st._components) == 1
+    # 알려진 유형은 종전대로 구분된다
+    assert st.reachable_nodes(replace(WM, avoid=("x-1",)), 5.0) == {"N1", "N2", "N3", "N4"}
+    assert st.reachable_nodes(WM, 5.0) == {"N1", "N2", "N3"}
+
+
+def test_component_cache_size_is_bounded_and_drops_oldest():
+    """경사 상한을 요청마다 달리 줘도 항목 수가 상한을 넘지 않고, 먼저 들어온 것부터 버린다."""
+    from route_service.engine import graph as g
+    st = _store()
+    first = st.reachable_nodes(WM, 1.0)
+    for i in range(g.COMPONENT_CACHE_MAX + 20):
+        st.reachable_nodes(WM, 2.0 + i * 0.01)
+        assert len(st._components) <= g.COMPONENT_CACHE_MAX
+    assert len(st._components) == g.COMPONENT_CACHE_MAX
+    last_key = st._component_key(WM, 2.0 + (g.COMPONENT_CACHE_MAX + 19) * 0.01)
+    assert last_key in st._components and st._component_key(WM, 1.0) not in st._components
+    again = st.reachable_nodes(WM, 1.0)                  # 버려진 조합은 다시 계산해 같은 결과를 낸다
+    assert again == first and again is not first
 
 
 def test_override_apply_and_revert_invalidate_component_cache():
