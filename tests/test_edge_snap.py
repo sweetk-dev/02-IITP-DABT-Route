@@ -263,3 +263,78 @@ def test_api_same_link_trip_has_no_uturn(client):
     assert [s["maneuver"] for s in route["steps"]] == ["depart", "arrive"]
     assert not any("유턴" in s["instruction"] for s in route["steps"])
     assert 35 <= route["steps"][0]["distance_m"] <= 46
+
+
+# ── 가상 링크의 짧은 구간 경사 예외 — 원 링크 길이로 판정 ─────────────────
+def _steep_graph(length=100.0, slope=9.0):
+    """A ──(sidewalk, 경사 slope 도, 동서 length m)── B. 수동 휠체어 하드 상한은 8도다."""
+    G = nx.Graph()
+    G.add_node("A", lat=37.3900, lon=126.9500, node_type="intersection")
+    G.add_node("B", lat=37.3900, lon=126.9500 + 0.0023 * length / 203.0, node_type="intersection")
+    G.add_edge("A", "B", **_edge(length=length, slope=slope))
+    return G
+
+
+def _attach_pair(st, t0, t1, span_lng):
+    """링크의 t0·t1 지점(남쪽 4m)에 출발·도착 가상 노드를 붙인 사본과 두 노드 id."""
+    H = vsnap.virtual_graph(st)
+    ids = []
+    for tag, t in (("o", t0), ("d", t1)):
+        c = vsnap.candidates(st, 37.3900 - 0.00004, 126.9500 + span_lng * t, WM, WM.hard_slope() + 4.0,
+                             allowed=set(st.graph.nodes))[0]
+        ids.append(vsnap.attach(H, c, "V_%s_0" % tag))
+    return H, ids[0], ids[1]
+
+
+def test_virtual_link_on_long_steep_link_is_not_treated_as_short_link():
+    """경사 9도 100m 링크의 40m→50m 지점: 직결 링크는 10m 지만 경사는 100m 링크에서 잰 값이다.
+
+    짧은 링크 예외(15m 미만은 경사로 막지도 경고하지도 않음)를 잘린 길이로 적용하면 하드 상한 8도를
+    넘는 구간이 완화 표기·경고 없이 통과한다 — 원 링크 길이로 판정해야 한다.
+    """
+    from route_service.engine import planner
+    from route_service.engine.steps import build_steps
+    st = _store(_steep_graph())
+    H, o, d = _attach_pair(st, 0.4, 0.5, 0.0023 * 100.0 / 203.0)
+    direct = H[o][d]
+    assert direct["length"] == pytest.approx(10.0, abs=1.0), "거리 계산용 길이는 실제(짧아진) 길이 그대로"
+    assert direct["orig_length"] == 100.0
+    assert H["A"][o]["orig_length"] == 100.0 and H[o]["B"]["orig_length"] == 100.0, "분할 링크에도 남는다"
+    assert "orig_length" not in st.graph["A"]["B"], "공유 그래프의 실제 링크에는 붙이지 않는다"
+    assert not planner.edge_passable(direct, WM, WM.hard_slope())
+    assert planner.edge_passable(direct, WM, WM.hard_slope() + 2.0)
+
+    # 완화 허용 — 경로는 나오되 완화 사실과 경사 경고가 함께 나온다
+    res = planner.plan(st, o, d, WM, 1, relax=True, graph=H)
+    assert res["fallback"]["used"] is True and res["fallback"]["applied_max_slope_deg"] == 10.0
+    r = res["routes"][0]
+    assert r["path"] == [o, d]
+    assert r["summary"]["total_distance_m"] == pytest.approx(10.0, abs=1.5)
+    assert any("권장 경사" in w for w in r["summary"]["warnings"]), r["summary"]["warnings"]
+    steps = build_steps(H, r["path"], WM)
+    assert any("경사 9.0도 (권장" in w for w in steps[0]["warnings"]), steps[0]["warnings"]
+    assert not any("짧은 구간 경사 추정" in w for w in steps[0]["warnings"])
+    assert steps[0]["distance_m"] == pytest.approx(10.0, abs=1.5)
+
+    # 완화 금지 — 원 링크를 그대로 지날 때와 같이 통행 불가
+    with pytest.raises(planner.NoRouteError):
+        planner.plan(st, o, d, WM, 1, relax=False, graph=H)
+    with pytest.raises(planner.NoRouteError):
+        planner.plan(st, "A", "B", WM, 1, relax=False)
+
+
+def test_real_short_steep_link_keeps_short_link_exception():
+    """실제 그래프의 짧은 링크(12m, 경사 9도)와 그 위의 가상 링크는 종전대로 막지도 경고하지도 않는다."""
+    from route_service.engine import planner
+    from route_service.engine.steps import build_steps
+    st = _store(_steep_graph(length=12.0))
+    assert planner.edge_passable(st.graph["A"]["B"], WM, WM.hard_slope())
+    res = planner.plan(st, "A", "B", WM, 1, relax=False)
+    assert res["fallback"]["used"] is False
+    assert not any("권장 경사" in w for w in res["routes"][0]["summary"]["warnings"])
+    H, o, d = _attach_pair(st, 0.25, 0.75, 0.0023 * 12.0 / 203.0)
+    assert o != d and H[o][d]["orig_length"] == 12.0
+    res = planner.plan(st, o, d, WM, 1, relax=False, graph=H)
+    assert res["fallback"]["used"] is False and res["routes"][0]["path"] == [o, d]
+    assert not any("권장 경사" in w for w in res["routes"][0]["summary"]["warnings"])
+    assert any("짧은 구간 경사 추정" in w for w in build_steps(H, [o, d], WM)[0]["warnings"])

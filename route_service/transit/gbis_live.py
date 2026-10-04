@@ -22,6 +22,7 @@ import contextvars
 import http.client
 import json
 import logging
+import socket
 import threading
 import time
 import urllib.error
@@ -50,18 +51,25 @@ STATE_LABEL = {0: "이동 중", 1: "정류소 도착", 2: "정류소 출발"}
 # 호출 측(경로 API 클라이언트)은 6초에 요청을 끊고, 연속으로 끊기면 한동안 호출 자체를 막는다 —
 # 실시간을 못 붙인 것이 경로 안내 전체의 실패로 번진다.
 #
-# REQUEST_BUDGET_SEC: 계획 한 건이 실시간 조회에 쓸 수 있는 누적 시간. 호출 측 제한 6초에서
-#   보행 경로 계산·DB 조회 몫을 넉넉히(약 4초) 남기도록 2초로 둔다. 정상 응답은 건당 0.1~0.3초라
-#   후보 8개 안팎의 조회는 이 안에 끝난다.
+# REQUEST_BUDGET_SEC: 계획 한 건이 실시간 조회(실제 네트워크 호출)에 쓸 수 있는 시간. 호출 측 제한
+#   6초에서 보행 경로 계산·DB 조회·응답 전송 몫으로 약 3초를 남기고 3초를 준다.
+#   2초일 때는 외부 API 가 정상이지만 느린 구간(건당 0.3~0.5초)에서 후보 정류장을 다 확인하기 전에
+#   예산이 끝나, 저상버스가 오는 정류장이 "판정 불가"로 밀리고 일반버스 정류장이 선택됐다.
+#   캐시에 있는 응답을 쓰는 것은 시간이 들지 않으므로 예산과 무관하게 허용한다(GbisLive.*_cached).
 # CONSECUTIVE_FAIL_LIMIT: 연속 실패가 이 횟수에 이르면 그 요청의 남은 조회를 생략한다.
 #   1회는 특정 정류장·노선만의 일시 오류일 수 있어 한 번 더 확인하고, 서로 다른 대상에서
 #   2회 연속이면 서비스 쪽 장애로 본다(즉시 거절·한도 초과처럼 빨리 실패하는 경우에도
-#   남은 대상마다 외부 API 를 두드리지 않는다).
+#   남은 대상마다 외부 API 를 두드리지 않는다). 동시 조회(call_many)는 한 묶음을 다 보낸 뒤에
+#   세므로, 장애 때 실제로 나가는 조회는 한 묶음(PARALLEL_CALLS)까지다.
 # MIN_CALL_TIMEOUT_SEC: 예산이 거의 남지 않았을 때 조회 한 번에 주는 최소 타임아웃. 이보다 짧으면
 #   정상 응답도 끊긴다. 따라서 실시간 조회 누적 시간의 상한은 예산 + 이 값이다.
-REQUEST_BUDGET_SEC = 2.0
+# PARALLEL_CALLS: 후보 정류장 도착정보·노선 위치정보를 한 번에 몇 건씩 동시에 조회할지.
+#   후보 정류장은 6~10곳이라 4건씩이면 2~3묶음, 즉 조회 2~3회 분량의 시간에 끝난다. 더 키우면
+#   외부 API 에 순간 요청이 몰리므로(개발계정 한도·초당 제한) 4로 둔다.
+REQUEST_BUDGET_SEC = 3.0
 CONSECUTIVE_FAIL_LIMIT = 2
 MIN_CALL_TIMEOUT_SEC = 0.5
+PARALLEL_CALLS = 4
 
 # LiveBudget.call() 이 실행 중인 조회에 적용할 타임아웃 상한(초). None 이면 상한 없음.
 # 조회 메서드의 시그니처를 바꾸지 않고 `_http_get` 까지 전달하기 위해 컨텍스트 변수로 둔다.
@@ -76,8 +84,16 @@ class LiveBudget:
     False 가 되고, 호출 측은 남은 대상을 조회하지 않고 "실시간 불가"로 처리한다.
     실시간이 정상이면 예산에 닿지 않으므로 결과는 예산이 없을 때와 같다.
 
-    요청마다 새로 만든다(요청 사이에 공유하지 않는다). 한 요청은 한 스레드에서 순차로
-    조회하므로 잠금은 두지 않는다.
+    예산은 실제 네트워크 호출에만 든다. 캐시에 남아 있는 응답은 예산이 끝난 뒤에도 쓸 수 있고
+    (GbisLive.arrivals_cached 등 — 호출 측이 `allow()` 가 False 일 때 따로 확인한다),
+    그렇게 쓴 건수는 `cache_hit_cnt` 로 센다.
+
+    요청마다 새로 만든다(요청 사이에 공유하지 않는다). 집계 값(spent_sec·fail_streak 등)은
+    요청을 처리하는 스레드 하나에서만 고친다 — `call_many` 의 작업 스레드는 조회를 실행하고
+    걸린 시간을 돌려줄 뿐 집계에 손대지 않으므로 잠금을 두지 않는다.
+
+    clock: 단조 시계 함수(초). 테스트에서 가짜 시계를 넣는다. `call_many` 는 조회를 실행한
+    스레드에서 시작·끝 시각을 읽으므로, 가짜 시계는 스레드별로 따로 흘러도 된다.
     """
 
     def __init__(self, budget_sec: float = None, fail_limit: int = None, clock=time.monotonic):
@@ -88,6 +104,7 @@ class LiveBudget:
         self.fail_streak = 0          # 연속 실패 횟수(성공하면 0 으로)
         self.ok_cnt = 0               # 성공한 조회 수
         self.skipped_cnt = 0          # 예산·연속 실패로 생략한 조회 수
+        self.cache_hit_cnt = 0        # 조회 없이 캐시의 성공 응답을 쓴 건수(예산과 무관)
 
     def skip_reason(self):
         """조회를 생략해야 하는 이유(문자열). 조회해도 되면 None."""
@@ -106,7 +123,7 @@ class LiveBudget:
         실행 동안 조회 타임아웃을 남은 예산(최소 MIN_CALL_TIMEOUT_SEC)으로 낮춘다 — 예산이
         0.3초 남은 시점에 3초짜리 조회가 시작돼 예산을 크게 넘기는 일을 막는다.
         """
-        cap = max(self.budget_sec - self.spent_sec, MIN_CALL_TIMEOUT_SEC)
+        cap = self.timeout_cap()
         token = _TIMEOUT_CAP.set(cap)
         t0 = self._clock()
         try:
@@ -114,6 +131,47 @@ class LiveBudget:
         finally:
             self.spent_sec += max(self._clock() - t0, 0.0)
             _TIMEOUT_CAP.reset(token)
+
+    def timeout_cap(self) -> float:
+        """지금 시작하는 조회 한 번에 줄 타임아웃 상한(초) — 남은 예산, 최소 MIN_CALL_TIMEOUT_SEC."""
+        return max(self.budget_sec - self.spent_sec, MIN_CALL_TIMEOUT_SEC)
+
+    def call_many(self, pool, thunks: list) -> list:
+        """조회 여러 건을 스레드풀에서 동시에 실행한다(한 묶음).
+
+        인자
+          pool   : concurrent.futures.ThreadPoolExecutor — 묶음 크기 이상의 작업 스레드를 가진 풀.
+                   요청 단위로 만든 풀을 넘긴다(여러 요청이 풀을 나눠 쓰면 대기 시간이 섞인다).
+          thunks : 인자 없는 조회 함수 목록(각각 dict 를 돌려준다).
+        반환: thunks 와 같은 순서의 결과 목록. 조회 함수가 예외를 올리면 그 자리에 예외 객체가 들어간다
+              (호출 측이 "실시간 불가"로 바꾼다 — 한 건의 예외가 묶음 전체를 버리게 하지 않는다).
+
+        시간 집계: 동시에 실행하므로 묶음이 쓰는 시간은 건별 합이 아니라 가장 오래 걸린 한 건이다.
+        각 작업 스레드가 자기 조회의 시작·끝을 재서 돌려주고, 그 최댓값을 예산에 더한다.
+        타임아웃 상한은 묶음 시작 시점의 남은 예산으로 모든 건에 똑같이 준다. 컨텍스트 변수는
+        작업 스레드로 전달되지 않으므로 작업 스레드 안에서 직접 건다.
+        성공·실패 기록(`note`)은 하지 않는다 — 호출 측이 결과 순서대로 한다.
+        """
+        if not thunks:
+            return []
+        cap = self.timeout_cap()
+        clock = self._clock
+
+        def run(fn):
+            token = _TIMEOUT_CAP.set(cap)
+            t0 = clock()
+            try:
+                out = fn()
+            except Exception as e:            # 조회 한 건의 예외는 결과로 돌려준다
+                out = e
+            finally:
+                dur = max(clock() - t0, 0.0)
+                _TIMEOUT_CAP.reset(token)
+            return out, dur
+
+        results = list(pool.map(run, thunks))
+        self.spent_sec += max(d for _o, d in results)
+        return [o for o, _d in results]
 
     def note(self, ok: bool) -> None:
         """조회 결과를 기록한다 — 성공이면 연속 실패를 0 으로, 실패면 1 늘린다."""
@@ -125,6 +183,17 @@ class LiveBudget:
 
     def skipped(self) -> None:
         self.skipped_cnt += 1
+
+    def cache_hit(self) -> None:
+        """조회 없이 캐시의 성공 응답을 썼음을 기록한다(시간·연속 실패 집계는 건드리지 않는다)."""
+        self.cache_hit_cnt += 1
+
+
+def _is_timeout(e: BaseException) -> bool:
+    """예외가 타임아웃인가 — urlopen 은 연결 단계 타임아웃을 URLError(reason=timeout)로 감싼다."""
+    if isinstance(e, (TimeoutError, socket.timeout)):
+        return True
+    return isinstance(e, urllib.error.URLError) and isinstance(e.reason, (TimeoutError, socket.timeout))
 
 
 def _int(v, default=None):
@@ -189,6 +258,10 @@ class GbisLive:
         if not self.enabled:
             return None, "인증키가 설정되지 않았습니다(DATA_GO_KR_API_KEY)"
         body, err = None, None
+        # 요청 단위 예산이 이 조회의 타임아웃을 정상값보다 짧게 줄였는가(아래 캐시 저장 판단용)
+        cap = _TIMEOUT_CAP.get()
+        shortened = cap is not None and float(cap) < self.timeout_sec
+        timed_out = False
         try:
             data = self._fetch(self._url(path, **params))
             # 응답 JSON 의 최상위·response·msgHeader·msgBody 가 dict 가 아닌 경우(게이트웨이가
@@ -215,8 +288,15 @@ class GbisLive:
             # http.client.HTTPException: 본문을 읽는 도중 연결이 끊기면 IncompleteRead 가 난다.
             # OSError·URLError 의 하위가 아니어서 따로 잡지 않으면 호출자에게 예외로 올라간다.
             err = "%s: %s" % (type(e).__name__, e)
+            timed_out = _is_timeout(e)
         if err:
             logger.warning("GBIS 호출 실패 %s %s — %s", path, params, err)
+        if err and timed_out and shortened:
+            # 예산 때문에 줄어든 타임아웃(예: 0.5초)으로 난 타임아웃은 "이 요청이 더 기다리지 못했다"는
+            # 뜻이지 외부 API 가 응답하지 않는다는 뜻이 아니다. 전역 캐시에 실패로 남기면 직후의 단독
+            # 조회(정류장 도착정보 API 등, 정상 타임아웃 3초)가 조회도 해 보지 않고 10초 동안
+            # "실시간 불가"를 받는다 — 저장하지 않는다. 정상 타임아웃으로 난 실패는 종전대로 저장한다.
+            return body, err
         with self._lock:
             # 실패도 짧게 캐시한다 — 장애 중 폴링이 외부 API 를 두드리지 않게
             ttl = ttl_ok if not err else min(self.cache_ttl_sec, 10.0)
@@ -224,6 +304,19 @@ class GbisLive:
             if len(self._cache) > 500:
                 self._cache.clear()
         return body, err
+
+    def _peek(self, key: tuple):
+        """캐시에 유효한 **성공** 응답이 있으면 (True, msg_body), 없으면 (False, None). 조회는 하지 않는다.
+
+        실패로 캐시된 항목·만료된 항목은 없는 것으로 본다. 성공 응답의 본문은 빈 dict 일 수 있어
+        (결과 없음) 본문만으로는 적중 여부를 가릴 수 없으므로 적중 여부를 따로 돌려준다.
+        """
+        now = time.time()
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit and hit[0] > now and not hit[2]:
+                return True, hit[1]
+        return False, None
 
     # ---------- 노선형상 ----------
     def route_line(self, route_id) -> list:
@@ -235,6 +328,22 @@ class GbisLive:
                               routeId=route_id)
         if err or not body:
             return []
+        return self._parse_route_line(body)
+
+    def route_line_cached(self, route_id) -> list:
+        """캐시에 있는 노선형상만 돌려준다(조회하지 않는다). 캐시에 없거나 형상이 비었으면 [].
+
+        경로 후보를 비교하는 단계에서 쓴다 — 후보마다 형상을 조회하면 후보 수만큼 외부 호출이
+        나가는데, 지도선은 최종 선택된 경로에만 필요하다.
+        """
+        hit, body = self._peek(("line", str(route_id)))
+        if not hit or not body:
+            return []
+        return self._parse_route_line(body)
+
+    @staticmethod
+    def _parse_route_line(body: dict) -> list:
+        """노선형상 응답 본문 → [[lat, lng], ...] (lineSeq 오름차순)."""
         raw = body.get("busRouteLineList") or []
         if isinstance(raw, dict):
             raw = [raw]
@@ -311,6 +420,22 @@ class GbisLive:
         route_id 를 주면 그 노선만 남긴다(경로 안내 중 승차 노선 확인용).
         """
         body, err = self._get(("arr", str(station_id)), ARRIVAL_PATH, stationId=station_id)
+        return self._build_arrivals(body, err, station_id, route_id, route_meta)
+
+    def arrivals_cached(self, station_id, route_id=None, route_meta: dict = None):
+        """캐시에 있는 도착정보만으로 `arrivals()` 와 같은 모양의 성공 응답을 만든다(조회하지 않는다).
+
+        캐시에 유효한 성공 응답이 없으면 None. 요청 단위 예산이 끝난 뒤에도 이미 받아 둔 응답은
+        쓸 수 있게 하려는 것이다 — 저상 판정에 쓴 응답과 버스 구간에 붙이는 실시간 정보가 같은
+        응답에서 나와야 서로 어긋나지 않는다.
+        """
+        hit, body = self._peek(("arr", str(station_id)))
+        if not hit:
+            return None
+        return self._build_arrivals(body, None, station_id, route_id, route_meta)
+
+    def _build_arrivals(self, body, err, station_id, route_id=None, route_meta: dict = None) -> dict:
+        """도착정보 응답 본문(또는 오류) → `arrivals()` 반환 dict."""
         if err:
             return {"status": "unavailable", "reason": err, "station_id": str(station_id),
                     "items": [], "next_low_floor": None}
@@ -370,6 +495,17 @@ class GbisLive:
         """노선의 운행 차량 위치. stop_index: {station_id(str): {"name","lat","lng","station_seq"}}
         가 있으면 차량이 있는 정류장의 이름·좌표를 붙인다(지도 표시용)."""
         body, err = self._get(("loc", str(route_id)), LOCATION_PATH, routeId=route_id)
+        return self._build_locations(body, err, route_id, stop_index)
+
+    def locations_cached(self, route_id, stop_index: dict = None):
+        """캐시에 있는 위치정보만으로 `locations()` 와 같은 모양의 성공 응답을 만든다. 없으면 None."""
+        hit, body = self._peek(("loc", str(route_id)))
+        if not hit:
+            return None
+        return self._build_locations(body, None, route_id, stop_index)
+
+    def _build_locations(self, body, err, route_id, stop_index: dict = None) -> dict:
+        """위치정보 응답 본문(또는 오류) → `locations()` 반환 dict."""
         if err:
             return {"status": "unavailable", "reason": err, "route_id": str(route_id),
                     "vehicles": [], "low_floor_cnt": 0}

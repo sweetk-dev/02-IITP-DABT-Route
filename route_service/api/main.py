@@ -476,11 +476,26 @@ def _walk_leg(frm, to, profile, allowed, label_from, label_to, to_is_entrance: b
     return leg
 
 
-def _bus_leg(part, budget=None):
-    """버스 leg 1개. budget(gbis_live.LiveBudget)을 주면 노선형상 조회도 그 요청의 실시간 예산 안에서만 한다.
+def _route_line_geometry(line: list, board: dict, alight: dict):
+    """노선형상 좌표열을 승·하차 정류장 사이로 잘라 지도선 좌표열로 만든다.
 
-    후보마다(최대 8개) 노선형상을 조회하므로, 외부 API 가 응답하지 않으면 조회 수만큼 타임아웃이
-    쌓인다. 예산을 넘겼으면 형상 없이 정류장 직선으로 그린다(지도선은 부가 정보).
+    인자 line: GBIS 노선형상 [[lat, lng], ...], board·alight: lat·lng 를 가진 정류장 dict.
+    반환: [[lat, lng], ...](소수 7자리) 또는 None — 형상이 없거나 정류장이 형상에 붙지 않으면 None 이고,
+    호출 측은 정류장 직선을 그대로 쓴다.
+    """
+    seg = gbis_live.LIVE.slice_line(line, board, alight) if line else []
+    if len(seg) < 2:
+        return None
+    return [[round(a, 7), round(b, 7)] for a, b in seg]
+
+
+def _bus_leg(part):
+    """버스 leg 1개. 지도선은 캐시에 있는 노선형상만 쓴다 — 여기서는 외부 조회를 하지 않는다.
+
+    이 함수는 경로 후보마다(최대 8개) 불린다. 후보마다 노선형상을 조회하면 그 시간이 저상 판정과
+    같은 실시간 예산에서 빠져, 외부 API 가 느릴 때 판정에 쓸 시간이 모자란다. 지도선은 후보 비교에
+    쓰이지 않고 최종 선택된 경로에만 필요하므로, 캐시에 없는 형상은 선택이 끝난 뒤
+    `_fill_bus_geometry` 가 한 번만 조회한다. 그때까지는 정류장 직선(geometry_source="stops")이다.
     """
     route = part["route"]
     path = poi_store.STORE.route_stop_path(route["route_id"], part["seq_from"], part["seq_to"])
@@ -489,15 +504,10 @@ def _bus_leg(part, budget=None):
     # 형상을 못 받거나 정류장이 형상에 붙지 않으면 종전대로 정류장 직선.
     geometry, geometry_source = stop_geom, "stops"
     try:
-        if not gbis_live.LIVE.enabled or (budget is not None and not budget.allow()):
-            line = []
-        elif budget is not None:
-            line = budget.call(gbis_live.LIVE.route_line, route["route_id"])
-        else:
-            line = gbis_live.LIVE.route_line(route["route_id"])
-        seg = gbis_live.LIVE.slice_line(line, part["board"], part["alight"]) if line else []
-        if len(seg) >= 2:
-            geometry, geometry_source = [[round(a, 7), round(b, 7)] for a, b in seg], "gbis_line"
+        line = gbis_live.LIVE.route_line_cached(route["route_id"]) if gbis_live.LIVE.enabled else []
+        geom = _route_line_geometry(line, part["board"], part["alight"])
+        if geom:
+            geometry, geometry_source = geom, "gbis_line"
     except Exception as e:                       # 지도선은 부가 정보 — 경로 안내를 막지 않는다
         logger.warning("노선형상 적용 실패 route_id=%s — %s", route["route_id"], e)
     dist = 0.0
@@ -654,6 +664,31 @@ def _station_brief(poi_id: str, name: str) -> dict:
     }
 
 
+def _fill_bus_geometry(legs: list, budget=None) -> None:
+    """최종 선택된 경로의 버스 leg 중 지도선이 정류장 직선인 것에 노선형상을 조회해 입힌다.
+
+    `_bus_leg` 는 캐시에 있는 형상만 쓴다. 캐시에 없던 노선은 여기서 한 번 조회한다(24시간 캐시).
+    budget(gbis_live.LiveBudget): 이 요청의 실시간 조회 예산 — 이미 끝났으면 조회하지 않고 정류장
+    직선을 그대로 둔다(지도선은 부가 정보). 조회 실패·예외도 같은 폴백이며 예외를 올리지 않는다.
+    """
+    for leg in legs:
+        if leg["kind"] != "bus" or leg.get("geometry_source") != "stops":
+            continue
+        if not gbis_live.LIVE.enabled or (budget is not None and not budget.allow()):
+            continue
+        rid = leg["route"]["route_id"]
+        try:
+            if budget is not None:
+                line = budget.call(gbis_live.LIVE.route_line, rid)
+            else:
+                line = gbis_live.LIVE.route_line(rid)
+            geom = _route_line_geometry(line, leg["board"], leg["alight"])
+            if geom:
+                leg["geometry"], leg["geometry_source"] = geom, "gbis_line"
+        except Exception as e:                   # 지도선은 부가 정보 — 경로 안내를 막지 않는다
+            logger.warning("노선형상 적용 실패 route_id=%s — %s", rid, e)
+
+
 def _realtime_unavailable(station_id, reason: str) -> dict:
     """실시간 도착정보를 못 받았을 때 leg["realtime"] 에 넣는 값 — gbis_live.arrivals 의 실패 응답과 같은 모양."""
     return {"status": "unavailable", "reason": reason, "station_id": str(station_id),
@@ -667,7 +702,10 @@ def _attach_realtime(legs: list, realtime: bool, budget=None) -> None:
       고정 경고(LOW_BUS_WARNING)를 실측 문구로 바꾼다. 실패하면 경고를 그대로 둔다.
     - 지하철: 승·하차 역 설비 요약(정적) — 항상 붙인다(자료 없으면 빈 dict).
 
-    budget(gbis_live.LiveBudget): 이 요청의 실시간 조회 예산. 이미 소진됐으면 조회하지 않는다.
+    budget(gbis_live.LiveBudget): 이 요청의 실시간 조회 예산. 이미 소진됐으면 조회하지 않는다 —
+    다만 캐시에 그 정류장의 성공 응답이 있으면 그것을 붙인다. 저상 판정이 방금 받은 응답이 캐시에
+    있는데 "실시간 불가"를 붙이면, 같은 응답으로 "저상버스 도착 예정"이라 판정한 leg 에 실시간
+    정보가 없다고 나가 서로 어긋난다.
     실시간 조회가 예외를 올리거나 예상과 다른 값을 돌려줘도 "실시간 불가"로 바꿔 붙인다 —
     부가 정보 때문에 경로 응답 전체가 500 이 되지 않게 한다.
     """
@@ -683,7 +721,15 @@ def _attach_realtime(legs: list, realtime: bool, budget=None) -> None:
                 meta = {}
             skip = budget.skip_reason() if budget is not None else None
             if skip is not None:
-                live = _realtime_unavailable(board["poi_id"], skip)
+                try:
+                    live = gbis_live.LIVE.arrivals_cached(board["poi_id"], route_id=rid, route_meta=meta)
+                except Exception as e:
+                    logger.warning("실시간 도착정보 캐시 조회 실패 station_id=%s — %s", board["poi_id"], e)
+                    live = None
+                if isinstance(live, dict):
+                    budget.cache_hit()
+                else:
+                    live = _realtime_unavailable(board["poi_id"], skip)
             else:
                 try:
                     if budget is not None:
@@ -732,7 +778,16 @@ def _rank_low_floor(cands: list, judge, profile, origin) -> list:
 
     후보마다 버스 part 의 승차 정류장까지 도보 근사 초를 구해 실시간 저상 판정을 받고,
     (계층, 시간) 키로 정렬한다. 버스가 없는 후보(도보+지하철)는 저상 판정이 필요 없어 tier 1 로 둔다.
+
+    판정에 앞서 전 후보의 실시간 응답을 한꺼번에 받아 둔다(judge.prefetch — 도착정보 먼저, 위치정보는
+    필요한 노선만). 후보 순서대로 하나씩 조회하면 앞 후보의 조회가 예산을 다 써 뒤 후보가 판정 불가가 된다.
     """
+    pre = []
+    for c in cands:
+        part = _cand_bus_part(c)
+        if part is not None:
+            pre.append((part, _walk_est_sec(profile, origin, (part["board"]["lat"], part["board"]["lng"]))))
+    judge.prefetch(pre)
     ranked = []
     for c in cands:
         part = _cand_bus_part(c)
@@ -853,7 +908,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
 
     cands = _search()
     judge = None
-    # 이 요청의 실시간 조회 예산 — 저상 판정·노선형상·도착정보 부착이 함께 쓴다.
+    # 이 요청의 실시간 조회 예산 — 저상 판정·도착정보 부착·노선형상이 이 순서로 함께 쓴다.
     # 외부 API 가 느리거나 응답하지 않아도 실시간 조회에 쓰는 시간 합이 예산을 넘지 않는다.
     live_budget = gbis_live.LiveBudget()
     if lf_mode:
@@ -913,7 +968,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                     if walk_legs_by_idx.get(pi) is not None:
                         built.append(walk_legs_by_idx[pi])
                 elif part["kind"] == "bus":
-                    built.append(_bus_leg(part, live_budget))
+                    built.append(_bus_leg(part))
                 else:
                     sl = _subway_leg(part)
                     bx, ax = exit_by_idx.get((pi, "board")), exit_by_idx.get((pi, "alight"))
@@ -960,6 +1015,9 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
         )
 
     _attach_realtime(legs, realtime, live_budget)
+    # 노선형상은 선택된 경로에만 조회한다(후보 단계에서는 캐시에 있을 때만 쓴다). 판정·도착정보보다
+    # 뒤에 두어, 예산이 모자랄 때 빠지는 것이 부가 정보인 지도선이 되게 한다.
+    _fill_bus_geometry(legs, live_budget)
     for leg in legs:                      # 하차 후 역 안/밖 안내 (#77)
         if leg["kind"] == "subway":
             ax = leg.get("alight_exit")

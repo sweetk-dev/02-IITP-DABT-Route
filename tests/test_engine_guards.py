@@ -3,7 +3,7 @@
 
   1) 에스컬레이터(highway=steps + conveying)는 계단으로 분류돼 휠체어 프로필에서 회피된다
   2) 유턴 억제 재탐색은 후보가 나아지지 않으면 멈춘다(같은 탐색을 되풀이하지 않는다)
-  3) 짧은 링크로 이월된 회전각은 ±180° 로 되돌려 판정한다
+  3) 짧은 링크로 이월된 회전각 — 합이 ±180° 를 넘어도 좌우를 뒤집지 않는다
   4) 실측 출입구 파일이 깨져 있어도 기동은 계속된다
 """
 import math
@@ -110,20 +110,43 @@ def _polyline_store(headings_lengths):
 
 
 def test_carried_turn_angle_is_normalized_before_judging():
-    """우 120° → 8m 짧은 링크 → 우 120°: 합 240° 는 좌 120° 와 같다 — 유턴이 아니라 급좌회전."""
+    """우 120° → 8m 짧은 링크 → 우 120°: 합 240°. 실제로 오른쪽으로 두 번 도는 길이다 —
+    ±180° 로 접은 값(좌 120°)으로 "급좌회전"이라 하지 않고, 유턴도 아닌 급우회전으로 안내한다."""
     st, path = _polyline_store([(0, 50), (120, 8), (240, 40)])
     steps = build_steps(st.graph, path, get_profile("walk"))
     mans = [s["maneuver"] for s in steps]
     assert "uturn" not in mans, mans
+    assert mans == ["depart", "sharp_right", "arrive"], mans
+    assert not any("유턴" in s["instruction"] or "좌회전" in s["instruction"] for s in steps)
+
+
+def test_carried_turn_angle_keeps_side_when_turning_left_twice():
+    """좌 120° 두 번(합 −240°)도 같은 규칙 — 급우회전이 아니라 급좌회전."""
+    st, path = _polyline_store([(0, 50), (240, 8), (120, 40)])
+    mans = [s["maneuver"] for s in build_steps(st.graph, path, get_profile("walk"))]
     assert mans == ["depart", "sharp_left", "arrive"], mans
-    assert not any("유턴" in s["instruction"] for s in steps)
 
 
 def test_carried_turn_angle_over_two_short_links():
-    """우 100° 를 세 번(짧은 링크 둘 경유): 합 300° = 좌 60° — 좌회전으로 안내한다."""
+    """우 100° 를 세 번(짧은 링크 둘 경유): 합 300°. 접으면 좌 60° 지만 도는 방향은 오른쪽이다 — 급우회전."""
     st, path = _polyline_store([(0, 50), (100, 8), (200, 8), (300, 40)])
     mans = [s["maneuver"] for s in build_steps(st.graph, path, get_profile("walk"))]
-    assert mans == ["depart", "left", "arrive"], mans
+    assert mans == ["depart", "sharp_right", "arrive"], mans
+
+
+def test_carried_turn_over_180_that_ends_reversed_is_a_uturn():
+    """우 100° 두 번(합 200°): 접으면 −160° 로 되돌아 나가는 방향이다 — 좌우 구분 없이 유턴."""
+    st, path = _polyline_store([(0, 50), (100, 8), (200, 40)])
+    mans = [s["maneuver"] for s in build_steps(st.graph, path, get_profile("walk"))]
+    assert mans == ["depart", "uturn", "arrive"], mans
+
+
+def test_carried_turn_within_180_is_unchanged():
+    """합이 ±180° 이내면 종전과 같다 — 우 60° + 우 60° = 우 120°(급우회전), 우 60° + 좌 100° = 좌 40°."""
+    st, path = _polyline_store([(0, 50), (60, 8), (120, 40)])
+    assert [s["maneuver"] for s in build_steps(st.graph, path, get_profile("walk"))] == ["depart", "sharp_right", "arrive"]
+    st, path = _polyline_store([(0, 50), (60, 8), (320, 40)])
+    assert [s["maneuver"] for s in build_steps(st.graph, path, get_profile("walk"))] == ["depart", "slight_left", "arrive"]
 
 
 def test_real_uturn_is_still_a_uturn():

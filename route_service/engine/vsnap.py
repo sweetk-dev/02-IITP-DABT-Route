@@ -173,6 +173,20 @@ def candidates(store, lat, lng, profile, max_slope_deg, allowed=None, radius_m=D
 _REGISTRY_KEY = "_vsnap_on_edge"
 
 
+def _orig_length(data: dict, fallback: float = 0.0) -> float:
+    """가상 링크에 남길 원 링크 길이(m).
+
+    원 링크 속성의 length 를 쓴다 — 경로 탐색이 원 링크를 "짧은 링크"로 보는지와 같은 값이어야
+    실제 그래프의 짧은 링크(15m 미만)에서 잘린 가상 링크가 종전과 같이 예외를 받는다.
+    length 가 없거나 0 이면 fallback(좌표열로 잰 길이)을 쓴다.
+    """
+    try:
+        v = float(data.get("length") or 0.0)
+    except (TypeError, ValueError):
+        v = 0.0
+    return v if v > 0 else float(fallback or 0.0)
+
+
 def _link_between(G, coords, data, a, b):
     """같은 원 링크 위 두 가상 노드 a·b 를 잇는 직결 가상 링크를 얹는다.
 
@@ -189,6 +203,9 @@ def _link_between(G, coords, data, a, b):
     geom = [a[2]] + mid + [b[2]]
     d = dict(data)
     d["length"] = max(b[0] - a[0], 0.1)          # 분할 링크와 같은 하한(0 길이 링크 방지)
+    # 경사는 원 링크에서 상속하므로 "짧은 링크 경사 예외"는 원 링크 길이로 판정해야 한다
+    # (planner.slope_ref_length). data 는 원 링크 속성이라 length 가 곧 원 링크 길이다.
+    d["orig_length"] = _orig_length(data)
     d["geometry"] = geom if len(geom) > 2 else None
     G.add_edge(a[1], b[1], **d)
 
@@ -224,6 +241,9 @@ def attach(H, cand: dict, node_id: str) -> str:
     G.add_node(node_id, lat=p[0], lon=p[1], node_type="virtual", virtual=True)
     d1 = dict(data); d1["length"] = max(t * total, 0.1); d1["geometry"] = head if len(head) > 2 else None
     d2 = dict(data); d2["length"] = max((1.0 - t) * total, 0.1); d2["geometry"] = tail if len(tail) > 2 else None
+    # 분할 링크는 원 링크의 경사를 상속하고 길이만 짧아진다. 경사 판정의 "짧은 링크" 예외가
+    # 잘린 길이로 적용되지 않도록 원 링크 길이를 따로 남긴다(거리·시간 계산은 length 그대로).
+    d1["orig_length"] = d2["orig_length"] = _orig_length(data, total)
     G.add_edge(u, node_id, **d1)
     G.add_edge(node_id, v, **d2)
 
