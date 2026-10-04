@@ -16,6 +16,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from route_service.topomap import graphio  # noqa: E402
 from route_service.topomap import restitch as rs  # noqa: E402
 
 
@@ -25,7 +26,14 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--report", default="data/restitch_report.csv")
     ap.add_argument("--margin", type=float, default=rs.MARGIN_M)
+    ap.add_argument("--overwrite-input", action="store_true",
+                    help="--graph 와 같은 경로에 저장하는 것을 허용한다(원본은 <경로>.bak 으로 남긴다)")
     a = ap.parse_args()
+    # 출력이 입력과 같은 경로면 계산 전에 멈춘다 — 접합 보강은 누적되므로 입력을 덮어쓰면 되돌릴 수 없다.
+    try:
+        graphio.check_output_path(a.out, a.graph, a.overwrite_input)
+    except graphio.GraphIOError as e:
+        ap.error(str(e))
     with open(a.graph, "rb") as f:
         G = pickle.load(f)
     items = rs.find_restitch(G, margin_m=a.margin)
@@ -42,8 +50,8 @@ def main():
         n = rs.apply_restitch(G, items)
         joins = rs.connect_dead_ends(G)
         print("보도 끝 연결 %d (링크 분할 %d)" % (len(joins), sum(1 for j in joins if j["split"])))
-        with open(a.out, "wb") as f:
-            pickle.dump(G, f)
+        # 임시 파일에 쓴 뒤 교체한다 — 쓰는 도중 중단돼도 잘린 그래프 파일이 남지 않는다.
+        graphio.save_graph(G, a.out, input_path=a.graph, overwrite_input=a.overwrite_input)
         print("추가 %d → %s (노드 %d / 링크 %d)" % (n, a.out, G.number_of_nodes(), G.number_of_edges()))
 
 

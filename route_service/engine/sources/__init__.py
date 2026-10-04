@@ -7,7 +7,5 @@
 두 어댑터 모두 동일한 그래프 스키마(engine/graph.py 참조)를 산출하므로,
 융기원 원본이 도착하면 API 변경 없이 그래프만 교체하면 된다.
 """
-from .osm import build_from_osm
-from .tabular import build_from_tabular
-
-BUILDERS = {"osm": build_from_osm, "tabular": build_from_tabular}
+from .osm import build_from_osm  # noqa: F401
+from .tabular import build_from_tabular  # noqa: F401

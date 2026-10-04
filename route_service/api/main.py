@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from collections import OrderedDict
@@ -53,9 +54,15 @@ logger = logging.getLogger("route_api")
 settings = get_settings()
 
 def _apply_overrides_safe() -> dict:
-    """수집 저장소의 활성 오버라이드를 그래프에 적용 — 실패해도 서비스는 계속."""
+    """수집 저장소의 활성 오버라이드를 그래프에 적용 — 실패해도 서비스는 계속.
+
+    적용·철회는 링크 통행성을 바꾸므로 `NET.update_graph` 로 실행한다 — 저장소 락 아래에서
+    적용하고 연결요소 캐시를 비운다(캐시가 남으면 통행 불가 승인 뒤에도 종전 연결요소로
+    스냅 후보를 고른다). 오버라이드 목록 조회(DB)는 락 밖에서 먼저 끝낸다.
+    """
     try:
-        stat = apply_overrides(NET.graph, collect_store.STORE.active_overrides())
+        overrides = collect_store.STORE.active_overrides()
+        stat = NET.update_graph(lambda G: apply_overrides(G, overrides))
         logger.info("오버라이드 적용: %s", stat)
         return stat
     except Exception as e:            # DB 미가용 등 — 오버라이드 없이 운행
@@ -469,7 +476,27 @@ def _walk_leg(frm, to, profile, allowed, label_from, label_to, to_is_entrance: b
     return leg
 
 
+def _route_line_geometry(line: list, board: dict, alight: dict):
+    """노선형상 좌표열을 승·하차 정류장 사이로 잘라 지도선 좌표열로 만든다.
+
+    인자 line: GBIS 노선형상 [[lat, lng], ...], board·alight: lat·lng 를 가진 정류장 dict.
+    반환: [[lat, lng], ...](소수 7자리) 또는 None — 형상이 없거나 정류장이 형상에 붙지 않으면 None 이고,
+    호출 측은 정류장 직선을 그대로 쓴다.
+    """
+    seg = gbis_live.LIVE.slice_line(line, board, alight) if line else []
+    if len(seg) < 2:
+        return None
+    return [[round(a, 7), round(b, 7)] for a, b in seg]
+
+
 def _bus_leg(part):
+    """버스 leg 1개. 지도선은 캐시에 있는 노선형상만 쓴다 — 여기서는 외부 조회를 하지 않는다.
+
+    이 함수는 경로 후보마다(최대 8개) 불린다. 후보마다 노선형상을 조회하면 그 시간이 저상 판정과
+    같은 실시간 예산에서 빠져, 외부 API 가 느릴 때 판정에 쓸 시간이 모자란다. 지도선은 후보 비교에
+    쓰이지 않고 최종 선택된 경로에만 필요하므로, 캐시에 없는 형상은 선택이 끝난 뒤
+    `_fill_bus_geometry` 가 한 번만 조회한다. 그때까지는 정류장 직선(geometry_source="stops")이다.
+    """
     route = part["route"]
     path = poi_store.STORE.route_stop_path(route["route_id"], part["seq_from"], part["seq_to"])
     stop_geom = [[round(s["lat"], 7), round(s["lng"], 7)] for s in path]
@@ -477,10 +504,10 @@ def _bus_leg(part):
     # 형상을 못 받거나 정류장이 형상에 붙지 않으면 종전대로 정류장 직선.
     geometry, geometry_source = stop_geom, "stops"
     try:
-        line = gbis_live.LIVE.route_line(route["route_id"]) if gbis_live.LIVE.enabled else []
-        seg = gbis_live.LIVE.slice_line(line, part["board"], part["alight"]) if line else []
-        if len(seg) >= 2:
-            geometry, geometry_source = [[round(a, 7), round(b, 7)] for a, b in seg], "gbis_line"
+        line = gbis_live.LIVE.route_line_cached(route["route_id"]) if gbis_live.LIVE.enabled else []
+        geom = _route_line_geometry(line, part["board"], part["alight"])
+        if geom:
+            geometry, geometry_source = geom, "gbis_line"
     except Exception as e:                       # 지도선은 부가 정보 — 경로 안내를 막지 않는다
         logger.warning("노선형상 적용 실패 route_id=%s — %s", route["route_id"], e)
     dist = 0.0
@@ -614,7 +641,11 @@ def _station_exit_step(leg) -> dict:
 
 
 def _station_brief(poi_id: str, name: str) -> dict:
-    """지하철 leg 승·하차 역의 설비 요약 — 승강기 출입구·리프트·장애인화장실(3상태)."""
+    """지하철 leg 승·하차 역의 설비 요약 — 승강기 출입구·리프트·장애인화장실(3상태).
+
+    응답 표시용이다(승강기 6건·리프트 4건까지만 싣는다). 하차 안내 판정처럼 설비 전체가
+    필요한 곳에는 이 요약이 아니라 `_station_facilities_cached` 의 전체 목록을 쓴다.
+    """
     try:
         fac = poi_store.STORE.station_facilities(stn_cd=poi_id, name=name)
     except Exception as e:
@@ -633,12 +664,50 @@ def _station_brief(poi_id: str, name: str) -> dict:
     }
 
 
-def _attach_realtime(legs: list, realtime: bool) -> None:
+def _fill_bus_geometry(legs: list, budget=None) -> None:
+    """최종 선택된 경로의 버스 leg 중 지도선이 정류장 직선인 것에 노선형상을 조회해 입힌다.
+
+    `_bus_leg` 는 캐시에 있는 형상만 쓴다. 캐시에 없던 노선은 여기서 한 번 조회한다(24시간 캐시).
+    budget(gbis_live.LiveBudget): 이 요청의 실시간 조회 예산 — 이미 끝났으면 조회하지 않고 정류장
+    직선을 그대로 둔다(지도선은 부가 정보). 조회 실패·예외도 같은 폴백이며 예외를 올리지 않는다.
+    """
+    for leg in legs:
+        if leg["kind"] != "bus" or leg.get("geometry_source") != "stops":
+            continue
+        if not gbis_live.LIVE.enabled or (budget is not None and not budget.allow()):
+            continue
+        rid = leg["route"]["route_id"]
+        try:
+            if budget is not None:
+                line = budget.call(gbis_live.LIVE.route_line, rid)
+            else:
+                line = gbis_live.LIVE.route_line(rid)
+            geom = _route_line_geometry(line, leg["board"], leg["alight"])
+            if geom:
+                leg["geometry"], leg["geometry_source"] = geom, "gbis_line"
+        except Exception as e:                   # 지도선은 부가 정보 — 경로 안내를 막지 않는다
+            logger.warning("노선형상 적용 실패 route_id=%s — %s", rid, e)
+
+
+def _realtime_unavailable(station_id, reason: str) -> dict:
+    """실시간 도착정보를 못 받았을 때 leg["realtime"] 에 넣는 값 — gbis_live.arrivals 의 실패 응답과 같은 모양."""
+    return {"status": "unavailable", "reason": reason, "station_id": str(station_id),
+            "items": [], "next_low_floor": None}
+
+
+def _attach_realtime(legs: list, realtime: bool, budget=None) -> None:
     """최종 선택된 legs 에 실시간·설비 정보를 붙인다.
 
     - 버스: realtime=true 면 승차 정류장 도착정보(해당 노선만) — 저상 차량이 확인되면
       고정 경고(LOW_BUS_WARNING)를 실측 문구로 바꾼다. 실패하면 경고를 그대로 둔다.
     - 지하철: 승·하차 역 설비 요약(정적) — 항상 붙인다(자료 없으면 빈 dict).
+
+    budget(gbis_live.LiveBudget): 이 요청의 실시간 조회 예산. 이미 소진됐으면 조회하지 않는다 —
+    다만 캐시에 그 정류장의 성공 응답이 있으면 그것을 붙인다. 저상 판정이 방금 받은 응답이 캐시에
+    있는데 "실시간 불가"를 붙이면, 같은 응답으로 "저상버스 도착 예정"이라 판정한 leg 에 실시간
+    정보가 없다고 나가 서로 어긋난다.
+    실시간 조회가 예외를 올리거나 예상과 다른 값을 돌려줘도 "실시간 불가"로 바꿔 붙인다 —
+    부가 정보 때문에 경로 응답 전체가 500 이 되지 않게 한다.
     """
     for leg in legs:
         if leg["kind"] == "bus":
@@ -650,7 +719,29 @@ def _attach_realtime(legs: list, realtime: bool) -> None:
                 meta = poi_store.STORE.stop_route_meta(board["poi_id"])
             except Exception:
                 meta = {}
-            live = gbis_live.LIVE.arrivals(board["poi_id"], route_id=rid, route_meta=meta)
+            skip = budget.skip_reason() if budget is not None else None
+            if skip is not None:
+                try:
+                    live = gbis_live.LIVE.arrivals_cached(board["poi_id"], route_id=rid, route_meta=meta)
+                except Exception as e:
+                    logger.warning("실시간 도착정보 캐시 조회 실패 station_id=%s — %s", board["poi_id"], e)
+                    live = None
+                if isinstance(live, dict):
+                    budget.cache_hit()
+                else:
+                    live = _realtime_unavailable(board["poi_id"], skip)
+            else:
+                try:
+                    if budget is not None:
+                        live = budget.call(gbis_live.LIVE.arrivals, board["poi_id"],
+                                           route_id=rid, route_meta=meta)
+                    else:
+                        live = gbis_live.LIVE.arrivals(board["poi_id"], route_id=rid, route_meta=meta)
+                except Exception as e:
+                    logger.warning("실시간 도착정보 조회 실패 station_id=%s — %s", board["poi_id"], e)
+                    live = None
+                if not isinstance(live, dict):
+                    live = _realtime_unavailable(board["poi_id"], "realtime lookup failed")
             leg["realtime"] = live
             nlf = live.get("next_low_floor")
             if leg.get("low_floor"):
@@ -687,7 +778,16 @@ def _rank_low_floor(cands: list, judge, profile, origin) -> list:
 
     후보마다 버스 part 의 승차 정류장까지 도보 근사 초를 구해 실시간 저상 판정을 받고,
     (계층, 시간) 키로 정렬한다. 버스가 없는 후보(도보+지하철)는 저상 판정이 필요 없어 tier 1 로 둔다.
+
+    판정에 앞서 전 후보의 실시간 응답을 한꺼번에 받아 둔다(judge.prefetch — 도착정보 먼저, 위치정보는
+    필요한 노선만). 후보 순서대로 하나씩 조회하면 앞 후보의 조회가 예산을 다 써 뒤 후보가 판정 불가가 된다.
     """
+    pre = []
+    for c in cands:
+        part = _cand_bus_part(c)
+        if part is not None:
+            pre.append((part, _walk_est_sec(profile, origin, (part["board"]["lat"], part["board"]["lng"]))))
+    judge.prefetch(pre)
     ranked = []
     for c in cands:
         part = _cand_bus_part(c)
@@ -713,17 +813,21 @@ def _rank_low_floor(cands: list, judge, profile, origin) -> list:
 
 _FAC_CACHE = {}
 _FAC_TTL_SEC = 600
+# 조회 실패(예외)나 자료 없음(None)은 짧게만 기억한다. 성공과 같은 10분을 주면 DB 가 잠깐
+# 응답하지 않았던 것만으로 그 역의 출구·승강기 안내가 10분 동안 빠진다. 30초는 한 요청 안의
+# 후보 조합들이 같은 역을 되풀이 조회하는 것(수 초)을 흡수하기에 충분한 길이다.
+_FAC_FAIL_TTL_SEC = 30
 
 
 def _station_facilities_cached(station: dict):
-    """역 설비 — 후보 조합마다 같은 역을 되풀이 조회하지 않도록 10분 캐시."""
+    """역 설비 — 후보 조합마다 같은 역을 되풀이 조회하지 않도록 10분 캐시(실패·없음은 30초)."""
     key = (str(station.get("poi_id")), station.get("name"))
     hit = _FAC_CACHE.get(key)
     now = time.time()
-    if hit and now - hit[0] < _FAC_TTL_SEC:
+    if hit and now - hit[0] < (_FAC_TTL_SEC if hit[1] else _FAC_FAIL_TTL_SEC):
         return hit[1]
     try:
-        fac = poi_store.STORE.station_facilities(stn_cd=station.get("poi_id"), name=station["name"])
+        fac = poi_store.STORE.station_facilities(stn_cd=station.get("poi_id"), name=station.get("name"))
     except Exception as e:
         logger.warning("역 설비 조회 실패 %s: %s", station.get("name"), e)
         fac = None
@@ -804,11 +908,19 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
 
     cands = _search()
     judge = None
+    # 이 요청의 실시간 조회 예산 — 저상 판정·도착정보 부착·노선형상이 이 순서로 함께 쓴다.
+    # 외부 API 가 느리거나 응답하지 않아도 실시간 조회에 쓰는 시간 합이 예산을 넘지 않는다.
+    live_budget = gbis_live.LiveBudget()
     if lf_mode:
-        judge = lowfloor.LowFloorJudge(gbis_live.LIVE, poi_store.STORE, now=now_ts)
+        judge = lowfloor.LowFloorJudge(gbis_live.LIVE, poi_store.STORE, now=now_ts, budget=live_budget)
         cands = _rank_low_floor(cands, judge, profile, origin)
         best_tier = cands[0]["low_floor"]["tier"] if cands else 3
-        if best_tier not in (1, 2):
+        if cands and best_tier == 0 and judge.realtime_unavailable:
+            # 실시간 응답을 한 건도 받지 못해 판정이 안 된 경우 — "운행 중인 저상버스가 없다"(tier 3)와
+            # 다르다. 반경을 넓혀도 판정 불가 후보만 늘고 채택되지도 않으므로(아래 조건은 tier 1·2 만
+            # 채택) 확장 탐색을 하지 않는다. 450m 안에 후보가 아예 없을 때의 확장은 그대로 한다.
+            pass
+        elif best_tier not in (1, 2):
             # 450m 에 탈 수 있는 저상 후보가 없을 때만 800m 로 넓힌다(사용자 결정 반영)
             wider = _rank_low_floor(_search(lowfloor.STOP_RADIUS_EXPANDED_M, lowfloor.EXPANDED_MAX_STOPS),
                                     judge, profile, origin)
@@ -902,13 +1014,19 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             detail="대중교통 접근 도보 경로를 만들 수 없습니다 (%s)" % last_err,
         )
 
-    _attach_realtime(legs, realtime)
+    _attach_realtime(legs, realtime, live_budget)
+    # 노선형상은 선택된 경로에만 조회한다(후보 단계에서는 캐시에 있을 때만 쓴다). 판정·도착정보보다
+    # 뒤에 두어, 예산이 모자랄 때 빠지는 것이 부가 정보인 지도선이 되게 한다.
+    _fill_bus_geometry(legs, live_budget)
     for leg in legs:                      # 하차 후 역 안/밖 안내 (#77)
         if leg["kind"] == "subway":
             ax = leg.get("alight_exit")
+            # 판정에는 역 설비 전체를 넘긴다. leg 에 붙은 facilities 는 표시용 요약이라 승강기 6건·
+            # 리프트 4건에서 잘려 있어, 출구 승강기가 많은 역에서는 목록 뒤쪽의 승강장 승강기가
+            # 빠지고 "내린 승강장 쪽 승강기" 안내가 나오지 않는다. 전체 조회가 안 되면 요약으로 대신한다.
+            fac_full = _station_facilities_cached(leg["alight"]) or leg["alight"].get("facilities") or {}
             leg["egress"] = station_exits.egress_guide(
-                leg["alight"]["name"], leg["board"]["name"],
-                leg["alight"].get("facilities") or {}, ax)
+                leg["alight"]["name"], leg["board"]["name"], fac_full, ax)
 
     # ── 통합 요약·geometry·steps ──
     walk_legs = [l for l in legs if l["kind"] == "walk"]
@@ -1441,13 +1559,19 @@ def food_nearby(
     radius_m: float = Query(3000, ge=100, le=20000),
     limit: int = Query(5, ge=1, le=30),
     accessible_only: bool = Query(False, description="휠체어 출입이 확인된 곳만"),
+    toilet_radius_m: float = Query(poi_food.TOILET_PAIR_RADIUS_M, ge=0, le=1000,
+                                   description="식당마다 붙이는 접근 가능 화장실 탐색 반경. 0 이면 붙이지 않는다"),
 ):
     """휠체어로 갈 수 있는 음식점 — 관광 음식점(경기관광공사) + 편의시설 실태조사의 음식점 건물.
 
     `entry_status` 는 yes(턱 없는 출입구 확인) / no(턱 있음) / unknown(자료 없음) 3상태다.
     yes 를 먼저, 같은 상태 안에서 가까운 순. `total`·`confirmed` 로 반경 안 전체 수와 확인된 수를 준다.
+    v1.33.0: 항목마다 `toilet` — 식당 자체 장애인 화장실(own) 또는 반경 `toilet_radius_m` 안 가장 가까운
+    접근 가능 화장실(nearby) — 을 붙인다. 소규모 식당은 화장실 자료가 없어 "근처 화장실"이 판단 근거다.
     """
     res = poi_food.food_near(poi_store.STORE, lat, lng, sigungu, radius_m, limit, accessible_only)
+    poi_food.attach_toilets(poi_store.STORE, res["items"], toilet_radius_m)
+    res["toilet_radius_m"] = toilet_radius_m
     metrics.tag(sigungu=sigungu, result_cnt=res["count"])
     return {"source": poi_store.STORE.source, "radius_m": radius_m if lat is not None else None,
             "sigungu": sigungu, **res}
@@ -1676,17 +1800,50 @@ def delete_accessibility_report(report_id: int):
 
 
 # ────────────────────────── admin ──────────────────────────
+def _network_file_or_400(path: str) -> str:
+    """교체할 그래프 파일 경로를 검증해 실경로로 돌려준다.
+
+    그래프 파일은 pickle 이라 읽는 것만으로 파일 안의 코드가 실행될 수 있다. 요청의 path 를
+    그대로 열면 서버가 읽을 수 있는 임의 파일을 pickle 로 해석하게 되므로, 설정된 네트워크
+    파일(NETWORK_PATH)이 있는 디렉터리 아래의 파일만 허용한다. 심볼릭 링크와 `..` 를 푼
+    실경로로 비교한다. 범위 밖이면 400.
+    """
+    base = os.path.realpath(os.path.dirname(settings.network_path) or ".")
+    target = os.path.realpath(path)
+    try:
+        inside = os.path.commonpath([base, target]) == base
+    except ValueError:                    # 드라이브가 다른 경로 등 — 비교 자체가 안 되면 범위 밖
+        inside = False
+    if not inside or target == base:
+        raise HTTPException(status_code=400,
+                            detail="네트워크 파일은 설정된 네트워크 디렉터리 아래에 있어야 합니다")
+    return target
+
+
 @app.post("/admin/reload-network", tags=["admin"], dependencies=[Depends(auth)])
 def reload_network(path: str = Query(None), version: str = Query(None)):
-    """그래프 교체(융기원 원본 도착 시 무중단 반영). 오버라이드도 재적용된다."""
+    """그래프 교체(융기원 원본 도착 시 무중단 반영). 오버라이드도 재적용된다.
+
+    path 는 설정된 네트워크 파일이 있는 디렉터리 아래여야 한다(범위 밖 400, 없는 파일 404).
+    파일이 손상됐거나 그래프 형식이 아니면 422 — 이 경우 종전 그래프로 계속 운행한다.
+    """
+    target = _network_file_or_400(path) if path else settings.network_path
     try:
         meta = NET.load(
-            path or settings.network_path,
+            target,
             version or settings.network_version,
             settings.region_name,
         )
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="네트워크 파일을 찾을 수 없습니다")
+    except Exception as e:
+        # 손상된 pickle·그래프가 아닌 객체·좌표 없는 노드 등. NET.load 는 끝까지 성공했을 때만
+        # 그래프를 바꾸므로 여기 오면 종전 그래프가 그대로다.
+        logger.warning("네트워크 교체 실패 %s — 종전 그래프 유지: %s: %s",
+                       os.path.basename(target), type(e).__name__, e)
+        raise HTTPException(status_code=422,
+                            detail="네트워크 파일을 읽을 수 없습니다(%s) — 종전 그래프로 계속 운행합니다"
+                                   % type(e).__name__)
     meta["overrides"] = _apply_overrides_safe()
     return meta
 

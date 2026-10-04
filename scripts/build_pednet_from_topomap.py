@@ -137,9 +137,5 @@ def main():
           f"({time.time()-t0:.1f}s)")
 
 
-def _coords_5186(nodes, to_5186):
-    return {n["NODE_ID"]: to_5186(n["X"], n["Y"]) for n in nodes}
-
-
 if __name__ == "__main__":
     main()

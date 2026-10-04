@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import pickle
 import re
@@ -206,12 +205,21 @@ class ManualEntrances:
     def __init__(self, path: str = ""):
         self.items = {}
         if path and os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                self.items = json.load(f)
+            # 실측 출입구는 부가 자료다. 파일의 JSON 문법 오류·인코딩 오류·형식 불일치(객체가 아닌
+            # 배열 등)로 예외가 나면 서비스 기동 자체가 멈추므로, BuildingIndex 와 같이 경고만
+            # 남기고 빈 값으로 둔다(목적지는 건물 접근점·대표점으로 해석된다).
+            try:
+                with open(path, encoding="utf-8") as f:
+                    items = json.load(f)
+                if not isinstance(items, dict):
+                    raise ValueError("최상위가 객체(dict)가 아닙니다: %s" % type(items).__name__)
+                self.items = items
+            except (OSError, ValueError) as e:      # JSONDecodeError·UnicodeDecodeError 는 ValueError 의 하위
+                logger.warning("실측 출입구 파일 로드 실패 — 실측 출입구 없이 운행 (%s)", e)
 
     def get(self, poi_id: str):
         v = self.items.get(str(poi_id))
-        if not v or v.get("lat") is None:
+        if not isinstance(v, dict) or v.get("lat") is None:   # 항목 형식이 다르면 없는 것으로 본다
             return None
         return {
             "lat": float(v["lat"]),

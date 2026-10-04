@@ -47,7 +47,6 @@ class Settings:
     edge_snap: bool = os.environ.get("EDGE_SNAP", "true").lower() not in ("0", "false", "no")
     edge_snap_radius_m: float = float(os.environ.get("EDGE_SNAP_RADIUS_M", "60"))
     edge_snap_k: int = int(os.environ.get("EDGE_SNAP_K", "3"))
-    max_alternatives: int = int(os.environ.get("MAX_ALTERNATIVES", "2"))
     off_route_threshold_m: float = float(os.environ.get("OFF_ROUTE_THRESHOLD_M", "30"))
 
     # 계측 로그(#73) — 요청 처리시간·재탐색·추천 스냅샷을 JSONL 로 append. 빈 문자열이면 메모리만.

@@ -169,3 +169,172 @@ def test_api_edge_snap_can_be_disabled(client, monkeypatch):
     d = client.post("/route/plan", json=body).json()
     assert d["origin"]["snap_kind"] == "node"
     assert d["routes"][0]["summary"]["total_distance_m"] > 290
+
+
+# ── 같은 링크 위 출발·도착 — 직결 가상 링크 ──
+def _cand_at(st, frac, south_m=4.0):
+    """A–B 링크의 frac 지점 남쪽 south_m 좌표에서 낸 최근접 투영 후보."""
+    lat, lng = 37.3900 - south_m / 110_540.0, 126.9500 + 0.0023 * frac
+    return vsnap.candidates(st, lat, lng, WM, WM.hard_slope(), allowed=set(st.graph.nodes))[0]
+
+
+def _flip(c, n_seg=1):
+    """같은 투영점을 (v, u) 표기로 뒤집은 후보 — 후보 생성 순서에 따라 표기 방향이 달라질 수 있다.
+
+    선분 번호(seg_index)는 후보 자신의 표기 방향 기준이므로 함께 뒤집는다(n_seg = 링크의 선분 수).
+    """
+    return dict(c, u=c["v"], v=c["u"], t=1.0 - c["t"], seg_index=n_seg - 1 - c["seg_index"])
+
+
+@pytest.mark.parametrize("flip_dest", [False, True])
+def test_same_link_origin_and_destination_are_joined_directly(flip_dest):
+    from route_service.engine.planner import plan
+    from route_service.engine.steps import build_steps
+    st = _store(long_graph())
+    H = vsnap.virtual_graph(st)
+    co, cd = _cand_at(st, 0.4), _cand_at(st, 0.6)
+    assert {co["u"], co["v"]} == {"A", "B"} == {cd["u"], cd["v"]}
+    o = vsnap.attach(H, co, "V_o_0")
+    d = vsnap.attach(H, _flip(cd) if flip_dest else cd, "V_d_0")
+    assert H.has_edge(o, d), "같은 링크 위 두 가상 노드는 직결돼야 한다"
+    seg = 0.2 * co["length"]                      # 40%→60% 구간 길이(약 40m)
+    assert H[o][d]["length"] == pytest.approx(seg, abs=1.0)
+    assert H[o][d]["link_type"] == "sidewalk" and H[o][d]["width"] == 2.0     # 원 링크 속성 상속
+    assert not st.graph.has_node(o) and vsnap._REGISTRY_KEY not in st.graph.graph, "공유 그래프는 그대로여야 한다"
+
+    r = plan(st, o, d, WM, 1, graph=H)["routes"][0]
+    assert r["path"] == [o, d], "링크 끝 노드를 거쳐 되돌아오면 안 된다: %s" % r["path"]
+    assert r["summary"]["total_distance_m"] == pytest.approx(seg, abs=1.5)
+    steps = build_steps(H, r["path"], WM)
+    assert [s["maneuver"] for s in steps] == ["depart", "arrive"]
+    assert all(s["maneuver"] != "uturn" and "유턴" not in s["instruction"] for s in steps)
+    assert steps[0]["distance_m"] == pytest.approx(seg, abs=1.5)
+
+
+def test_same_link_direct_link_follows_bent_geometry():
+    """꺾인 링크에서는 직결 링크의 좌표열이 두 투영점 사이의 꺾임점을 그대로 지난다."""
+    from route_service.engine.geo import path_length_m
+    from route_service.engine.graph import edge_coords
+    G = nx.Graph()
+    G.add_node("A", lat=37.3900, lon=126.9500, node_type="intersection")
+    G.add_node("B", lat=37.3909, lon=126.9512, node_type="intersection")
+    bend = (37.3900, 126.9512)                    # A 에서 동쪽으로 간 뒤 북쪽으로 꺾인다
+    G.add_edge("A", "B", **_edge(length=206.0, geometry=[(37.3900, 126.9500), bend, (37.3909, 126.9512)]))
+    st = _store(G)
+    H = vsnap.virtual_graph(st)
+    co = vsnap.candidates(st, 37.38997, 126.9506, WM, WM.hard_slope(), allowed=set(G.nodes))[0]   # 동서 구간 위
+    cd = vsnap.candidates(st, 37.3905, 126.95123, WM, WM.hard_slope(), allowed=set(G.nodes))[0]   # 남북 구간 위
+    o = vsnap.attach(H, co, "V_o_0")
+    d = vsnap.attach(H, _flip(cd, n_seg=2), "V_d_0")
+    coords = edge_coords(H, o, d)
+    assert len(coords) == 3 and coords[1] == pytest.approx(bend), coords
+    assert H[o][d]["length"] == pytest.approx(path_length_m(coords), abs=1.0)
+    # 분할 링크를 거치는 길(끝 노드 경유)보다 짧아야 탐색이 직결 링크를 고른다
+    assert H[o][d]["length"] < min(H[o]["A"]["length"] + H["A"][d]["length"],
+                                   H[o]["B"]["length"] + H["B"][d]["length"])
+
+
+def test_same_link_when_one_end_snaps_to_real_node():
+    """한쪽이 링크 끝 1m 이내라 끝 노드로 스냅되면 분할 링크가 곧 직결 구간이다."""
+    from route_service.engine.planner import plan
+    st = _store(long_graph())
+    H = vsnap.virtual_graph(st)
+    cd = _cand_at(st, 0.6)
+    near_a = vsnap.candidates(st, 37.3900, 126.95001, WM, WM.hard_slope(), allowed=set(st.graph.nodes))[0]
+    o = vsnap.attach(H, near_a, "V_o_0")
+    d = vsnap.attach(H, cd, "V_d_0")
+    assert o == "A"
+    r = plan(st, o, d, WM, 1, graph=H)["routes"][0]
+    assert r["path"] == ["A", d]
+    assert r["summary"]["total_distance_m"] == pytest.approx(0.6 * cd["length"], abs=1.5)
+
+
+def test_api_same_link_trip_has_no_uturn(client):
+    """`_plan_core` 경유 — 한 링크의 40% 지점에서 60% 지점으로 가는 요청."""
+    lat = 37.3900 - 0.00004
+    body = {"origin": {"lat": lat, "lng": 126.9500 + 0.0023 * 0.4},
+            "destination": {"type": "coord", "lat": lat, "lng": 126.9500 + 0.0023 * 0.6},
+            "profile": "wheelchair_manual"}
+    r = client.post("/route/plan", json=body); assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["origin"]["snap_kind"] == "edge" and d["destination"]["snap_kind"] == "edge"
+    route = d["routes"][0]
+    assert 35 <= route["summary"]["total_distance_m"] <= 46, route["summary"]
+    assert [s["maneuver"] for s in route["steps"]] == ["depart", "arrive"]
+    assert not any("유턴" in s["instruction"] for s in route["steps"])
+    assert 35 <= route["steps"][0]["distance_m"] <= 46
+
+
+# ── 가상 링크의 짧은 구간 경사 예외 — 원 링크 길이로 판정 ─────────────────
+def _steep_graph(length=100.0, slope=9.0):
+    """A ──(sidewalk, 경사 slope 도, 동서 length m)── B. 수동 휠체어 하드 상한은 8도다."""
+    G = nx.Graph()
+    G.add_node("A", lat=37.3900, lon=126.9500, node_type="intersection")
+    G.add_node("B", lat=37.3900, lon=126.9500 + 0.0023 * length / 203.0, node_type="intersection")
+    G.add_edge("A", "B", **_edge(length=length, slope=slope))
+    return G
+
+
+def _attach_pair(st, t0, t1, span_lng):
+    """링크의 t0·t1 지점(남쪽 4m)에 출발·도착 가상 노드를 붙인 사본과 두 노드 id."""
+    H = vsnap.virtual_graph(st)
+    ids = []
+    for tag, t in (("o", t0), ("d", t1)):
+        c = vsnap.candidates(st, 37.3900 - 0.00004, 126.9500 + span_lng * t, WM, WM.hard_slope() + 4.0,
+                             allowed=set(st.graph.nodes))[0]
+        ids.append(vsnap.attach(H, c, "V_%s_0" % tag))
+    return H, ids[0], ids[1]
+
+
+def test_virtual_link_on_long_steep_link_is_not_treated_as_short_link():
+    """경사 9도 100m 링크의 40m→50m 지점: 직결 링크는 10m 지만 경사는 100m 링크에서 잰 값이다.
+
+    짧은 링크 예외(15m 미만은 경사로 막지도 경고하지도 않음)를 잘린 길이로 적용하면 하드 상한 8도를
+    넘는 구간이 완화 표기·경고 없이 통과한다 — 원 링크 길이로 판정해야 한다.
+    """
+    from route_service.engine import planner
+    from route_service.engine.steps import build_steps
+    st = _store(_steep_graph())
+    H, o, d = _attach_pair(st, 0.4, 0.5, 0.0023 * 100.0 / 203.0)
+    direct = H[o][d]
+    assert direct["length"] == pytest.approx(10.0, abs=1.0), "거리 계산용 길이는 실제(짧아진) 길이 그대로"
+    assert direct["orig_length"] == 100.0
+    assert H["A"][o]["orig_length"] == 100.0 and H[o]["B"]["orig_length"] == 100.0, "분할 링크에도 남는다"
+    assert "orig_length" not in st.graph["A"]["B"], "공유 그래프의 실제 링크에는 붙이지 않는다"
+    assert not planner.edge_passable(direct, WM, WM.hard_slope())
+    assert planner.edge_passable(direct, WM, WM.hard_slope() + 2.0)
+
+    # 완화 허용 — 경로는 나오되 완화 사실과 경사 경고가 함께 나온다
+    res = planner.plan(st, o, d, WM, 1, relax=True, graph=H)
+    assert res["fallback"]["used"] is True and res["fallback"]["applied_max_slope_deg"] == 10.0
+    r = res["routes"][0]
+    assert r["path"] == [o, d]
+    assert r["summary"]["total_distance_m"] == pytest.approx(10.0, abs=1.5)
+    assert any("권장 경사" in w for w in r["summary"]["warnings"]), r["summary"]["warnings"]
+    steps = build_steps(H, r["path"], WM)
+    assert any("경사 9.0도 (권장" in w for w in steps[0]["warnings"]), steps[0]["warnings"]
+    assert not any("짧은 구간 경사 추정" in w for w in steps[0]["warnings"])
+    assert steps[0]["distance_m"] == pytest.approx(10.0, abs=1.5)
+
+    # 완화 금지 — 원 링크를 그대로 지날 때와 같이 통행 불가
+    with pytest.raises(planner.NoRouteError):
+        planner.plan(st, o, d, WM, 1, relax=False, graph=H)
+    with pytest.raises(planner.NoRouteError):
+        planner.plan(st, "A", "B", WM, 1, relax=False)
+
+
+def test_real_short_steep_link_keeps_short_link_exception():
+    """실제 그래프의 짧은 링크(12m, 경사 9도)와 그 위의 가상 링크는 종전대로 막지도 경고하지도 않는다."""
+    from route_service.engine import planner
+    from route_service.engine.steps import build_steps
+    st = _store(_steep_graph(length=12.0))
+    assert planner.edge_passable(st.graph["A"]["B"], WM, WM.hard_slope())
+    res = planner.plan(st, "A", "B", WM, 1, relax=False)
+    assert res["fallback"]["used"] is False
+    assert not any("권장 경사" in w for w in res["routes"][0]["summary"]["warnings"])
+    H, o, d = _attach_pair(st, 0.25, 0.75, 0.0023 * 12.0 / 203.0)
+    assert o != d and H[o][d]["orig_length"] == 12.0
+    res = planner.plan(st, o, d, WM, 1, relax=False, graph=H)
+    assert res["fallback"]["used"] is False and res["routes"][0]["path"] == [o, d]
+    assert not any("권장 경사" in w for w in res["routes"][0]["summary"]["warnings"])
+    assert any("짧은 구간 경사 추정" in w for w in build_steps(H, [o, d], WM)[0]["warnings"])

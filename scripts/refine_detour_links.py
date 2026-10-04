@@ -19,8 +19,24 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from route_service.topomap import graphio  # noqa: E402
 from route_service.topomap import refine as rf  # noqa: E402
 from route_service.topomap.obstacles import ObstacleIndex  # noqa: E402
+
+
+def gaps_report_path(report_path: str) -> str:
+    """이면도로 횡단 교량 보고서 경로 — 본 보고서 이름의 확장자 앞에 `_gaps` 를 붙인다.
+
+    `report.replace(".csv", "_gaps.csv")` 로 만들면 확장자가 .csv 가 아닐 때(예: report.txt,
+    확장자 없음) 치환이 일어나지 않아 본 보고서와 **같은 경로**가 되고, 뒤에 쓰는 갭 보고서가
+    본 보고서를 덮어쓴다. 경로 중간에 ".csv" 가 들어간 디렉터리 이름도 함께 바뀐다.
+    os.path.splitext 로 마지막 확장자만 떼어 붙이면 어떤 이름이든 본 보고서와 다른 경로가 된다.
+      data/refine_report.csv → data/refine_report_gaps.csv   (종전과 같다)
+      data/refine_report.txt → data/refine_report_gaps.txt
+      data/refine_report     → data/refine_report_gaps
+    """
+    root, ext = os.path.splitext(report_path)
+    return root + "_gaps" + ext
 
 
 def main():
@@ -32,7 +48,14 @@ def main():
     ap.add_argument("--report", default="data/refine_report.csv")
     ap.add_argument("--version")
     ap.add_argument("--min-confidence", type=float, default=0.0)
+    ap.add_argument("--overwrite-input", action="store_true",
+                    help="--graph 와 같은 경로에 저장하는 것을 허용한다(원본은 <경로>.bak 으로 남긴다)")
     a = ap.parse_args()
+    # 출력이 입력과 같은 경로면 계산 전에 멈춘다 — 정제 링크는 누적되므로 입력을 덮어쓰면 되돌릴 수 없다.
+    try:
+        graphio.check_output_path(a.out, a.graph, a.overwrite_input)
+    except graphio.GraphIOError as e:
+        ap.error(str(e))
     t0 = time.time()
     with open(a.graph, "rb") as f:
         G = pickle.load(f)
@@ -58,7 +81,7 @@ def main():
     gaps = rf.find_gap_bridges(G, ob, dem)
     from collections import Counter
     print("gap bridges %d → %s" % (len(gaps), dict(Counter((c.get("gate") or "adopted").split(" ")[0] for c in gaps))), flush=True)
-    with open(a.report.replace(".csv", "_gaps.csv"), "w", newline="", encoding="utf-8") as fp:
+    with open(gaps_report_path(a.report), "w", newline="", encoding="utf-8") as fp:
         w = csv.writer(fp)
         w.writerow(["a", "b", "lat_a", "lon_a", "lat_b", "lon_b", "straight_m", "via_m", "ratio", "road_name", "gate", "confidence", "slope_deg"])
         for c in gaps:
@@ -76,8 +99,8 @@ def main():
         n += rf.apply_gap_bridges(G, gaps)
         if a.version:
             G.graph["network_version"] = a.version
-        with open(a.out, "wb") as f:
-            pickle.dump(G, f)
+        # 임시 파일에 쓴 뒤 교체한다 — 쓰는 도중 중단돼도 잘린 그래프 파일이 남지 않는다.
+        graphio.save_graph(G, a.out, input_path=a.graph, overwrite_input=a.overwrite_input)
         print("applied %d derived links → %s (%d/%d)" % (n, a.out, G.number_of_nodes(), G.number_of_edges()))
 
 

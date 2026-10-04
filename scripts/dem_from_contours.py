@@ -178,7 +178,6 @@ def main():
     ap.add_argument("--buffer", type=float, default=300.0, help="블록 경계 버퍼(m)")
     args = ap.parse_args()
 
-    import numpy as np
     import rasterio
     from rasterio.transform import from_origin
 

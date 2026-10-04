@@ -301,3 +301,15 @@ def test_missing_building_index_does_not_kill_service(tmp_path):
     idx = BuildingIndex(str(bad))
     assert idx.loaded is False
     assert idx.containing(37.39, 126.95) is None
+
+
+def test_metrics_log_is_written_outside_repository(client):
+    """테스트가 남기는 계측 로그는 저장소의 data/metrics 가 아니라 임시 경로로 간다."""
+    import route_service.api.main as m
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assert client.get("/health").status_code == 200          # request 행 1건 기록
+    path = m.metrics.METRICS.path
+    assert path and os.path.isabs(path)
+    assert os.path.commonpath([repo, os.path.realpath(path)]) != repo, path
+    assert os.path.exists(path), "임시 경로에는 실제로 기록된다"

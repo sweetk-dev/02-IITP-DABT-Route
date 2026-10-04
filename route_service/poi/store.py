@@ -18,6 +18,8 @@ import logging
 import math
 import os
 import re
+import threading
+import time
 
 from ..engine.geo import haversine_m
 
@@ -245,13 +247,84 @@ def tour_category(r: dict):
             return cat, v
     return "tour", None
 
+# ── 조회 결과 캐시의 만료·상한 ──
+# POI_CACHE_TTL_SEC: 캐시 항목의 유효 시간. 원천 테이블은 적재 배치로만 바뀌고 배치는 분 단위로
+#   돌지 않는다 — 10분이면 배치 결과가 재기동 없이 늦어도 10분 안에 반영되고, 비용이 큰 계산
+#   (지역 전체 조회 + 세 소스 오버레이 결합)은 지역당 10분에 한 번으로 묶인다. 만료가 없으면
+#   적재 결과(신규·삭제 POI)가 프로세스를 다시 띄울 때까지 보이지 않는다.
+# POI_CACHE_MAX_ITEMS: 캐시 항목 수 상한. 키에 요청의 지역명(sigungu)·건수(limit)가 들어가므로
+#   상한이 없으면 서로 다른 입력만큼 항목이 늘어난다. 실제로 쓰는 키는 파일 10여 종과
+#   지역(안양) × 조회 종류 몇 가지라 64 면 정상 사용에서는 밀려나는 항목이 없다.
+POI_CACHE_TTL_SEC = 600.0
+POI_CACHE_MAX_ITEMS = 64
+
+
+# 캐시에 값이 없음을 나타내는 표식 — 저장 값이 빈 리스트·None 일 수 있어 따로 둔다.
+_CACHE_MISS = object()
+
+
+class _TtlCache:
+    """만료 시간과 항목 수 상한이 있는 작은 캐시 — dict 처럼 `in` · `[]` · 대입으로 쓴다.
+
+    만료된 항목은 `in` 에서 없는 것으로 보이고, 다음 대입 때 새 값으로 덮인다.
+    `cache[key]` 는 `in` 확인 직후에 부르는 것을 전제로 저장된 값을 그대로 돌려준다
+    (두 호출 사이에 만료 시각이 지나도 KeyError 를 내지 않는다).
+    상한을 넘으면 만료된 항목부터, 그래도 넘으면 넣은 지 오래된 순으로 버린다.
+    """
+
+    def __init__(self, ttl_sec: float = None, max_items: int = None, clock=time.monotonic):
+        self.ttl_sec = float(POI_CACHE_TTL_SEC if ttl_sec is None else ttl_sec)
+        self.max_items = int(POI_CACHE_MAX_ITEMS if max_items is None else max_items)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._items = {}                    # key -> (만료 시각, 값). dict 는 넣은 순서를 유지한다
+
+    def __contains__(self, key) -> bool:
+        hit = self._items.get(key)
+        return hit is not None and hit[0] > self._clock()
+
+    def __getitem__(self, key):
+        return self._items[key][1]
+
+    def get(self, key, default=None):
+        """만료되지 않은 값을 돌려준다. 없거나 만료됐으면 default.
+
+        요청은 여러 스레드에서 동시에 들어온다. `key in cache` 로 확인한 뒤 `cache[key]` 로
+        꺼내면, 그 사이에 다른 스레드의 대입이 상한 정리로 이 키를 지웠을 때 KeyError 가 난다.
+        조회 경로는 확인과 꺼내기를 한 번에 하는 이 메서드를 쓴다
+        (dict.get 한 번은 원자적이라 락 없이도 값 또는 None 만 나온다).
+        """
+        hit = self._items.get(key)
+        if hit is None or hit[0] <= self._clock():
+            return default
+        return hit[1]
+
+    def __setitem__(self, key, value) -> None:
+        now = self._clock()
+        with self._lock:
+            self._items.pop(key, None)      # 다시 넣는 키는 순서의 맨 뒤(가장 최근)로 보낸다
+            self._items[key] = (now + self.ttl_sec, value)
+            if len(self._items) > self.max_items:
+                for k in [k for k, (exp, _v) in self._items.items() if exp <= now]:
+                    del self._items[k]
+                while len(self._items) > self.max_items:
+                    del self._items[next(iter(self._items))]
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+
 class PoiStore:
     def __init__(self, backend: str = "none", data_dir: str = "", dsn: str = ""):
         self.backend = backend
         self.data_dir = data_dir
         self.dsn = dsn
         self._engine = None
-        self._cache = {}
+        self._cache = _TtlCache()           # 만료·상한 근거는 POI_CACHE_TTL_SEC 주석 참고
 
     # ---------- 공통 ----------
     @property
@@ -259,8 +332,9 @@ class PoiStore:
         return self.backend
 
     def _load_file(self, name: str) -> list:
-        if name in self._cache:
-            return self._cache[name]
+        hit = self._cache.get(name, _CACHE_MISS)
+        if hit is not _CACHE_MISS:
+            return hit
         path = os.path.join(self.data_dir, name)
         if not os.path.exists(path):
             self._cache[name] = []
@@ -293,12 +367,14 @@ class PoiStore:
         # 오버레이 결합은 지역당 한 번만 계산한다. /tour/recommend 는 total 산출 때문에
         # 같은 호출을 두 번 하므로 캐시가 없으면 매칭 비용이 그대로 두 배가 된다.
         merged_key = "spots:%s:%d" % ("|".join(variants or []), limit)
-        if self.backend == "db" and merged_key in self._cache:
-            out = self._cache[merged_key]
+        out = self._cache.get(merged_key, _CACHE_MISS) if self.backend == "db" else _CACHE_MISS
+        if out is not _CACHE_MISS:
             return self._bbox_filter(out, bbox)[:limit]
         if self.backend == "file":
             rows = self._load_file("tour_bf.json")
         else:
+            # 삭제 표시(is_deleted='Y') 행은 뺀다 — ID 직접 조회(get_tour_spot)와 같은 조건.
+            # 목록·음식점·이름 검색에 이 조건이 없으면 삭제 처리된 POI 가 추천·검색에 그대로 나온다.
             # 지역 필터는 주소의 시·군·구 토큰 정합으로만 판정한다.
             # LIKE '%안양%' 방식은 주소 전체를 보기 때문에 전남 장흥군 "안양면" 소재
             # POI(거리 307km)까지 포함시켰다(#26). title 대조도 같은 이유로 지역
@@ -333,6 +409,7 @@ class PoiStore:
                        search_filter_json->'search_filter'->>'accommodation' AS sf_accommodation
                   FROM mv_poi
                  WHERE language_code = 'ko'
+                   AND COALESCE(is_deleted, 'N') = 'N'
                    AND latitude IS NOT NULL AND longitude IS NOT NULL
                    {fac}
                    {sg}
@@ -360,8 +437,9 @@ class PoiStore:
             return []
         variants = sigungu_variants(sigungu)
         key = "food:%s" % "|".join(variants or [])
-        if key in self._cache:
-            return self._cache[key]
+        hit = self._cache.get(key, _CACHE_MISS)
+        if hit is not _CACHE_MISS:
+            return hit
         if self.backend == "file":
             rows = [r for r in self._load_file("tour_bf.json")
                     if tour_category(r)[0] == "food"]
@@ -389,6 +467,7 @@ class PoiStore:
                        search_filter_json->'search_filter'->>'restaurant' AS sf_restaurant
                   FROM mv_poi
                  WHERE language_code = 'ko'
+                   AND COALESCE(is_deleted, 'N') = 'N'
                    AND latitude IS NOT NULL AND longitude IS NOT NULL
                    AND COALESCE(search_filter_json->'search_filter'->>'restaurant', '') <> ''
                    {sg}
@@ -426,8 +505,9 @@ class PoiStore:
     def _overlay_rows(self, variants):
         """지역별 오버레이 2종을 한 번만 읽어 캐시한다(배치로만 바뀌는 데이터)."""
         key = "overlay:%s" % "|".join(variants or [])
-        if key in self._cache:
-            return self._cache[key]
+        hit = self._cache.get(key, _CACHE_MISS)
+        if hit is not _CACHE_MISS:
+            return hit
         bf, facl = [], []
         if self.backend == "db":
             params, clause = {}, ""
@@ -644,6 +724,7 @@ class PoiStore:
                        search_filter_json->'search_filter'->>'accommodation' AS sf_accommodation
                   FROM mv_poi
                  WHERE language_code = 'ko'
+                   AND COALESCE(is_deleted, 'N') = 'N'
                    AND latitude IS NOT NULL AND longitude IS NOT NULL
                    AND title ILIKE :q
                    {sg}
@@ -717,19 +798,6 @@ class PoiStore:
             if (r.get("name") or "").replace(" ", "") == norm:
                 return r
         return None
-
-    def get_entrance(self, poi_id: str):
-        """무장애 출입구 좌표. 없으면 시설 대표 좌표로 대체(fallback 표기)."""
-        spot = self.get_tour_spot(poi_id)
-        if spot is None:
-            return None
-        ent = spot.get("entrance")
-        if ent and ent.get("lat") is not None:
-            return {"lat": float(ent["lat"]), "lng": float(ent["lng"]),
-                    "source": "accessible_entrance"}
-        if spot["lat"] is None:
-            return None
-        return {"lat": spot["lat"], "lng": spot["lng"], "source": "facility_centroid"}
 
     def recommend_tour(self, disabilities: list, sigungu: str = "안양",
                        match_mode: str = "all", topk: int = 10,
@@ -1212,9 +1280,7 @@ class PoiStore:
         return out
 
     def resolve_destination(self, dest_type: str, poi_id: str):
-        """목적지 유형별 좌표 해석. tour 는 무장애 출입구 우선."""
-        if dest_type == "tour":
-            return self.get_entrance(poi_id)
+        """목적지 유형별 좌표 해석(역·정류장). tour 는 호출부(api/main.py)가 출입구 해석까지 직접 처리한다."""
         pool = (self._stations() if dest_type == "transit_station"
                 else self._stops(poi_id=poi_id))
         for s in pool:

@@ -129,6 +129,42 @@ def test_food_confirmed_first_unknown_kept(client):
     assert b["items"][0]["facilities"] == ["접근로·경사로", "장애인 화장실"]
 
 
+def test_food_toilet_pairing(client):
+    """v1.33.0 — 식당마다 자체 장애인 화장실(own) 또는 200m 안 접근 가능 화장실(nearby)을 붙인다."""
+    r = client.get("/food/nearby", params={"lat": BASE[0], "lng": BASE[1], "radius_m": 1000})
+    b = r.json()
+    assert b["toilet_radius_m"] == 200
+    by = {i["name"]: i["toilet"] for i in b["items"]}
+    assert by["경사로식당"]["status"] == "own" and by["경사로식당"]["nearby"] is None     # 공원 화장실 267m 밖
+    assert by["흥부가"]["status"] == "nearby" and by["흥부가"]["nearby"]["name"] == "공원 공중화장실"
+    assert 30 <= by["흥부가"]["nearby"]["dist_m"] <= 60 and by["흥부가"]["nearby"]["open_time"] == "24시간"
+    assert by["가까운식당"]["status"] == "nearby"
+    r = client.get("/food/nearby", params={"lat": BASE[0], "lng": BASE[1], "radius_m": 1000, "toilet_radius_m": 0})
+    assert all(i["toilet"]["nearby"] is None for i in r.json()["items"])
+    assert [i["toilet"]["status"] for i in r.json()["items"]] == ["own", "none", "none"]
+
+
+def test_food_toilet_pairing_single_query_and_unknown(monkeypatch):
+    """DB 는 한 번만 부르고, 좌표 없는 식당은 unknown 이다."""
+    from route_service.poi import food as poi_food
+    calls = []
+
+    def fake_toilets_near(store, lat, lng, radius_m, limit, accessible_only):
+        calls.append((round(lat, 4), round(lng, 4), round(radius_m), limit))
+        return [{"name": "화장실A", "lat": 37.3906, "lng": 126.95, "source": "PUBLIC_TOILET", "open_time": "24시간"}]
+    monkeypatch.setattr(poi_food.poi_support, "toilets_near", fake_toilets_near)
+    items = [{"name": "a", "lat": 37.3905, "lng": 126.95, "facilities": []},
+             {"name": "b", "lat": 37.3910, "lng": 126.95, "facilities": ["장애인 화장실"]},
+             {"name": "c", "lat": None, "lng": None, "facilities": []},
+             {"name": "d", "lat": 37.4200, "lng": 126.95, "facilities": None}]
+    poi_food.attach_toilets(None, items, 200)
+    assert len(calls) == 1 and calls[0][3] == 500
+    assert items[0]["toilet"]["status"] == "nearby" and items[0]["toilet"]["nearby"]["dist_m"] == 11
+    assert items[1]["toilet"]["status"] == "own" and items[1]["toilet"]["nearby"]["name"] == "화장실A"
+    assert items[2]["toilet"]["status"] == "unknown" and items[2]["toilet"]["nearby"] is None
+    assert items[3]["toilet"]["status"] == "none"                      # 3.3km 밖 — 반경 안 화장실 없음
+
+
 def test_food_accessible_only_and_no_origin(client):
     r = client.get("/food/nearby", params={"lat": BASE[0], "lng": BASE[1], "accessible_only": "true"})
     assert [i["entry_status"] for i in r.json()["items"]] == ["yes", "yes"]
@@ -191,3 +227,48 @@ def test_workplaces_filter(client):
     assert [i["name"] for i in b["items"]] == ["㈜고운누리"] and b["base_date"] == "2025-07-10"
     r = client.get("/directory/workplaces")
     assert r.json()["total"] == 2
+
+
+# ── 음식점 조회의 지역 대조 ─────────────────────────────────────
+def test_food_region_filter_uses_admin_unit_tokens(tmp_path):
+    """다른 시·군의 '안양면'·'안양동' 주소는 sigungu='안양' 조회에 들어오지 않는다."""
+    from route_service.poi import food as poi_food
+    from route_service.poi.store import PoiStore
+
+    def row(i, name, addr):
+        r = _facl(i, name, "일반음식점", 37.39 + 0.001 * i, 126.95, entrance_ramp_yn="Y")
+        r["addr"] = addr
+        return r
+    (tmp_path / "facility_accessibility.json").write_text(json.dumps([
+        row(1, "안양국밥", "경기도 안양시 만안구 안양로 1"),
+        row(2, "수문횟집", "전라남도 장흥군 안양면 수문리 2"),
+        row(3, "부산밀면", "부산광역시 안양동 3"),
+    ], ensure_ascii=False), encoding="utf-8")
+    st = PoiStore(backend="file", data_dir=str(tmp_path))
+    names = {it["name"] for it in poi_food.food_near(st, sigungu="안양", limit=50)["items"]}
+    assert names == {"안양국밥"}
+    # 행정단위가 붙은 지역명·빈 지역명도 종전과 같이 동작한다
+    assert {it["name"] for it in poi_food.food_near(st, sigungu="안양시", limit=50)["items"]} == {"안양국밥"}
+    assert len(poi_food.food_near(st, sigungu="", limit=50)["items"]) == 3
+
+
+def test_food_building_query_pushes_region_filter_to_sql():
+    """db 백엔드 — 실태조사 음식점 조회에 지역 조건이 SQL 로 들어간다(전국 행을 읽지 않는다)."""
+    from route_service.poi import food as poi_food
+    from route_service.poi.store import PoiStore
+
+    class _Rec(PoiStore):
+        def __init__(self):
+            super().__init__(backend="db", dsn="postgresql+psycopg2://x/y")
+            self.calls = []
+
+        def _query(self, sql, params):
+            self.calls.append((sql, dict(params)))
+            return []
+    st = _Rec()
+    poi_food.food_near(st, sigungu="안양")
+    hits = [(s, p) for s, p in st.calls if "FROM poi_facility_accessibility" in s and "facl_type = ANY" in s]
+    assert len(hits) == 1
+    sql, params = hits[0]
+    assert "COALESCE(addr, '') LIKE '%%' || :ad0 || '%%'" in sql
+    assert [params["ad0"], params["ad1"], params["ad2"]] == ["안양시", "안양군", "안양구"]

@@ -8,7 +8,8 @@ OSM 태그 -> 표준 link_type 매핑:
     highway=footway/path/pedestrian    -> sidewalk
     bridge=yes + highway=footway       -> overpass (육교)
     tunnel=yes + highway=footway       -> underpass (지하보도)
-    highway=elevator / conveying=yes   -> elevator / ramp
+    highway=elevator                   -> elevator
+    highway=steps + conveying          -> steps (에스컬레이터 — 휠체어 통행 불가)
     그 외 보행 허용 도로               -> road
 휠체어 관련 태그: wheelchair(yes/limited/no), incline, width, kerb, tactile_paving, surface
 """
@@ -39,11 +40,12 @@ def classify_link(tags: dict) -> str:
     footway = _as_str(tags.get("footway")) or ""
     bridge = _as_str(tags.get("bridge")) or ""
     tunnel = _as_str(tags.get("tunnel")) or ""
-    conveying = _as_str(tags.get("conveying")) or ""
 
     if hw == "steps":
-        if conveying in ("yes", "forward", "backward"):
-            return "ramp"  # 에스컬레이터는 휠체어 통행 불가에 준하나 별도 표기
+        # 에스컬레이터(highway=steps + conveying)도 계단으로 분류한다. "ramp" 로 두면 휠체어
+        # 프로필의 회피 대상(avoid=steps)에 걸리지 않아 경로에 포함되고 "경사로를 따라 이동"으로
+        # 안내된다 — 휠체어는 에스컬레이터를 이용할 수 없다. 링크 종류에 에스컬레이터 전용 값이
+        # 없으므로 통행 불가 판정이 같은 steps 로 둔다(conveying 값과 무관하게 같은 결과).
         return "steps"
     if hw == "elevator":
         return "elevator"

@@ -9,11 +9,9 @@
 """
 from __future__ import annotations
 
-import uuid
-
 import networkx as nx
 
-from .geo import (haversine_m, lead_bearing, path_length_m,
+from .geo import (haversine_m, lead_bearing,
                   point_segment_dist_m, trail_bearing, turn_angle)
 from .graph import edge_coords
 from .profiles import Profile
@@ -27,6 +25,26 @@ UTURN_RETRY = 3
 # 짧은 링크(횡단보도 8m 등)의 DEM 경사는 5m 격자 보간 오차가 그대로 각도로 튄다(8m 링크 1.1m 차이 = 7.8°).
 # 이 길이 미만은 경사로 통행을 막지 않고 비용 가중만 한다 (v1.20.0).
 SHORT_LINK_M = 15.0
+
+
+def slope_ref_length(data: dict) -> float:
+    """"짧은 링크" 판정(SHORT_LINK_M)에 쓰는 길이(m) — 가상 링크는 원 링크 길이, 그 밖에는 자기 길이.
+
+    짧은 링크 예외는 "5m 격자 DEM 으로 잰 짧은 링크의 경사는 믿기 어렵다"는 이유로 둔 것이다.
+    요청 단위 가상 링크(engine.vsnap 의 분할·직결 링크)는 원 링크의 경사를 그대로 상속하면서
+    길이만 투영점 사이로 짧아진다. 자기 길이로 판정하면 경사 9도 100m 링크 위의 10m 이동이
+    "짧은 링크"가 되어 경사 제한도 경고도 받지 않는다 — 경사값은 100m 구간에서 잰 것이므로
+    짧은 링크 예외의 근거(측정 오차)가 해당하지 않는다.
+    그래서 가상 링크에는 원 링크 길이가 `orig_length` 로 남고(vsnap.attach), 여기서는 그 값을 쓴다.
+    `orig_length` 가 없는 링크(실제 그래프의 링크 전부)는 종전과 같이 자기 `length` 로 판정한다.
+    경로 거리·소요시간·비용 계산은 이 함수가 아니라 실제 `length` 를 쓴다.
+
+    인자 data: 링크 속성 dict. 반환: 길이(m). 값이 없거나 숫자가 아니면 0.0(= 짧은 링크로 본다, 종전 동작).
+    """
+    try:
+        return float(data.get("orig_length") or data.get("length") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 class NoRouteError(Exception):
@@ -71,7 +89,8 @@ def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
     if data["link_type"] in profile.avoid:
         return False
     # max_slope_deg 는 하드 상한(profile.hard_slope() 또는 완화 단계). 짧은 링크는 경사로 막지 않는다 (v1.20.0)
-    if data["slope"] > max_slope_deg and float(data.get("length") or 0.0) >= SHORT_LINK_M:
+    # 가상 링크(분할·직결)는 원 링크 길이로 짧은 링크 여부를 본다 — slope_ref_length 주석 참고
+    if data["slope"] > max_slope_deg and slope_ref_length(data) >= SHORT_LINK_M:
         return False
     w = data.get("width")
     if profile.min_width_m and w is not None and w < profile.min_width_m:
@@ -132,7 +151,8 @@ def _summarize(G, path, profile, slope_coverage: float = 1.0) -> dict:
         if lt == "crossing" and d.get("curb_cut") is False:
             warnings.append("턱낮춤 없는 횡단보도 구간이 있습니다")
         warnings.extend(d.get("report_warnings") or [])   # 이용자 제보 경고 (overrides)
-        if float(d["slope"]) > profile.max_slope_deg and float(d.get("length") or 0.0) >= SHORT_LINK_M:
+        # 짧은 링크 예외의 기준 길이는 edge_passable 과 같다(가상 링크는 원 링크 길이)
+        if float(d["slope"]) > profile.max_slope_deg and slope_ref_length(d) >= SHORT_LINK_M:
             warnings.append(
                 "권장 경사(%.1f도)를 넘는 구간이 포함되어 있습니다" % profile.max_slope_deg
             )
@@ -244,6 +264,10 @@ def plan(store, start_node, goal_node, profile: Profile, alternatives: int = 1,
         n = len(_uturn_edges(G, cand))
         if n < best_n:
             best_n, best_path = n, cand
+        else:
+            # 나아지지 않았으면 그만둔다. best_path 가 그대로면 다음 회차의 페널티 집합도 그대로여서
+            # 같은 탐색이 같은 결과로 남은 횟수만큼 되풀이될 뿐이다(A* 비용만 든다).
+            break
     primary = best_path
 
     routes = [primary]

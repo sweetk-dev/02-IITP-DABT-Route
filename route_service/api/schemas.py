@@ -6,6 +6,9 @@
     (기존 crossing_cnt = crossing 링크 수 — 의미 불변)
   - routes[].steps[].maneuver == "crossing_point" : 노드 부착 횡단보도 안내 스텝
     (distance_m 0, crosswalk_cnt 포함. 턱낮춤 False=경고 / None="턱낮춤 미상")
+v1.34.0 추가 필드(추가 전용):
+  - crossing_point 스텝의 crossing_ahead(true) · crossing_side(left|right|both) ·
+    crossing_length_m · crosswalk_ids — 직진으로 지나는 교차로에서 가는 길을 가로막는 큰 횡단보도
 """
 from __future__ import annotations
 

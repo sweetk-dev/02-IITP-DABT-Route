@@ -6,7 +6,9 @@
 """
 from __future__ import annotations
 
-from .geo import haversine_m, lead_bearing, trail_bearing, turn_angle
+import math
+
+from .geo import bearing_deg, haversine_m, lead_bearing, trail_bearing, turn_angle
 from .graph import edge_coords
 from .profiles import Profile
 
@@ -18,6 +20,15 @@ TACTILE_PROFILES = ("visual",)
 
 def tactile_for(profile) -> bool:
     return bool(profile) and getattr(profile, "id", None) in TACTILE_PROFILES
+
+# 직진으로 지나는 교차로에서도 알릴 횡단보도의 기준 (v1.34.0).
+# 가는 길을 가로막는 옆길 횡단보도(진행 방향의 좌우로 벗어나 있는 것)이고 건너는 거리가 기준 이상이면 알린다.
+CROSS_AHEAD_MIN_M = 9.0           # 건너는 거리(m) — 10m 안팎을 겨냥하되 원천 실측 오차만큼 낮춰 잡는다
+CROSS_AHEAD_LATERAL_MIN_M = 5.0   # 진행 축에서 좌우로 이만큼은 벗어나 있어야 옆길 횡단보도로 본다
+CROSS_AHEAD_LATERAL_MAX_M = 30.0  # 넓은 길의 반폭까지 — 노드 부착 반경(30m)과 같다
+CROSS_AHEAD_ALONG_MAX_M = 15.0    # 진행 방향 앞뒤 허용 폭
+CROSS_AHEAD_SPAN_M = 25.0         # 직진 여부·진행 방위각을 재는 앞뒤 구간 — 교차로 안 짧은 절점의 방위각 튐을 넘긴다
+CROSS_AHEAD_SIDE_DEG = (30.0, 150.0)   # 옆길로 보는 갈림 각도 범위(진행 방향 기준 좌·우)
 
 # 회전 임계각(도)
 SLIGHT = 20.0
@@ -67,10 +78,31 @@ def _maneuver_from_angle(angle: float) -> str:
     return "sharp_left" if a >= SHARP else "left"
 
 
+def _maneuver_from_carried(angle: float) -> str:
+    """짧은 링크를 거치며 누적된 회전각(정규화하지 않은 합, 양수=우) → maneuver.
+
+    - 합이 ±180° 이내면 `_maneuver_from_angle` 과 같다(종전 동작).
+    - 합의 절댓값이 180° 를 넘으면(같은 쪽으로 연달아 꺾은 경우) ±180° 로 접어 좌우를 뒤집지 않는다.
+      예: 우 120° → 8m 링크 → 우 120° 는 합 240° 이고, 접으면 −120°(급좌회전)가 되지만
+      이용자는 실제로 오른쪽으로 두 번 돈다. "급좌회전"을 들으면 반대쪽으로 돌게 된다.
+      · 접은 값이 유턴 기준(150° 이상)이면 결과적으로 되돌아 나가는 것이므로 유턴(좌우 구분 없음).
+      · 그 밖에는 누적된 방향 그대로의 급회전(sharp_right / sharp_left) — 기존 maneuver 체계에서
+        "그 방향으로 크게 돈다"를 나타내는 가장 큰 값이다.
+    """
+    if abs(angle) <= 180.0:
+        return _maneuver_from_angle(angle)
+    folded = (angle + 180.0) % 360.0 - 180.0
+    if abs(folded) >= 150.0:
+        return "uturn"
+    return "sharp_right" if angle > 0 else "sharp_left"
+
+
 def _edge_warnings(data: dict, profile: Profile) -> list:
     out = []
     slope = float(data["slope"])
-    short = float(data.get("length") or 0.0) < SHORT_LINK_M
+    # 가상 링크(출발·도착 투영으로 잘린 링크)는 원 링크 길이로 본다 — 긴 급경사 링크의 일부를
+    # 짧게 지난다고 "짧은 구간 경사 추정"으로 낮춰 말하지 않는다(planner.slope_ref_length 와 같은 기준).
+    short = float(data.get("orig_length") or data.get("length") or 0.0) < SHORT_LINK_M
     if slope > profile.max_slope_deg:
         if short:
             out.append("짧은 구간 경사 추정 %.1f도" % slope)   # 격자 보간 오차 가능 — 확정 표현을 피한다 (v1.20.0)
@@ -89,8 +121,120 @@ def _edge_warnings(data: dict, profile: Profile) -> list:
     return out
 
 
+def _through_bearing(raw, i, span_m: float = CROSS_AHEAD_SPAN_M):
+    """raw[i] 가 시작하는 노드를 지나는 진행 방위각. 직진이 아니면 None (v1.34.0).
+
+    노드 앞뒤 span_m 만큼의 경로 좌표로 잰다. 바로 붙은 링크만 보면 교차로 안 1~2m 절점에서
+    방위각이 튀어, 실제로는 직진인데 꺾인 것으로 읽힌다.
+    """
+    def _walk(coords_iter):
+        acc, first, prev = 0.0, None, None
+        for c in coords_iter:
+            if first is None:
+                first = prev = c
+                continue
+            acc += haversine_m(prev[0], prev[1], c[0], c[1])
+            prev = c
+            if acc >= span_m:
+                break
+        return first, prev, acc
+
+    def _back():
+        for k in range(i - 1, -1, -1):
+            for c in reversed(raw[k]["coords"]):
+                yield c
+
+    def _fwd():
+        for k in range(i, len(raw)):
+            for c in raw[k]["coords"]:
+                yield c
+
+    n0, far_b, d_b = _walk(_back())
+    n1, far_f, d_f = _walk(_fwd())
+    if n0 is None or n1 is None or d_b < 1.0 or d_f < 1.0:
+        return None
+    b_in = bearing_deg(far_b[0], far_b[1], n0[0], n0[1])
+    b_out = bearing_deg(n1[0], n1[1], far_f[0], far_f[1])
+    turn = turn_angle(b_in, b_out)
+    if abs(turn) >= SLIGHT:
+        return None
+    return (b_in + turn / 2.0) % 360.0
+
+
+def _side_roads(G, node, bearing, skip=()) -> set:
+    """노드에서 진행 방향의 왼쪽·오른쪽으로 갈리는 길이 있는 쪽 — {"left", "right"} 의 부분집합.
+
+    skip 은 경로가 드나드는 이웃 노드(걸어온 길·갈 길). 횡단보도·승강기 같은 특수 링크와
+    길이가 없는 링크(방위각을 잴 수 없다)는 옆길로 치지 않는다.
+    """
+    lo, hi = CROSS_AHEAD_SIDE_DEG
+    out = set()
+    for nb in G.neighbors(node):
+        if nb in skip:
+            continue
+        data = G[node][nb]
+        if data.get("link_type") in ("crossing", "elevator", "ramp", "steps"):
+            continue
+        coords = edge_coords(G, node, nb)
+        if haversine_m(coords[0][0], coords[0][1], coords[-1][0], coords[-1][1]) < 1.0:
+            continue
+        rel = turn_angle(bearing, lead_bearing(coords, BEARING_SPAN_M))   # 양수 = 오른쪽
+        if lo <= abs(rel) <= hi:
+            out.add("right" if rel > 0 else "left")
+    return out
+
+
+def _crosswalks_ahead(G, node, bearing, skip=()) -> list:
+    """직진으로 지나는 노드에서, 가는 길을 가로막는 큰 횡단보도를 고른다 (v1.34.0).
+
+    도로 중심선으로 이어진 구간은 옆길을 건너는 횡단이 링크로 잡히지 않아, 노드에 붙은
+    횡단보도를 직진 통과 때 모두 생략하면 큰 교차로도 말없이 지나가게 된다.
+    노드에 붙은 횡단보도의 위치(cw_points)를 진행 방향 기준으로 나눠 보면
+      · 진행 축 위(앞뒤)에 놓인 것 — 지금 따라가는 길을 건너는 횡단보도. 지나칠 뿐이다
+      · 진행 축에서 좌우로 벗어난 것 — 옆길을 건너는 횡단보도. 보도로 직진하려면 건너야 한다
+    뒤쪽만 골라, 건너는 거리가 CROSS_AHEAD_MIN_M 이상인 것을 돌려준다.
+    그쪽으로 실제 갈리는 길이 있을 때만 인정한다 — 나란한 다른 길의 횡단보도가 붙은 경우를 거른다.
+    걷는 쪽 보도(왼쪽·오른쪽)는 알 수 없으므로 어느 쪽에 있는지도 함께 준다.
+    cw_points 가 없는 그래프에서는 빈 목록 — 종전 동작 그대로다.
+    """
+    if bearing is None:
+        return []
+    attrs = G.nodes[node]
+    pts = attrs.get("cw_points") or []
+    if not pts:
+        return []
+    roads = _side_roads(G, node, bearing, skip)
+    if not roads:                          # 갈림이 없는 지점에는 건널 옆길이 없다
+        return []
+    lat0, lon0 = float(attrs["lat"]), float(attrs["lon"])
+    b = math.radians(float(bearing))
+    de, dn = math.sin(b), math.cos(b)      # 진행 방향 단위벡터(동, 북)
+    k_e = 111320.0 * math.cos(math.radians(lat0))
+    out = []
+    for pt in pts:
+        try:
+            length = float(pt.get("length_m") or 0.0)
+            e = (float(pt["lon"]) - lon0) * k_e
+            n = (float(pt["lat"]) - lat0) * 110540.0
+        except (TypeError, ValueError, KeyError, AttributeError):
+            continue
+        if length < CROSS_AHEAD_MIN_M:
+            continue
+        along = e * de + n * dn
+        left = -e * dn + n * de            # 진행 방향의 왼쪽이 +
+        if abs(along) > CROSS_AHEAD_ALONG_MAX_M or abs(left) <= abs(along):
+            continue
+        if not (CROSS_AHEAD_LATERAL_MIN_M <= abs(left) <= CROSS_AHEAD_LATERAL_MAX_M):
+            continue
+        side = "left" if left > 0 else "right"
+        if side not in roads:
+            continue
+        out.append({"id": pt.get("id"), "side": side, "length_m": length})
+    return out
+
+
 def _node_crosswalk_step(G, node, position: str = "mid", profile=None,
-                         turning: bool = False) -> dict | None:
+                         turning: bool = False, bearing=None, skip=()) -> dict | None:
     """노드에 지점 부착된 횡단보도의 안내 스텝(안내 전용 계층).
 
     안양시 원천 횡단보도 2,728건 중 다수는 crossing 링크가 아니라 최근접 노드에
@@ -113,6 +257,13 @@ def _node_crosswalk_step(G, node, position: str = "mid", profile=None,
       · 꺾이는 지점이면 정보형("횡단보도가 있는 지점입니다")으로만 알린다
     지시형은 crossing 링크 스텝(_sentence)에서만 쓴다.
 
+    예외 — v1.34.0: 직진 통과라도 가는 길을 가로막는 큰 횡단보도(_crosswalks_ahead)가 있으면
+    프로필과 무관하게 알린다. "옆길 횡단보도"라고 짚어, 따라가던 길을 건너라는 뜻으로 듣지
+    않게 한다. 한쪽에만 있으면 그쪽 보도로 가는 경우로 한정해 말한다(걷는 쪽을 모른다).
+    이 스텝에는 "턱낮춤 미상"을 붙이지 않는다 — 원천 기재율이 낮아 거의 모든 교차로에서
+    되풀이되기 때문. 확인된 "없음"만 알린다.
+    bearing 은 그 노드를 직진으로 지나는 진행 방위각(직진이 아니면 None).
+
     cw_curb_cut / cw_tactile_paving 의 None 은 "없음"이 아니라 **미상**이다
     (원천 기재율 4.4%). False 일 때만 "없음" 경고, None 은 "턱낮춤 미상" 표기.
     """
@@ -120,13 +271,14 @@ def _node_crosswalk_step(G, node, position: str = "mid", profile=None,
     cnt = int(attrs.get("crosswalk_cnt") or 0)
     if cnt <= 0:
         return None
-    if position == "mid" and not turning and not tactile_for(profile):
+    ahead = _crosswalks_ahead(G, node, bearing, skip) if position == "mid" else []
+    if position == "mid" and not turning and not tactile_for(profile) and not ahead:
         return None
     warnings = []
     curb = attrs.get("cw_curb_cut")
     if curb is False:
         warnings.append("턱낮춤 없음")
-    elif curb is None:
+    elif curb is None and not ahead:
         warnings.append("턱낮춤 미상")
     if attrs.get("cw_tactile_paving") is False and tactile_for(profile):
         warnings.append("점자블록 없음")   # 시각장애 프로필에서만 (v1.20.0)
@@ -135,13 +287,20 @@ def _node_crosswalk_step(G, node, position: str = "mid", profile=None,
         base = "출발 지점에 횡단보도%s가 있습니다." % many
     elif position == "end":
         base = "도착 지점에 횡단보도%s가 있습니다." % many
+    elif ahead:
+        sides = {a["side"] for a in ahead}
+        if len(sides) == 2:
+            base = "교차로입니다. 옆길 횡단보도를 건넙니다."
+        else:
+            base = ("교차로입니다. %s 보도로 가는 중이면 옆길 횡단보도를 건넙니다."
+                    % ("왼쪽" if "left" in sides else "오른쪽"))
     elif cnt == 1:
         base = "횡단보도가 있는 지점입니다."
     else:
         base = "횡단보도 %d개가 있는 지점입니다." % cnt
     if warnings:
         base += " (%s)" % ", ".join(warnings)
-    return {
+    step = {
         "maneuver": "crossing_point",
         "instruction": base,
         "distance_m": 0,
@@ -152,6 +311,13 @@ def _node_crosswalk_step(G, node, position: str = "mid", profile=None,
         "warnings": warnings,
         "crosswalk_cnt": cnt,
     }
+    if ahead:
+        sides = {a["side"] for a in ahead}
+        step["crossing_ahead"] = True
+        step["crossing_side"] = "both" if len(sides) == 2 else next(iter(sides))
+        step["crossing_length_m"] = round(max(a["length_m"] for a in ahead))
+        step["crosswalk_ids"] = [a["id"] for a in ahead if a.get("id")]
+    return step
 
 
 def _josa(word: str, with_batchim: str, without_batchim: str) -> str:
@@ -205,7 +371,6 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
         return []
 
     raw = []
-    coord_cursor = 0
     for u, v in zip(path[:-1], path[1:]):
         data = G[u][v]
         coords = edge_coords(G, u, v)
@@ -238,6 +403,9 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
         else:
             turn_here = turn_angle(prev_out, seg["in_bearing"])
             pending_angle += turn_here
+            # 이월각은 ±180° 로 접지 않고 합 그대로 들고 간다. 짧은 링크를 사이에 두고 같은 쪽으로
+            # 두 번 꺾으면 합이 180° 를 넘는데(예: 우 120° + 우 120° = 240°), 접으면 −120° 가 되어
+            # 실제로는 오른쪽으로 도는 길이 "급좌회전"으로 안내된다. 판정은 _maneuver_from_carried 가 한다.
             if special:
                 # 특수 링크는 링크 종류로 안내한다(종전과 동일). 이월각은 여기서 정리한다.
                 maneuver = "straight"
@@ -246,15 +414,18 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
                 # 짧은 링크의 회전은 안내하지 않고 다음으로 이월 — 아래 merge 로 앞 스텝에 흡수된다.
                 maneuver = "straight"
             else:
-                maneuver = _maneuver_from_angle(pending_angle)
+                maneuver = _maneuver_from_carried(pending_angle)
                 pending_angle = 0.0
 
         # 노드 부착 횡단보도 안내 — 경로 중간 노드(seg 시작점).
         # 앞뒤 어느 한쪽이 crossing 링크면 링크 스텝이 이미 횡단을 안내하므로 생략(중복 방지).
         if i > 0 and lt != "crossing" and raw[i - 1]["data"]["link_type"] != "crossing":
             # 직진 통과면 알리지 않는다 — 위 _node_crosswalk_step 주석 참고 (v1.21.0)
+            # 앞뒤 25m 로 보아 직진이면(through 가 값) 바로 붙은 링크의 방위각 튐은 회전으로 치지 않는다
+            through = _through_bearing(raw, i)
             cw = _node_crosswalk_step(G, seg["u"], profile=profile,
-                                      turning=abs(turn_here) >= SLIGHT)
+                                      turning=(through is None and abs(turn_here) >= SLIGHT),
+                                      bearing=through, skip=(raw[i - 1]["u"], seg["v"]))
             if cw is not None:
                 cw.update({"idx": len(steps), "_cw_point": True,
                            "_link_type": None, "_maneuver_special": True})
@@ -335,6 +506,9 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
                 "link_type": s["_link_type"],
                 "link_name": s["_link_name"],
                 "warnings": s["_warnings"],
+                # 횡단보도 링크의 관리번호(안양시 좌표본) — 한 횡단보도가 여러 링크로 나뉘어 있을 때
+                # 클라이언트가 같은 횡단보도의 조각을 묶어 한 번만 안내하게 한다 (v1.33.1, #98)
+                "crosswalk_id": (s["_data"].get("cw_mgmt_no") if s["_link_type"] == "crossing" else None),
             }
         )
 

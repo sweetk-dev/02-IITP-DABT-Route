@@ -14,5 +14,4 @@ psycopg2-binary>=2.9
 # osmnx>=1.9
 # pandas>=2.0
 # openpyxl>=3.1
-# xdem>=0.1
 # pyproj>=3.6

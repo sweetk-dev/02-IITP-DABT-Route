@@ -21,10 +21,13 @@ from __future__ import annotations
 
 from ..engine.geo import haversine_m
 from . import buildings as poi_buildings
-from .store import SOURCE_LABELS, SAME_BUILDING_M, _name_match_rank, _norm_name
+from . import support as poi_support
+from .store import (SOURCE_LABELS, SAME_BUILDING_M, _addr_in_sigungu, _name_match_rank, _norm_name,
+                    sigungu_variants)
 
 FOOD_FACL_TYPES = ("일반음식점", "휴게음식점·제과점")
 ENTRY_ORDER = {"yes": 0, "unknown": 1, "no": 2}
+TOILET_PAIR_RADIUS_M = 200.0      # 식당 ↔ 접근 가능 화장실 짝짓기 반경 (v1.33.0)
 
 
 def _listing_entry(spot: dict) -> str:
@@ -101,6 +104,49 @@ def _dup(b: dict, items: list) -> bool:
     return False
 
 
+def attach_toilets(store, items: list, radius_m: float = TOILET_PAIR_RADIUS_M) -> list:
+    """식당마다 가장 가까운 접근 가능 화장실을 붙인다 (v1.33.0, #96).
+
+    소규모 일반음식점은 장애인등편의법상 편의시설 설치 의무 대상이 아니라 식당 자체 장애인 화장실
+    자료가 거의 없다. 대신 "식당 + 반경 200m 안 접근 가능 화장실(공중·시설 내·공공건물 안)" 을
+    짝지어 준다. ``toilet.status`` — own(식당 무장애 속성에 장애인 화장실) / nearby(반경 안 있음) /
+    none(둘 다 없음) / unknown(좌표가 없어 찾지 못함). ``toilet.nearby`` 는 가장 가까운 1곳.
+
+    DB 는 한 번만 부른다 — 목록 전체를 덮는 원과 반경으로 ``toilets_near`` 를 1회 호출한 뒤
+    식당마다 메모리에서 최근접을 고른다(항목 수만큼 질의하지 않는다).
+    """
+    for it in items:
+        fac = it.get("facilities")
+        own = isinstance(fac, list) and "장애인 화장실" in fac
+        it["toilet"] = {"status": "own" if own else "none", "nearby": None, "radius_m": radius_m}
+    located = [it for it in items if it.get("lat") is not None and it.get("lng") is not None]
+    for it in items:
+        if it not in located and it["toilet"]["status"] != "own":
+            it["toilet"]["status"] = "unknown"
+    if radius_m <= 0 or not located:
+        return items
+    clat = sum(it["lat"] for it in located) / len(located)
+    clng = sum(it["lng"] for it in located) / len(located)
+    spread = max(haversine_m(clat, clng, it["lat"], it["lng"]) for it in located)
+    pool = poi_support.toilets_near(store, clat, clng, spread + radius_m, 500, True)
+    for it in located:
+        best, best_d = None, radius_m
+        for t in pool:
+            if t.get("lat") is None:
+                continue
+            d = haversine_m(it["lat"], it["lng"], t["lat"], t["lng"])
+            if d <= best_d:
+                best, best_d = t, d
+        if best is None:
+            continue
+        it["toilet"]["nearby"] = {"name": best.get("name"), "dist_m": round(best_d), "source": best.get("source"),
+                                  "open_time": best.get("open_time_detail") or best.get("open_time"),
+                                  "lat": best.get("lat"), "lng": best.get("lng")}
+        if it["toilet"]["status"] != "own":
+            it["toilet"]["status"] = "nearby"
+    return items
+
+
 def food_near(store, lat: float = None, lng: float = None, sigungu: str = "안양",
               radius_m: float = 3000.0, limit: int = 5, accessible_only: bool = False) -> dict:
     """음식점 목록 — 휠체어 출입 확인(yes)을 먼저, 같은 상태 안에서 가까운 순.
@@ -109,15 +155,19 @@ def food_near(store, lat: float = None, lng: float = None, sigungu: str = "안�
     휠체어 출입이 확인된 곳 수 — "정보가 있는 곳이 몇 곳뿐" 을 정직하게 말하는 근거다.
     """
     items = [_from_listing(s) for s in store.list_food(sigungu)]
-    rows = poi_buildings.fetch_rows(store, types=FOOD_FACL_TYPES)
-    variants_ok = (sigungu or "").strip()
+    # 지역 대조는 관광 음식점 목록(store.list_food)과 같은 규칙을 쓴다 — 지역명에 행정단위
+    # 접미사를 붙인 토큰("안양시"/"안양군"/"안양구")이 주소에 있을 때만 그 지역으로 본다.
+    # 지역명 그대로의 부분일치("안양" in 주소)는 다른 시·군의 "안양면"·"안양동" 주소까지 포함한다.
+    # db 백엔드는 같은 토큰을 SQL 조건으로도 넘겨 전국 행을 읽지 않는다.
+    variants = sigungu_variants(sigungu)
+    rows = poi_buildings.fetch_rows(store, types=FOOD_FACL_TYPES, addr_variants=variants)
     for r in rows:
         b = poi_buildings.normalize(r)
         if b["lat"] is None or not b["named"]:
             continue
         if b["facl_type"] not in FOOD_FACL_TYPES:
             continue
-        if variants_ok and variants_ok not in (b["addr"] or ""):
+        if variants and not _addr_in_sigungu(b["addr"], variants):
             continue
         if _dup(b, items):
             continue

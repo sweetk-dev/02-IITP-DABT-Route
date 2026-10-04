@@ -59,6 +59,15 @@ CROSS_NEAR = 12.0      # 규칙 C: 도로 횡단 브리지는 횡단보도 점 1
 STITCH_MAX = 25.0      # 경계 스티칭 최대 거리
 COVER_RADIUS = 30.0    # OSM 링크 제거 조건: topo 보도가 이 반경 안에 실재할 때만
 REMOVE_TYPES = ("road", "sidewalk", "crossing", "unknown")   # 회랑 내부에서 교체되는 타입
+# 신규 링크 중 DEM 에서 표고를 얻지 못해 경사가 0.0 으로 들어간 비율의 허용 상한.
+# 회랑은 시 경계 안쪽이라 정상이면 결측은 0 에 가깝다(DEM 가장자리·nodata 셀 몇 개 정도).
+# 경사 0.0 은 '평지'로 읽혀 휠체어 프로필의 경사 차단·비용 가중이 그 링크에서 꺼지므로, 결측이
+# 눈에 띄는 비율이면 산출 그래프를 그대로 쓰면 안 된다. 5% 는 가장자리 결측은 허용하되
+# DEM 파일 누락·좌표계 불일치(이 경우 결측은 사실상 100%)는 확실히 걸러내도록 잡은 운영값이다
+# (실측으로 정한 값이 아니다 — 결측 수는 리포트의 dem 항목에 남으니 필요하면 조정한다).
+DEM_MISSING_MAX_RATIO = 0.05
+DEM_EXPECTED_EPSG = 5186       # _DemSampler.elev 가 가정하는 입력 좌표계 (중부원점 GRS80)
+EXIT_DEM_MISSING = 3           # 결측 비율 초과로 저장하지 않고 끝낼 때의 종료 코드
 
 
 def _tf():
@@ -75,24 +84,66 @@ def _seg_intersect(p1, p2, p3, p4) -> bool:
     return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
 
 
-def _pt_seg_dist(px, py, x1, y1, x2, y2) -> float:
-    dx, dy = x2 - x1, y2 - y1
-    L2 = dx * dx + dy * dy
-    if L2 <= 0:
-        return math.hypot(px - x1, py - y1)
-    t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / L2))
-    return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+def dem_crs_warning(crs):
+    """DEM 좌표계가 EPSG:5186 이 아니면 경고 문구, 맞거나 알 수 없으면 None.
+
+    _DemSampler.elev 는 받은 좌표를 그대로 래스터 색인에 넣는다(재투영하지 않는다). 호출부는
+    EPSG:5186 좌표를 넘기므로 DEM 이 다른 좌표계(예: 4326, 5179)면 모든 점이 범위 밖이 되어
+    경사가 전부 0.0 이 된다. crs 는 rasterio 의 CRS 객체(to_epsg 메서드)를 기대하며,
+    None 이거나 EPSG 코드를 알아낼 수 없으면 판단하지 않는다(None 반환).
+    """
+    if crs is None:
+        return None
+    try:
+        epsg = crs.to_epsg()
+    except Exception:
+        return None
+    if epsg is None or int(epsg) == DEM_EXPECTED_EPSG:
+        return None
+    return ("DEM 좌표계가 EPSG:%s 입니다 — 이 스크립트는 EPSG:%d 좌표로 표고를 읽습니다. "
+            "좌표가 맞지 않으면 표고를 얻지 못해 경사가 0.0 으로 들어갑니다."
+            % (epsg, DEM_EXPECTED_EPSG))
+
+
+def dem_missing_summary(requested: bool, opened: bool, links: int, missing: int,
+                        max_ratio: float = DEM_MISSING_MAX_RATIO) -> dict:
+    """DEM 결측 집계를 리포트용 dict 로 만든다.
+
+    인자
+      requested : --dem 을 지정했는가
+      opened    : DEM 파일을 실제로 열었는가(파일 없음·rasterio 미설치면 False)
+      links     : 경사를 구하려 한 신규 링크 수
+      missing   : 그중 표고를 얻지 못해 경사 0.0 이 된 링크 수
+    반환 {"requested", "opened", "links", "missing_links", "missing_ratio", "max_ratio", "exceeded"}
+      exceeded 는 --dem 을 지정했는데 결측 비율이 max_ratio 를 넘을 때만 True.
+      --dem 을 주지 않은 실행은 경사 0.0 이 의도된 동작이므로 exceeded=False 다.
+    """
+    ratio = (missing / links) if links else 0.0
+    return {"requested": bool(requested), "opened": bool(opened), "links": int(links),
+            "missing_links": int(missing), "missing_ratio": round(ratio, 4),
+            "max_ratio": max_ratio,
+            "exceeded": bool(requested and links and ratio > max_ratio)}
 
 
 class _DemSampler:
     def __init__(self, path):
         self.ds = None
+        # 결측 집계 — 표고를 얻지 못해도 경사 0.0 으로 계속 진행하는 동작은 그대로 두고,
+        # 몇 개 링크가 그렇게 됐는지만 센다(main 이 리포트에 적고 임계 초과 시 실패 처리).
+        self.requested = bool(path)      # --dem 지정 여부
+        self.links = 0                   # slope_deg 를 구하려 한 링크 수
+        self.missing = 0                 # 그중 한쪽 끝이라도 표고가 없어 0.0 이 된 수
+        if path and not os.path.exists(path):
+            print(f"  경고: DEM 파일이 없습니다: {path} — 신규 링크 경사가 전부 0.0 이 됩니다")
         if path and os.path.exists(path):
             try:
                 import rasterio
                 self.ds = rasterio.open(path)
                 self.band = self.ds.read(1)
                 self.nodata = self.ds.nodata
+                warn = dem_crs_warning(getattr(self.ds, "crs", None))
+                if warn:
+                    print("  경고: " + warn)
             except Exception as e:      # rasterio 미설치 등 — 경사 0 으로 진행
                 print(f"  (DEM 미사용: {e})")
 
@@ -111,8 +162,16 @@ class _DemSampler:
             return None
         return None
 
+    def note_missing(self):
+        """좌표를 알 수 없어 slope_deg 를 부르지 못한 링크 — 결측으로 센다."""
+        self.links += 1
+        self.missing += 1
+
     def slope_deg(self, xy1, xy2, length_m):
         e1, e2 = self.elev(*xy1), self.elev(*xy2)
+        self.links += 1
+        if e1 is None or e2 is None:
+            self.missing += 1            # 범위 밖·nodata·예외·DEM 미사용 — 반환값(0.0)은 종전과 같다
         if e1 is None or e2 is None or length_m <= 0:
             return 0.0
         return round(abs(math.degrees(math.atan2(e2 - e1, length_m))), 2)
@@ -130,10 +189,22 @@ def _route_corridors(G, legs, to_5186):
     p = get_profile("wheelchair_manual")
     allowed = store.reachable_nodes(p, p.max_slope_deg + 4.0)
     lines = []
-    for leg in legs:
-        s = snap(store, leg["from"][0], leg["from"][1], p, 300, allowed=allowed)
-        g = snap(store, leg["to"][0], leg["to"][1], p, 300, allowed=allowed)
-        r = plan(store, s["node_id"], g["node_id"], p)["routes"][0]
+    for i, leg in enumerate(legs):
+        # 스냅·라우팅이 실패하면 어느 leg 인지 밝힌다. leg 이름 없이 SnapError/KeyError/NoRouteError 만
+        # 올라가면 여러 leg 중 어느 항목(좌표 누락·보행망 밖·경로 없음)이 문제인지 알 수 없다.
+        # 성공할 때의 동작(스냅 결과·경로)은 종전과 같다.
+        name = str(leg.get("name") or "#%d" % (i + 1)) if isinstance(leg, dict) else "#%d" % (i + 1)
+        try:
+            s = snap(store, leg["from"][0], leg["from"][1], p, 300, allowed=allowed)
+            g = snap(store, leg["to"][0], leg["to"][1], p, 300, allowed=allowed)
+        except Exception as e:
+            raise RuntimeError("leg '%s' 의 출발/도착 좌표를 보행망에 붙이지 못했습니다 (%s: %s)"
+                               % (name, type(e).__name__, e)) from e
+        try:
+            r = plan(store, s["node_id"], g["node_id"], p)["routes"][0]
+        except Exception as e:
+            raise RuntimeError("leg '%s' 의 경로를 찾지 못했습니다 (%s → %s, %s: %s)"
+                               % (name, s["node_id"], g["node_id"], type(e).__name__, e)) from e
         lines.append([to_5186(lng, lat) for lat, lng in r["geometry"]])
     return lines
 
@@ -172,7 +243,18 @@ def main():
     ap.add_argument("--buffer", type=float, default=BUFFER_M)
     ap.add_argument("--out", required=True)
     ap.add_argument("--report")
+    ap.add_argument("--allow-missing-dem", action="store_true",
+                    help="DEM 표고 결측 비율이 %d%%%% 를 넘어도 저장하고 정상 종료한다 "
+                         "(기본: 저장하지 않고 종료 코드 %d)" % (DEM_MISSING_MAX_RATIO * 100, EXIT_DEM_MISSING))
+    ap.add_argument("--overwrite-input", action="store_true",
+                    help="--graph 와 같은 경로에 저장하는 것을 허용한다(원본은 <경로>.bak 으로 남긴다)")
     args = ap.parse_args()
+    # 출력이 입력과 같은 경로면 계산 전에 멈춘다 — 입력 그래프를 그 자리에서 덮어쓰면 되돌릴 수 없다.
+    from route_service.topomap import graphio
+    try:
+        graphio.check_output_path(args.out, args.graph, args.overwrite_input)
+    except graphio.GraphIOError as e:
+        ap.error(str(e))
 
     import networkx as nx
     import numpy as np
@@ -349,7 +431,11 @@ def main():
                 return tnodes[n[1:]]["xy"]
             return XY.get(n)
         xy_u, xy_v = _xy(u), _xy(v)
-        slope = dem.slope_deg(xy_u, xy_v, length) if (xy_u and xy_v) else 0.0
+        if xy_u and xy_v:
+            slope = dem.slope_deg(xy_u, xy_v, length)
+        else:
+            slope = 0.0
+            dem.note_missing()
         G.add_edge(u, v, length=round(float(length), 2), slope=slope, link_type=lt,
                    width=width, curb_cut=None, tactile_paving=None, surface=surface,
                    link_name=name, geometry=None, topo_source="topo1k", **extra)
@@ -378,15 +464,41 @@ def main():
     stat["stitch_links"] = stitch
     print(f"[5/6] topo 삽입 완료 + 스티칭 {stitch}건")
 
-    # [6] 저장
-    with open(args.out, "wb") as f:
-        pickle.dump(G, f)
+    # DEM 결측 집계 — 표고를 얻지 못한 링크는 경사 0.0('평지')으로 들어가 있다.
+    dem_stat = dem_missing_summary(dem.requested, dem.ds is not None, dem.links, dem.missing)
+    stat["dem"] = dem_stat
+    if dem_stat["requested"]:
+        print(f"      DEM 표고 결측: 신규 링크 {dem_stat['links']}개 중 {dem_stat['missing_links']}개 "
+              f"({dem_stat['missing_ratio'] * 100:.1f}%) — 경사 0.0 처리")
+    else:
+        print("      DEM 미지정(--dem 없음) — 신규 링크 경사는 전부 0.0")
+    dem_failed = dem_stat["exceeded"] and not args.allow_missing_dem
+    if dem_stat["exceeded"]:
+        bar = "!" * 78
+        print(bar)
+        print(f"!! 경고: DEM 표고 결측 {dem_stat['missing_ratio'] * 100:.1f}% "
+              f"(허용 {DEM_MISSING_MAX_RATIO * 100:.0f}%) — 결측 링크는 경사 0.0 으로 들어가 "
+              "경사 차단·비용 가중이 적용되지 않습니다.")
+        print("!! DEM 파일 경로·범위·좌표계(EPSG:%d)를 확인하십시오." % DEM_EXPECTED_EPSG)
+        if dem_failed:
+            print(f"!! 그래프를 저장하지 않고 종료 코드 {EXIT_DEM_MISSING} 로 끝냅니다 "
+                  "(그대로 진행하려면 --allow-missing-dem).")
+        else:
+            print("!! --allow-missing-dem 지정 — 그대로 저장합니다.")
+        print(bar)
+
+    # [6] 저장 — 임시 파일에 쓴 뒤 교체한다(쓰는 도중 중단돼도 잘린 그래프 파일이 남지 않는다).
+    # DEM 결측 초과로 실패 처리할 때는 저장하지 않는다 — 뒤 단계가 경사 없는 그래프를 이어받지 않게 한다.
+    if not dem_failed:
+        graphio.save_graph(G, args.out, input_path=args.graph, overwrite_input=args.overwrite_input)
+    stat["saved"] = not dem_failed
     stat["nodes"], stat["links"] = G.number_of_nodes(), G.number_of_edges()
     lt_cnt = {}
     for _u, _v, d in G.edges(data=True):
         lt_cnt[d["link_type"]] = lt_cnt.get(d["link_type"], 0) + 1
     stat["link_types"] = lt_cnt
-    print(f"[6/6] 저장: {args.out}  노드 {stat['nodes']} / 링크 {stat['links']}")
+    print(f"[6/6] {'저장' if not dem_failed else '저장 안 함'}: {args.out}  "
+          f"노드 {stat['nodes']} / 링크 {stat['links']}")
     print(f"      링크타입: {lt_cnt}")
 
     if args.report:
@@ -394,6 +506,8 @@ def main():
         with open(args.report, "w", encoding="utf-8") as f:
             json.dump(stat, f, ensure_ascii=False, indent=1)
         print(f"      리포트: {args.report}")
+    if dem_failed:
+        sys.exit(EXIT_DEM_MISSING)
 
 
 if __name__ == "__main__":

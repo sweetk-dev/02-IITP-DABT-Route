@@ -101,6 +101,14 @@ def main():
     cw = _load_crosswalks(args.crosswalks, to_5186)
     segs = _load_sidewalk_segments(args.pednet_node, args.pednet_link, to_5186)
     print(f"횡단보도 {len(cw)} / 폭 기재 보도 링크 {len(segs)}")
+    # 빈 입력 — 아래 KD-트리 생성이 빈 배열에서 실패하고(IndexError/ValueError), 채움률 나눗셈이
+    # ZeroDivisionError 가 된다. 무엇이 비었는지 밝히고 멈춘다(빈 CSV 를 만들어 두지 않는다).
+    if not cw:
+        raise SystemExit(f"횡단보도가 0건입니다: {args.crosswalks} — Point 지오메트리이고 properties.src 가 "
+                         "비어 있거나 'anyang_city_2026' 인 피처만 읽습니다.")
+    if not segs:
+        raise SystemExit(f"폭이 기재된 보도 링크가 0건입니다: {args.pednet_link} — LINK_TYPE=sidewalk 이고 "
+                         "WIDTH 가 양수이며 양 끝 노드가 노드 파일에 있는 링크만 씁니다.")
 
     # 링크를 DENSIFY 간격 샘플점으로 펼쳐 KDTree 후보 추출 -> 정확 거리는 선분 투영으로
     pts, owner = [], []
@@ -144,9 +152,11 @@ def main():
                                  int(p / 100.0 * len(widths_sorted)))] if widths_sorted else None
 
     below = sum(1 for w_ in widths if w_ < 1.2)
+    # 반경 안에 폭 기재 보도가 하나도 없으면 dists 가 비어 중앙값 색인이 IndexError 가 된다 → '-' 로 표기.
+    med = f"{sorted(dists)[len(dists)//2]:.1f}m" if dists else "-"
     print(f"채움 {len(rows)}/{len(cw)} ({len(rows)/len(cw)*100:.1f}%)  "
           f"p10/p50/p90 = {pct(10)}/{pct(50)}/{pct(90)} m  "
-          f"법정 1.2m 미만 {below}건  거리 중앙값 {sorted(dists)[len(dists)//2]:.1f}m")
+          f"법정 1.2m 미만 {below}건  거리 중앙값 {med}")
     print(f"산출: {args.out}")
 
 
