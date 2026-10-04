@@ -383,6 +383,10 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
         else:
             turn_here = turn_angle(prev_out, seg["in_bearing"])
             pending_angle += turn_here
+            # 이월각을 더한 뒤 ±180° 범위로 되돌린다. 짧은 링크를 사이에 두고 같은 쪽으로 두 번
+            # 꺾으면 합이 180° 를 넘는데(예: 우 120° + 우 120° = 240°), 실제 진행 방향 변화는
+            # 좌 120° 다. 되돌리지 않으면 150° 이상이라는 이유로 유턴으로 안내된다.
+            pending_angle = (pending_angle + 180.0) % 360.0 - 180.0
             if special:
                 # 특수 링크는 링크 종류로 안내한다(종전과 동일). 이월각은 여기서 정리한다.
                 maneuver = "straight"

@@ -1,5 +1,9 @@
 # 그래프 구축 전용 (scripts/build_network.py)
-osmnx>=1.9
+# 2.0 이상 필요 — scripts/build_network.py(건물 폴리곤)·scripts/fetch_osm_crossings.py 가
+# features_from_bbox 에 bbox 를 (서, 남, 동, 북) 튜플로 넘긴다. 이 순서·호출 형식은 2.0 에서 도입됐고,
+# 1.9 는 bbox 튜플을 (북, 남, 동, 서)로 해석하거나 위치 인자 형식이 달라 그대로는 동작하지 않는다.
+# (engine/sources/osm.py 의 graph_from_bbox 는 1.x·2.x 를 모두 처리하지만 위 두 스크립트는 2.x 전용이다.)
+osmnx>=2.0
 pandas>=2.0
 openpyxl>=3.1
 numpy>=1.24
@@ -13,3 +17,8 @@ pillow>=10.0
 geopandas>=1.0
 scipy>=1.11
 shapely>=2.0
+
+# 수치지형도 SHP 읽기 (route_service/topomap/extract.py, scripts/enrich_osm_with_topomap.py 의 `import shapefile`)
+pyshp>=2.3
+# 보도 면형 -> 중심선 골격화 (route_service/topomap/centerline.py 의 skimage.draw·skimage.morphology)
+scikit-image>=0.21

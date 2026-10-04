@@ -227,3 +227,48 @@ def test_workplaces_filter(client):
     assert [i["name"] for i in b["items"]] == ["㈜고운누리"] and b["base_date"] == "2025-07-10"
     r = client.get("/directory/workplaces")
     assert r.json()["total"] == 2
+
+
+# ── 음식점 조회의 지역 대조 ─────────────────────────────────────
+def test_food_region_filter_uses_admin_unit_tokens(tmp_path):
+    """다른 시·군의 '안양면'·'안양동' 주소는 sigungu='안양' 조회에 들어오지 않는다."""
+    from route_service.poi import food as poi_food
+    from route_service.poi.store import PoiStore
+
+    def row(i, name, addr):
+        r = _facl(i, name, "일반음식점", 37.39 + 0.001 * i, 126.95, entrance_ramp_yn="Y")
+        r["addr"] = addr
+        return r
+    (tmp_path / "facility_accessibility.json").write_text(json.dumps([
+        row(1, "안양국밥", "경기도 안양시 만안구 안양로 1"),
+        row(2, "수문횟집", "전라남도 장흥군 안양면 수문리 2"),
+        row(3, "부산밀면", "부산광역시 안양동 3"),
+    ], ensure_ascii=False), encoding="utf-8")
+    st = PoiStore(backend="file", data_dir=str(tmp_path))
+    names = {it["name"] for it in poi_food.food_near(st, sigungu="안양", limit=50)["items"]}
+    assert names == {"안양국밥"}
+    # 행정단위가 붙은 지역명·빈 지역명도 종전과 같이 동작한다
+    assert {it["name"] for it in poi_food.food_near(st, sigungu="안양시", limit=50)["items"]} == {"안양국밥"}
+    assert len(poi_food.food_near(st, sigungu="", limit=50)["items"]) == 3
+
+
+def test_food_building_query_pushes_region_filter_to_sql():
+    """db 백엔드 — 실태조사 음식점 조회에 지역 조건이 SQL 로 들어간다(전국 행을 읽지 않는다)."""
+    from route_service.poi import food as poi_food
+    from route_service.poi.store import PoiStore
+
+    class _Rec(PoiStore):
+        def __init__(self):
+            super().__init__(backend="db", dsn="postgresql+psycopg2://x/y")
+            self.calls = []
+
+        def _query(self, sql, params):
+            self.calls.append((sql, dict(params)))
+            return []
+    st = _Rec()
+    poi_food.food_near(st, sigungu="안양")
+    hits = [(s, p) for s, p in st.calls if "FROM poi_facility_accessibility" in s and "facl_type = ANY" in s]
+    assert len(hits) == 1
+    sql, params = hits[0]
+    assert "COALESCE(addr, '') LIKE '%%' || :ad0 || '%%'" in sql
+    assert [params["ad0"], params["ad1"], params["ad2"]] == ["안양시", "안양군", "안양구"]

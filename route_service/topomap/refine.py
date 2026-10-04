@@ -298,6 +298,8 @@ def apply(G, adopted: list, min_confidence: float = 0.0) -> int:
 #   · 양 끝이 수치지형도 보도 노드(topo1k 링크에 붙은 노드), 직선 ≤ GAP_MAX_M
 #   · 두 노드 사이 보행망 경로가 없거나 직선의 GAP_RATIO_MIN 배 이상
 #   · 신설선이 **도로 링크를 정확히 하나**만 가로지르고, 그 도로가 이면도로(이름이 없거나 '…길'로 끝남 — 간선은 '…로'·'…대로')
+#     가로지르는 도로 링크는 _RoadLinkIndex(링크가 지나는 격자 칸 전부에 등록)로 찾는다 — 끝점이 멀리 있는
+#     긴 간선 링크도 신설선 위를 지나면 센다. 둘 이상이면 G2 로 기각하고 사유를 보고서에 남긴다.
 #   · 장애물(옹벽·담장·계단·시설물) 저촉 없음, 종단경사 ≤ 8°
 # 반영: link_type='crossing', unmarked=True(안내 문구 분기), curb_cut=None(미확인 — 수동휠체어는 False 일 때만 막힌다),
 #       topo_source='derived', confidence=GAP_CONFIDENCE(0.65: 수동 0.60 활성·시각 0.70 비활성 — 시각장애 이용자는 표시된 횡단보도만).
@@ -321,25 +323,80 @@ def _sidewalk_node(G, n) -> bool:
     return any(G[n][x].get("topo_source") == "topo1k" and G[n][x].get("link_type") == "sidewalk" for x in G[n])
 
 
-def _road_links_crossed(G, pa, pb, cell_nodes):
-    """신설선이 가로지르는 도로 링크 목록 [(u, v, name)]."""
+# 격자 칸 크기(도). 위도 0.00027° ≈ 29.8m, 경도 0.00034° ≈ 30.1m(안양 위도 37.4°) — 약 30m 칸.
+# 후보 노드 탐색 격자(find_gap_bridges)와 도로 링크 색인(_RoadLinkIndex)이 같은 칸을 쓴다.
+_GAP_CELL_LAT = 0.00027
+_GAP_CELL_LON = 0.00034
+# 도로 링크를 칸에 등록할 때의 표본 간격(m). 칸 한 변(약 30m)의 1/4 이하로 잡는다.
+# 신설선은 GAP_MAX_M(20m) 이하이므로 교차점은 A 에서 20m 안에 있고, 링크 위 가장 가까운 표본점은
+# 교차점에서 간격의 절반(3.5m) 안에 있다 → 그 표본점은 A 에서 23.5m 안 = A 가 든 칸의 3×3 이웃 안이다.
+# (칸 한 변 29.8m 보다 작아야 성립한다. 15m 간격이면 27.5m 로 여유가 2m 뿐이라 더 촘촘히 잡았다.)
+_ROAD_SAMPLE_M = 7.0
+ROAD_LINK_TYPES = ("road", "unknown")
+
+
+def _gap_cell(lat, lon):
+    return (int(lat / _GAP_CELL_LAT), int(lon / _GAP_CELL_LON))
+
+
+class _RoadLinkIndex:
+    """도로 링크 격자 색인 — 링크를 **지나는 칸 전부**에 등록한다(restitch._Index 와 같은 원리).
+
+    끝점이 있는 칸에만 등록하면, 양 끝이 수백 m 밖에 있는 긴 간선도로 링크가 후보 신설선을
+    가로질러도 찾지 못한다. 그러면 "도로를 정확히 하나만 가로지른다" 게이트가
+      · 간선 + 이면도로를 함께 건너는 선을 이면도로 하나만 건너는 것으로 보고 채택하거나
+      · 간선만 건너는 선을 '가로지르는 도로 없음'으로 보고 보고서 없이 버린다.
+    링크의 좌표열을 _ROAD_SAMPLE_M 간격으로 따라가며 표본점이 든 칸마다 링크를 넣는다.
+    색인은 정제 1회(find_gap_bridges 호출 1회)에 한 번만 만들고, 링크 선형(LineString)도 여기서
+    한 번만 만들어 재사용한다.
+    """
+
+    def __init__(self, G):
+        from shapely.geometry import LineString
+        from ..engine.graph import edge_coords
+        self.cells = {}       # 칸 → [링크 번호]
+        self.links = []       # 링크 번호 → (u, v, link_name, LineString(lon, lat))
+        for u, v, d in G.edges(data=True):
+            if d.get("link_type") not in ROAD_LINK_TYPES:
+                continue
+            coords = edge_coords(G, u, v)
+            if len(coords) < 2:
+                continue
+            k = len(self.links)
+            self.links.append((u, v, d.get("link_name"), LineString([(c[1], c[0]) for c in coords])))
+            seen = set()
+            for (la1, lo1), (la2, lo2) in zip(coords[:-1], coords[1:]):
+                steps = max(1, int(haversine_m(la1, lo1, la2, lo2) // _ROAD_SAMPLE_M) + 1)
+                for i in range(steps + 1):
+                    t = i / steps
+                    seen.add(_gap_cell(la1 + t * (la2 - la1), lo1 + t * (lo2 - lo1)))
+            for c in seen:
+                self.cells.setdefault(c, []).append(k)
+
+    def near(self, lat, lon):
+        """(lat, lon) 이 든 칸과 그 둘레 8칸을 지나는 링크 번호(오름차순, 중복 없음)."""
+        ci, cj = _gap_cell(lat, lon)
+        out = set()
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                out.update(self.cells.get((ci + di, cj + dj), ()))
+        return sorted(out)
+
+
+def _road_links_crossed(G, pa, pb, road_index):
+    """신설선(pa–pb)이 가로지르는 도로 링크 목록 [(u, v, name)].
+
+    road_index 는 _RoadLinkIndex. A·B 양쪽 칸 둘레를 지나는 링크를 후보로 삼아 실제 교차
+    (shapely crosses)를 판정한다. 끝점이 근처에 없는 긴 링크도 선형이 지나가면 후보에 든다.
+    반환 순서는 색인 등록 순(G.edges 순)으로 고정된다.
+    """
     from shapely.geometry import LineString
     seg = LineString([(pa[1], pa[0]), (pb[1], pb[0])])
-    out, seen = [], set()
-    for n in cell_nodes:
-        for x in G[n]:
-            key = frozenset((n, x))
-            if key in seen:
-                continue
-            seen.add(key)
-            d = G[n][x]
-            if d.get("link_type") not in ("road", "unknown"):
-                continue
-            from ..engine.graph import edge_coords
-            coords = edge_coords(G, n, x)
-            line = LineString([(c[1], c[0]) for c in coords])
-            if line.crosses(seg):
-                out.append((n, x, d.get("link_name")))
+    out = []
+    for k in sorted(set(road_index.near(pa[0], pa[1])) | set(road_index.near(pb[0], pb[1]))):
+        u, v, name, line = road_index.links[k]
+        if line.crosses(seg):
+            out.append((u, v, name))
     return out
 
 
@@ -349,8 +406,9 @@ def find_gap_bridges(G, obstacles=None, dem=None) -> list:
     nodes = [n for n in G.nodes if _sidewalk_node(G, n)]
     # 격자 색인(약 30m 셀)
     grid = {}
-    def cell(lat, lon):
-        return (int(lat / 0.00027), int(lon / 0.00034))
+    cell = _gap_cell
+    # 도로 링크 색인 — 호출 1회에 한 번만 만든다(후보 쌍마다 만들지 않는다).
+    road_index = _RoadLinkIndex(G)
     for n in G.nodes:
         grid.setdefault(cell(G.nodes[n]["lat"], G.nodes[n]["lon"]), []).append(n)
     def around(lat, lon):
@@ -375,9 +433,9 @@ def find_gap_bridges(G, obstacles=None, dem=None) -> list:
             straight = haversine_m(pa[0], pa[1], pb[0], pb[1])
             if straight < 3.0 or straight > GAP_MAX_M:
                 continue
-            crossed = _road_links_crossed(G, pa, pb, near)
-            if len(crossed) != 1:
-                continue
+            crossed = _road_links_crossed(G, pa, pb, road_index)
+            if not crossed:
+                continue          # 도로를 건너지 않는 쌍 — 이 규칙의 대상이 아니다(우회 삼각형 규칙이 본다)
             c = {"a": a, "m": None, "b": b, "pa": pa, "pb": pb, "pm": None, "straight_m": straight,
                  "via_m": None, "ratio": None, "type_am": "sidewalk", "type_mb": "sidewalk",
                  "kind": "gap_bridge", "road_name": crossed[0][2]}
@@ -389,6 +447,15 @@ def find_gap_bridges(G, obstacles=None, dem=None) -> list:
             c["via_m"], c["ratio"] = (None if via == float("inf") else via), (None if via == float("inf") else via / straight)
             if via != float("inf") and via / straight < GAP_RATIO_MIN:
                 continue
+            if len(crossed) > 1:
+                # 도로 링크를 둘 이상 가로지른다 — 이면도로 하나를 건너는 선이 아니다(간선 + 이면도로,
+                # 상·하행이 따로 그려진 도로 등). 채택하지 않고 사유와 건너는 도로 이름을 보고서에 남긴다.
+                # 간선 이름이 하나라도 있으면 그것을 앞에 둔다(검토자가 먼저 봐야 할 것).
+                names = sorted({(x[2] or "").strip() or "이름 없음" for x in crossed},
+                               key=lambda s: (_is_minor_road(None if s == "이름 없음" else s), s))
+                c["road_name"] = "·".join(names)
+                c["gate"] = "G2 도로 링크 %d개 횡단(%s)" % (len(crossed), c["road_name"])
+                out.append(c); continue
             if not _is_minor_road(crossed[0][2]):
                 c["gate"] = "G1 간선 횡단(%s)" % crossed[0][2]
                 out.append(c); continue

@@ -167,3 +167,81 @@ def test_stop_accessible_status_is_unknown_not_false():
     stop = [x for x in out if x["type"] == "transit_stop"][0]
     assert stop["accessible"] is None
     assert stop["accessible_status"] == "unknown"
+
+
+# ── 삭제 표시 POI 제외 ─────────────────────────────────────────
+class _SqlLog(PoiStore):
+    """보낸 SQL 을 전부 기록한다(목록 조회는 오버레이 조회까지 여러 번 질의한다)."""
+
+    def __init__(self):
+        super().__init__(backend="db", dsn="postgresql+psycopg2://x/y")
+        self.sqls = []
+
+    def _query(self, sql, params):
+        self.sqls.append((sql, dict(params)))
+        return []
+
+    def mv_poi_sqls(self):
+        return [s for s, _p in self.sqls if "FROM mv_poi" in s]
+
+
+@pytest.mark.parametrize("call", [
+    lambda st: st.list_tour_spots(sigungu="안양"),
+    lambda st: st.list_food("안양"),
+    lambda st: st.search_tour_by_name("안양예술공원", sigungu="안양"),
+])
+def test_mv_poi_queries_exclude_deleted_rows(call):
+    """목록·음식점·이름 검색도 ID 직접 조회와 같이 삭제 표시(is_deleted='Y') 행을 뺀다."""
+    st = _SqlLog()
+    call(st)
+    sqls = st.mv_poi_sqls()
+    assert sqls, "mv_poi 질의가 나가지 않았다"
+    assert all("COALESCE(is_deleted, 'N') = 'N'" in s for s in sqls), sqls
+
+
+# ── 조회 캐시 만료·상한 ─────────────────────────────────────────
+def test_ttl_cache_expires_and_caps_item_count():
+    from route_service.poi.store import _TtlCache
+    now = [0.0]
+    c = _TtlCache(ttl_sec=10, max_items=3, clock=lambda: now[0])
+    c["a"] = [1]
+    assert "a" in c and c["a"] == [1]
+    now[0] = 9.9
+    assert "a" in c
+    now[0] = 10.0
+    assert "a" not in c, "만료 시각이 지나면 없는 것으로 보여야 한다"
+    # 항목 수 상한 — 만료된 것부터, 그다음 넣은 지 오래된 순으로 버린다
+    for k in ("b", "c", "d"):
+        now[0] += 1
+        c[k] = k
+    assert len(c) == 3 and "a" not in c and all(k in c for k in ("b", "c", "d"))
+    c["e"] = "e"
+    assert len(c) == 3 and "b" not in c and all(k in c for k in ("c", "d", "e"))
+    c.clear()
+    assert len(c) == 0
+
+
+def test_poi_store_cache_has_ttl_and_limit():
+    from route_service.poi import store as ps
+    st = PoiStore(backend="none")
+    assert isinstance(st._cache, ps._TtlCache)
+    assert st._cache.ttl_sec == ps.POI_CACHE_TTL_SEC and 0 < ps.POI_CACHE_TTL_SEC <= 3600
+    assert st._cache.max_items == ps.POI_CACHE_MAX_ITEMS
+
+
+def test_food_listing_is_requeried_after_ttl_and_cache_does_not_grow_with_inputs():
+    """적재 결과가 재기동 없이 반영된다 — 만료 뒤에는 DB 를 다시 조회한다. 입력이 달라도 항목 수는 상한 이내."""
+    from route_service.poi.store import _TtlCache
+    now = [0.0]
+    st = _SqlLog()
+    st._cache = _TtlCache(ttl_sec=600, max_items=8, clock=lambda: now[0])
+    st.list_food("안양")
+    n1 = len(st.mv_poi_sqls())
+    st.list_food("안양")
+    assert len(st.mv_poi_sqls()) == n1, "유효 시간 안에는 캐시를 쓴다"
+    now[0] = 601.0
+    st.list_food("안양")
+    assert len(st.mv_poi_sqls()) == n1 + 1, "만료 뒤에는 다시 조회한다"
+    for i in range(50):                       # 요청마다 다른 지역명이 들어오는 상황
+        st.list_food("지역%d" % i)
+    assert len(st._cache) <= 8

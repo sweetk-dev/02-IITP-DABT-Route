@@ -38,6 +38,49 @@ SPAN_MAX     = 60.0    # m - 이보다 긴 횡단 링크는 오접합으로 보�
 NODE_SNAP    = 3.0     # m - 투영점이 이 안이면 기존 노드를 그대로 쓴다
 ATTACH_RADIUS = 30.0   # m - 지점 부착 반경
 SRC = "city_cw2026"
+CWX_PREFIX = "cwx"     # 링크 분할로 만드는 횡단 접속 노드 ID 접두 ("cwx%06d")
+
+
+def applied_traces(G) -> dict:
+    """그래프에 이 스크립트를 이미 돌린 흔적이 있는지 센다.
+
+    반환 {"cwx_nodes": 분할 접속 노드("cwx…") 수, "attached_nodes": cw_mgmt_nos 가 붙은 노드 수}.
+
+    이 스크립트는 한 그래프에 **한 번만** 돌리는 것을 전제로 한다. 이미 반영된 그래프에 다시 돌리면
+      · [2] 신설이 "cwx000001" 부터 번호를 다시 매겨 G.add_node 하므로, 같은 ID 의 기존 노드 좌표가
+        새 좌표로 덮어써져 서로 다른 지점이 한 노드로 합쳐지고
+      · [3] 부착이 crosswalk_cnt·cw_mgmt_nos·cw_points 에 같은 횡단보도를 한 번 더 더한다.
+    그래서 main 은 흔적이 있으면 멈춘다(--force 로만 진행).
+    """
+    cwx = sum(1 for n in G.nodes if isinstance(n, str) and n.startswith(CWX_PREFIX))
+    att = sum(1 for _n, a in G.nodes(data=True) if a.get("cw_mgmt_nos"))
+    return {"cwx_nodes": cwx, "attached_nodes": att}
+
+
+def cwx_start_index(G) -> int:
+    """새 "cwx%06d" 번호를 매기기 시작할 값(마지막으로 쓴 번호). 기존 cwx 노드가 없으면 0.
+
+    깨끗한 그래프에서는 0 이므로 첫 노드는 종전과 같이 cwx000001 이다. --force 로 이미 반영된
+    그래프에 다시 돌릴 때는 기존 번호의 최댓값에서 이어 매겨 기존 노드를 덮어쓰지 않는다.
+    숫자가 아닌 꼬리("cwx_abc")는 무시한다.
+    """
+    top = 0
+    for n in G.nodes:
+        if isinstance(n, str) and n.startswith(CWX_PREFIX) and n[len(CWX_PREFIX):].isdigit():
+            top = max(top, int(n[len(CWX_PREFIX):]))
+    return top
+
+
+def next_cwx_id(G, last: int):
+    """last 다음 번호부터 G 에 없는 "cwx%06d" 를 찾아 (노드 ID, 그 번호) 를 돌려준다.
+
+    cwx_start_index 로 시작 번호를 잡아도 한 번 더 `in G` 를 확인한다 — 번호 체계 밖에서 같은
+    이름의 노드가 들어와 있어도 덮어쓰지 않기 위해서다.
+    """
+    i = last + 1
+    while (CWX_PREFIX + "%06d" % i) in G:
+        i += 1
+    return CWX_PREFIX + "%06d" % i, i
 
 
 def _load_crosswalks(path, to_5186):
@@ -76,7 +119,18 @@ def main():
     ap.add_argument("--crosswalks", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--report")
+    ap.add_argument("--force", action="store_true",
+                    help="이미 횡단보도가 반영된 그래프에도 진행한다. 분할 노드 번호는 기존 번호 뒤에서 "
+                         "이어 매기지만, 지점 부착(crosswalk_cnt·cw_mgmt_nos)은 한 번 더 누적된다")
+    ap.add_argument("--overwrite-input", action="store_true",
+                    help="--graph 와 같은 경로에 저장하는 것을 허용한다(원본은 <경로>.bak 으로 남긴다)")
     args = ap.parse_args()
+    # 출력이 입력과 같은 경로면 계산 전에 멈춘다 — 반영은 누적되므로 입력을 덮어쓰면 되돌릴 수 없다.
+    from route_service.topomap import graphio
+    try:
+        graphio.check_output_path(args.out, args.graph, args.overwrite_input)
+    except graphio.GraphIOError as e:
+        ap.error(str(e))
 
     to_5186 = Transformer.from_crs("EPSG:4326", "EPSG:5186", always_xy=True).transform
     to_wgs  = Transformer.from_crs("EPSG:5186", "EPSG:4326", always_xy=True).transform
@@ -86,6 +140,26 @@ def main():
     cw = _load_crosswalks(args.crosswalks, to_5186)
     print("[0/4] 그래프 노드 %d / 링크 %d, 원천 횡단보도 %d"
           % (G.number_of_nodes(), G.number_of_edges(), len(cw)))
+
+    # 빈 입력 — 뒤의 KD-트리 생성(빈 배열)·half.max()·반영률 나눗셈이 IndexError/ValueError/
+    # ZeroDivisionError 로 끝나 원인을 알 수 없다. 무엇이 비었는지 밝히고 멈춘다.
+    if not cw:
+        raise SystemExit("원천 횡단보도가 0건입니다: %s — Point 지오메트리이고 properties.src 가 "
+                         "비어 있거나 'anyang_city_2026' 인 피처만 읽습니다." % args.crosswalks)
+    if G.number_of_edges() == 0:
+        raise SystemExit("그래프에 링크가 없습니다: %s" % args.graph)
+
+    # 재실행 안전장치 — 이미 반영된 그래프면 멈춘다(applied_traces 설명 참조).
+    traces = applied_traces(G)
+    if traces["cwx_nodes"] or traces["attached_nodes"]:
+        msg = ("입력 그래프에 횡단보도가 이미 반영돼 있습니다 (분할 노드 cwx %d개, 부착 노드 %d개): %s"
+               % (traces["cwx_nodes"], traces["attached_nodes"], args.graph))
+        if not args.force:
+            raise SystemExit(msg + "\n다시 돌리면 분할 노드 좌표가 덮어써지고 부착 수가 두 배가 됩니다. "
+                             "횡단보도 미반영본으로 다시 실행하십시오(강제 진행: --force).")
+        print("경고: " + msg)
+        print("      --force 로 진행합니다. 분할 노드 번호는 기존 번호 뒤에서 이어 매기고, "
+              "지점 부착은 기존 값에 누적됩니다.")
 
     stat = {"total": len(cw), "matched": 0, "matched_links": 0, "created": 0,
             "attached": 0, "orphan": 0, "filled_width": 0, "filled_curb": 0,
@@ -197,7 +271,8 @@ def main():
 
     # --- 2패스: 링크별 일괄 분할
     node_at = {}       # (edge_k, t) -> node_id
-    new_id = 0
+    # 깨끗한 그래프에서는 0(첫 노드 cwx000001 — 종전과 같다). 기존 cwx 노드가 있으면 그 뒤 번호부터.
+    new_id = cwx_start_index(G)
     for k, ts in cuts.items():
         u, v, _ = E[k]
         if not G.has_edge(u, v):
@@ -212,8 +287,7 @@ def main():
                 node_at[(k, t)] = u; continue
             if float(np.linalg.norm(pos - XY[v])) <= NODE_SNAP:
                 node_at[(k, t)] = v; continue
-            new_id += 1
-            nid = "cwx%06d" % new_id
+            nid, new_id = next_cwx_id(G, new_id)     # 기존 노드와 같은 ID 는 건너뛴다
             lon, lat = to_wgs(float(pos[0]), float(pos[1]))
             G.add_node(nid, lat=lat, lon=lon, node_type="crossing")
             XY[nid] = (float(pos[0]), float(pos[1]))
@@ -292,8 +366,8 @@ def main():
     print("[3/4] 지점 부착 %d건 / 반경 밖 %d건" % (stat["attached"], stat["orphan"]))
 
     # ---------------------------------------------------------------- 저장
-    with open(args.out, "wb") as f:
-        pickle.dump(G, f)
+    # 임시 파일에 쓴 뒤 교체한다 — 쓰는 도중 중단돼도 잘린 그래프 파일이 남지 않는다.
+    graphio.save_graph(G, args.out, input_path=args.graph, overwrite_input=args.overwrite_input)
     types = {}
     for _, _, d in G.edges(data=True):
         t = d.get("link_type")

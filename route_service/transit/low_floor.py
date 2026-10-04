@@ -18,12 +18,17 @@
 대기를 추정한다(순환 노선은 (승차순번 - 차량순번 + N) mod N).
 
 도착정보 flag 는 운행 중 'PASS' 가 실측값이다(2026-09-07). 운행 종료·회차 대기 값은 제외한다.
+
+실시간 조회는 요청 단위 예산(`gbis_live.LiveBudget`) 안에서만 한다. 조회가 연속으로 실패하거나
+누적 시간이 예산을 넘으면 그 요청의 남은 정류장·노선은 조회하지 않고 tier 0(판정 불가)으로 둔다 —
+외부 API 장애가 "정류장 수 × 타임아웃"만큼 경로 계획을 붙잡지 않게 한다.
 """
 from __future__ import annotations
 
 import time
 
 from . import planner as transit
+from .gbis_live import LiveBudget
 
 MISS_BUFFER_SEC = 180           # 승차 정류장 도착 여유(횡단보도 1회·승강기 대기 흡수)
 BOARDING_OVERHEAD_SEC = 90      # 경사판 전개·고정 등 승하차 오버헤드
@@ -68,15 +73,49 @@ def _upstream_stops(vehicle_seq, board_seq, n_total):
 
 
 class LowFloorJudge:
-    """후보의 버스 part 에 대해 저상 판정을 내린다. 도착정보는 정류장 단위로 캐시된다(gbis_live)."""
+    """후보의 버스 part 에 대해 저상 판정을 내린다. 도착정보는 정류장 단위로 캐시된다(gbis_live).
 
-    def __init__(self, live, store, now=None):
+    요청 하나에 판정 객체 하나를 쓴다. budget 은 그 요청의 실시간 조회 예산이며, 같은 요청의
+    다른 실시간 조회(노선형상 등)와 나눠 쓰도록 호출 측이 넘길 수 있다(없으면 새로 만든다).
+    """
+
+    def __init__(self, live, store, now=None, budget: LiveBudget = None):
         self.live = live
         self.store = store
         self.now = now or time.time()
+        self.budget = budget if budget is not None else LiveBudget()
         self._arr = {}
         self._loc = {}
         self._route_len = {}
+
+    @property
+    def realtime_unavailable(self) -> bool:
+        """이 요청에서 실시간 응답을 한 건도 받지 못했는가(미설정·장애·예산 소진).
+
+        True 면 tier 0 은 "저상버스가 없다"가 아니라 "확인하지 못했다"는 뜻이다 — 탐색 반경을
+        넓혀도 판정이 달라지지 않으므로 호출 측은 확장 탐색을 하지 않는다.
+        """
+        return self.budget.ok_cnt == 0
+
+    def _query(self, fn, *args, **kwargs) -> dict:
+        """실시간 조회 한 번 — 예산 확인 → 실행 → 성공·실패 기록.
+
+        반환: 조회 결과 dict. 예산을 넘겼거나 연속 실패 임계에 이르렀으면 조회하지 않고
+        {"status": "unavailable", "reason": 생략 사유, "skipped": True} 를 돌려준다.
+        조회 함수가 예외를 올려도 실시간 불가로 바꿔 돌려준다(경로 계획을 멈추지 않는다).
+        """
+        reason = self.budget.skip_reason()
+        if reason is not None:
+            self.budget.skipped()
+            return {"status": "unavailable", "reason": reason, "skipped": True}
+        try:
+            out = self.budget.call(fn, *args, **kwargs)
+        except Exception as e:
+            out = {"status": "unavailable", "reason": "%s: %s" % (type(e).__name__, e)}
+        if not isinstance(out, dict):
+            out = {"status": "unavailable", "reason": "unexpected realtime response"}
+        self.budget.note(out.get("status") == "success")
+        return out
 
     # ---------- 실시간 조회(정류장·노선 단위 1회) ----------
     def arrivals(self, station_id):
@@ -89,7 +128,9 @@ class LowFloorJudge:
                     meta = self.store.stop_route_meta(key)
                 except Exception:
                     meta = {}
-                self._arr[key] = self.live.arrivals(key, route_meta=meta)
+                out = self._query(self.live.arrivals, key, route_meta=meta)
+                out.setdefault("items", [])
+                self._arr[key] = out
         return self._arr[key]
 
     def locations(self, route_id):
@@ -98,7 +139,9 @@ class LowFloorJudge:
             if not getattr(self.live, "enabled", False):
                 self._loc[key] = {"status": "unavailable", "vehicles": []}
             else:
-                self._loc[key] = self.live.locations(key)
+                out = self._query(self.live.locations, key)
+                out.setdefault("vehicles", [])
+                self._loc[key] = out
         return self._loc[key]
 
     def route_len(self, route_id):

@@ -18,6 +18,8 @@
 """
 from __future__ import annotations
 
+import contextvars
+import http.client
 import json
 import logging
 import threading
@@ -39,6 +41,88 @@ LOW_FLOOR_CODE = 1
 
 # stateCd(위치정보): 0 교차로 통과 / 1 정류소 도착 / 2 정류소 출발
 STATE_LABEL = {0: "이동 중", 1: "정류소 도착", 2: "정류소 출발"}
+
+# ── 요청 단위 실시간 조회 예산 ──
+# 경로 계획 한 건은 후보 정류장·노선마다 실시간을 조회한다. 조회 한 번의 타임아웃이 3초이므로
+# 외부 API 가 느리거나 응답하지 않으면 "조회 수 × 3초"가 그대로 계획 응답시간에 쌓인다.
+# 호출 측(경로 API 클라이언트)은 6초에 요청을 끊고, 연속으로 끊기면 한동안 호출 자체를 막는다 —
+# 실시간을 못 붙인 것이 경로 안내 전체의 실패로 번진다.
+#
+# REQUEST_BUDGET_SEC: 계획 한 건이 실시간 조회에 쓸 수 있는 누적 시간. 호출 측 제한 6초에서
+#   보행 경로 계산·DB 조회 몫을 넉넉히(약 4초) 남기도록 2초로 둔다. 정상 응답은 건당 0.1~0.3초라
+#   후보 8개 안팎의 조회는 이 안에 끝난다.
+# CONSECUTIVE_FAIL_LIMIT: 연속 실패가 이 횟수에 이르면 그 요청의 남은 조회를 생략한다.
+#   1회는 특정 정류장·노선만의 일시 오류일 수 있어 한 번 더 확인하고, 서로 다른 대상에서
+#   2회 연속이면 서비스 쪽 장애로 본다(즉시 거절·한도 초과처럼 빨리 실패하는 경우에도
+#   남은 대상마다 외부 API 를 두드리지 않는다).
+# MIN_CALL_TIMEOUT_SEC: 예산이 거의 남지 않았을 때 조회 한 번에 주는 최소 타임아웃. 이보다 짧으면
+#   정상 응답도 끊긴다. 따라서 실시간 조회 누적 시간의 상한은 예산 + 이 값이다.
+REQUEST_BUDGET_SEC = 2.0
+CONSECUTIVE_FAIL_LIMIT = 2
+MIN_CALL_TIMEOUT_SEC = 0.5
+
+# LiveBudget.call() 이 실행 중인 조회에 적용할 타임아웃 상한(초). None 이면 상한 없음.
+# 조회 메서드의 시그니처를 바꾸지 않고 `_http_get` 까지 전달하기 위해 컨텍스트 변수로 둔다.
+_TIMEOUT_CAP: contextvars.ContextVar = contextvars.ContextVar("gbis_timeout_cap", default=None)
+
+
+class LiveBudget:
+    """경로 계획 한 건(요청 하나)의 실시간 조회 예산 — 누적 시간과 연속 실패를 센다.
+
+    조회하는 쪽은 `allow()` 로 조회해도 되는지 묻고, `call()` 로 조회를 실행한 뒤
+    `note()` 로 성공·실패를 알린다. 예산을 넘겼거나 연속 실패가 임계에 이르면 `allow()` 가
+    False 가 되고, 호출 측은 남은 대상을 조회하지 않고 "실시간 불가"로 처리한다.
+    실시간이 정상이면 예산에 닿지 않으므로 결과는 예산이 없을 때와 같다.
+
+    요청마다 새로 만든다(요청 사이에 공유하지 않는다). 한 요청은 한 스레드에서 순차로
+    조회하므로 잠금은 두지 않는다.
+    """
+
+    def __init__(self, budget_sec: float = None, fail_limit: int = None, clock=time.monotonic):
+        self.budget_sec = float(REQUEST_BUDGET_SEC if budget_sec is None else budget_sec)
+        self.fail_limit = int(CONSECUTIVE_FAIL_LIMIT if fail_limit is None else fail_limit)
+        self._clock = clock
+        self.spent_sec = 0.0          # 실시간 조회에 쓴 누적 시간
+        self.fail_streak = 0          # 연속 실패 횟수(성공하면 0 으로)
+        self.ok_cnt = 0               # 성공한 조회 수
+        self.skipped_cnt = 0          # 예산·연속 실패로 생략한 조회 수
+
+    def skip_reason(self):
+        """조회를 생략해야 하는 이유(문자열). 조회해도 되면 None."""
+        if self.fail_streak >= self.fail_limit:
+            return "realtime skipped: %d consecutive failures" % self.fail_streak
+        if self.spent_sec >= self.budget_sec:
+            return "realtime skipped: time budget %.1fs used" % self.budget_sec
+        return None
+
+    def allow(self) -> bool:
+        return self.skip_reason() is None
+
+    def call(self, fn, *args, **kwargs):
+        """조회 함수 fn 을 실행하고 걸린 시간을 누적한다. 반환값·예외는 fn 의 것을 그대로 넘긴다.
+
+        실행 동안 조회 타임아웃을 남은 예산(최소 MIN_CALL_TIMEOUT_SEC)으로 낮춘다 — 예산이
+        0.3초 남은 시점에 3초짜리 조회가 시작돼 예산을 크게 넘기는 일을 막는다.
+        """
+        cap = max(self.budget_sec - self.spent_sec, MIN_CALL_TIMEOUT_SEC)
+        token = _TIMEOUT_CAP.set(cap)
+        t0 = self._clock()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            self.spent_sec += max(self._clock() - t0, 0.0)
+            _TIMEOUT_CAP.reset(token)
+
+    def note(self, ok: bool) -> None:
+        """조회 결과를 기록한다 — 성공이면 연속 실패를 0 으로, 실패면 1 늘린다."""
+        if ok:
+            self.ok_cnt += 1
+            self.fail_streak = 0
+        else:
+            self.fail_streak += 1
+
+    def skipped(self) -> None:
+        self.skipped_cnt += 1
 
 
 def _int(v, default=None):
@@ -91,7 +175,10 @@ class GbisLive:
 
     def _http_get(self, url: str) -> dict:
         req = urllib.request.Request(url, headers={"User-Agent": "iitp-dabt-route/1.0"})
-        with urllib.request.urlopen(req, timeout=self.timeout_sec) as r:
+        # 요청 단위 예산(LiveBudget.call)이 걸려 있으면 타임아웃을 남은 예산까지로 낮춘다
+        cap = _TIMEOUT_CAP.get()
+        timeout = self.timeout_sec if cap is None else min(self.timeout_sec, float(cap))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8"))
 
     def _url(self, path: str, **params) -> str:
@@ -112,18 +199,29 @@ class GbisLive:
         body, err = None, None
         try:
             data = self._fetch(self._url(path, **params))
-            resp = (data or {}).get("response") or {}
-            head = resp.get("msgHeader") or {}
-            code = _int(head.get("resultCode"), -1)
-            if code == 0:
-                body = resp.get("msgBody") or {}
-            elif code == 4:
-                body = {}                    # 결과 없음 — 정상 응답의 한 형태
+            # 응답 JSON 의 최상위·response·msgHeader·msgBody 가 dict 가 아닌 경우(게이트웨이가
+            # 오류를 배열·문자열로 돌려주는 등)에는 .get 호출이 AttributeError 로 번진다 —
+            # 형식 오류로 보고 "실시간 불가"로 돌려준다.
+            resp = data.get("response") if isinstance(data, dict) else None
+            head = resp.get("msgHeader") if isinstance(resp, dict) else None
+            if not isinstance(resp, dict) or not isinstance(head, dict):
+                err = "GBIS 응답 형식 오류(%s)" % type(data).__name__
             else:
-                err = "GBIS resultCode=%s %s" % (code, head.get("resultMessage") or "")
+                code = _int(head.get("resultCode"), -1)
+                if code == 0:
+                    body = resp.get("msgBody") or {}
+                    if not isinstance(body, dict):
+                        body, err = None, "GBIS 응답 형식 오류(msgBody=%s)" % type(body).__name__
+                elif code == 4:
+                    body = {}                    # 결과 없음 — 정상 응답의 한 형태
+                else:
+                    err = "GBIS resultCode=%s %s" % (code, head.get("resultMessage") or "")
         except urllib.error.HTTPError as e:
             err = "HTTP %s" % e.code
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError,
+                http.client.HTTPException) as e:
+            # http.client.HTTPException: 본문을 읽는 도중 연결이 끊기면 IncompleteRead 가 난다.
+            # OSError·URLError 의 하위가 아니어서 따로 잡지 않으면 호출자에게 예외로 올라간다.
             err = "%s: %s" % (type(e).__name__, e)
         if err:
             logger.warning("GBIS 호출 실패 %s %s — %s", path, params, err)
@@ -149,7 +247,9 @@ class GbisLive:
         if isinstance(raw, dict):
             raw = [raw]
         pts = []
-        for it in raw:
+        for it in (raw if isinstance(raw, list) else []):
+            if not isinstance(it, dict):     # 항목이 dict 가 아니면 건너뛴다(형식 오류 방어)
+                continue
             try:
                 x = float(it.get("x")); y = float(it.get("y"))
             except (TypeError, ValueError):
@@ -226,7 +326,9 @@ class GbisLive:
         if isinstance(raw, dict):
             raw = [raw]
         items = []
-        for it in raw:
+        for it in (raw if isinstance(raw, list) else []):
+            if not isinstance(it, dict):     # 항목이 dict 가 아니면 건너뛴다(형식 오류 방어)
+                continue
             rid = _str(it.get("routeId"))
             if route_id is not None and str(route_id) != rid:
                 continue
@@ -283,7 +385,9 @@ class GbisLive:
         if isinstance(raw, dict):
             raw = [raw]
         vehicles = []
-        for it in raw:
+        for it in (raw if isinstance(raw, list) else []):
+            if not isinstance(it, dict):     # 항목이 dict 가 아니면 건너뛴다(형식 오류 방어)
+                continue
             sid = _str(it.get("stationId"))
             low = _int(it.get("lowPlate"))
             st = _int(it.get("stateCd"))

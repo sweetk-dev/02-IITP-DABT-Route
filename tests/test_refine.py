@@ -188,3 +188,59 @@ def test_unmarked_crossing_sentence():
     assert "이면도로를 건너" in s and "횡단보도 표시가 없으니" in s
     s2 = _sentence("straight", 17.2, None, {"link_type": "crossing"}, [])
     assert "이면도로" not in s2
+
+
+# ---- 긴 도로 링크(끝점이 멀리 있는 간선) 교차 판정 ----
+
+def _add_long_arterial(G, x=3.0, name="소곡로"):
+    """x 위치를 남북으로 지나는 간선 링크 — 양 끝이 각 300m 밖이라 A·B 주변 격자 칸에 끝점이 없다."""
+    for n, dy in (("L1", -300), ("L2", 300)):
+        la, lo = _pt(x, dy)
+        G.add_node(n, lat=la, lon=lo, node_type="intersection")
+    G.add_edge("L1", "L2", length=600.0, **_edge("L1", "L2", link_type="road", link_name=name))
+
+
+def test_gap_bridge_long_arterial_plus_minor_road_rejected_with_reason():
+    """이면도로와 함께 긴 간선 링크를 가로지르는 선은 '도로 하나만 횡단'이 아니다 — 기각하고 사유를 남긴다."""
+    G = gap_graph()
+    _add_long_arterial(G)
+    hit = [x for x in rf.find_gap_bridges(G) if {x["a"], x["b"]} == {"A", "B"}]
+    assert len(hit) == 1, "기각 사유가 갭 보고서에 남아야 한다"
+    assert hit[0]["gate"].startswith("G2") and "소곡로" in hit[0]["gate"] and "현충로52번길" in hit[0]["gate"]
+    assert hit[0]["road_name"].split("·")[0] == "소곡로", "간선 이름을 앞에 둔다"
+    assert rf.apply_gap_bridges(G, hit) == 0 and not G.has_edge("A", "B")
+
+
+def test_gap_bridge_long_arterial_only_is_gated_not_dropped():
+    """긴 간선 링크 하나만 가로지르는 선 — 후보가 조용히 사라지지 않고 G1(간선 횡단)으로 보고된다."""
+    G = gap_graph()
+    G.remove_edge("R1", "R2")
+    _add_long_arterial(G, x=6.0)
+    hit = [x for x in rf.find_gap_bridges(G) if {x["a"], x["b"]} == {"A", "B"}]
+    assert len(hit) == 1 and hit[0]["gate"].startswith("G1") and hit[0]["road_name"] == "소곡로"
+    assert rf.apply_gap_bridges(G, hit) == 0 and not G.has_edge("A", "B")
+
+
+def test_road_link_index_registers_every_cell_on_the_way():
+    """색인은 링크가 지나는 칸 전부에 링크를 넣는다 — 끝점에서 먼 중간 지점에서도 찾는다."""
+    G = gap_graph()
+    _add_long_arterial(G)
+    idx = rf._RoadLinkIndex(G)
+    names = lambda la, lo: {idx.links[k][2] for k in idx.near(la, lo)}      # noqa: E731
+    assert "소곡로" in names(*_pt(3, 0)) and "소곡로" in names(*_pt(3, 150)) and "소곡로" in names(*_pt(3, -290))
+    assert "소곡로" not in names(*_pt(200, 0))
+    assert all(G[u][v]["link_type"] == "road" for u, v, _n, _l in idx.links), "도로 링크만 색인한다"
+
+
+def test_gap_bridge_builds_road_index_once(monkeypatch):
+    """도로 링크 색인은 find_gap_bridges 호출 1회에 한 번만 만든다."""
+    made = []
+    orig = rf._RoadLinkIndex.__init__
+
+    def counting(self, G):
+        made.append(1)
+        orig(self, G)
+
+    monkeypatch.setattr(rf._RoadLinkIndex, "__init__", counting)
+    rf.find_gap_bridges(gap_graph())
+    assert len(made) == 1
