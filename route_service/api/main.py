@@ -441,6 +441,75 @@ ETA_NOTE_LOW_FLOOR = "소요시간은 정거장 수 기반 추정에 저상버�
 LOW_BUS_WARNING = ("저상버스 정차 여부는 보장되지 않습니다 — "
                    "실시간 도착정보로 저상 차량을 확인하세요")
 
+# ── 리프트만 있는 승강장 감점 (v1.35.0) ──
+# 후보 스코어는 "도보 m" 단위다(지하철 한 역 180, 탑승 1회 250, 도보 경고 1건 200). 리프트만 있는
+# 승강장은 그보다 훨씬 무거운 부담이다 — 역무원 호출·대기, 느린 리프트 운행, 그리고 폭 800mm·길이
+# 1,100mm 같은 리프트에 전동 휠체어가 올라가지 못하면 승강장에서 나올 수조차 없다. 그래서 승차·하차
+# 한 쪽마다 1,500m(전동 휠체어 1.1m/s 로 약 23분)를 더한다.
+#   · 이 정도면 리프트를 피하는 다른 승·하차역 조합이 도보 1.5km 이내의 추가 부담으로 있으면 그쪽이 이긴다.
+#   · 다른 조합이 없거나 훨씬 멀면(예: 석수에서 내려 3km 를 되걸어 오는 조합) 리프트 경로를 경고와 함께 남긴다 —
+#     무한대 감점으로 무조건 배제하면 "지하철로 가 달라"는 요청에 터무니없이 먼 경로를 내게 된다.
+#   · 자동 추천(12 앱)은 이 값을 응답(summary.platform_access_penalty_m)으로 받아, 대중교통이 아끼는 도보 거리가
+#     이 감점보다 작으면 도보 경로를 유지한다 — 같은 기준을 두 곳에서 따로 정하지 않게 값을 응답에 싣는다.
+# 휠체어 프로필(wheelchair_*)에만 적용한다. 시각장애 등 다른 프로필은 리프트와 무관하다(계단·에스컬레이터 이용).
+LIFT_ONLY_PLATFORM_PENALTY_M = 1500
+
+
+def _is_wheelchair(profile) -> bool:
+    """휠체어 프로필 여부 — 기존 출구 선택(_walk_leg_via_exit)과 같은 판별(id 접두어)."""
+    return str(getattr(profile, "id", "") or "").startswith("wheelchair")
+
+
+_PA_MEMO_KEY = "_platform_access_memo"     # 후보 part 에만 두는 내부 메모 — 응답(leg)으로 나가지 않는다
+
+
+def _subway_platform_access(part: dict, wheel: bool) -> dict:
+    """지하철 part 의 승차·하차 승강장 접근 판정 {"board": entry|None, "alight": entry|None}.
+
+    판정에는 역 설비 **전체**(_station_facilities_cached)를 쓴다 — 표시용 요약은 리프트 4건에서 잘린다.
+    설비 조회가 실패하면 판정이 unknown 이 되어 경고·감점하지 않는다(모르는 것을 단정하지 않는다).
+    휠체어 프로필이고 리프트만 있으면 entry["warning"] 에 경고 문장을 넣는다 — 경고·감점·스텝 표시는
+    모두 이 키가 있는지로 판단한다.
+
+    방향은 플래너가 정한 leg 의 노선(part["line"]) 안에서 판정한다 — 역 이름으로 노선을 다시 고르면
+    두 노선이 지나는 역에서 다른 노선의 순서·설비로 판정할 수 있다.
+
+    같은 후보 part 는 근사 정렬과 실계산에서 두 번 판정된다. 결과를 part 의 내부 키에 메모해 두고 다시
+    쓴다(휠체어 여부가 같을 때만). part 는 응답에 그대로 실리지 않고 _subway_leg 가 필요한 필드만 옮기므로
+    이 키는 응답으로 새지 않는다.
+    """
+    memo = part.get(_PA_MEMO_KEY)
+    if memo is not None and memo[0] == wheel:
+        return memo[1]
+    out = {"board": None, "alight": None}
+    lt = station_exits.subway_travel(part["board"].get("name") or "", part["alight"].get("name") or "",
+                                     part.get("line"))
+    if lt is not None:
+        line, travel = lt
+        for side in ("board", "alight"):
+            st = part[side]
+            fac = _station_facilities_cached(st) or {}
+            pa = station_exits.platform_access(st.get("name") or "", travel, fac, side, line=line)
+            if pa and wheel and pa["access"] == "lift_only":
+                pa["warning"] = station_exits.lift_only_warning(pa)
+            out[side] = pa
+    part[_PA_MEMO_KEY] = (wheel, out)
+    return out
+
+
+def _platform_penalty_m(pa_map: dict) -> float:
+    """경고가 붙은(=휠체어 프로필의 리프트만 있는) 승강장 수 × 감점."""
+    return LIFT_ONLY_PLATFORM_PENALTY_M * sum(
+        1 for pa in (pa_map or {}).values() if pa and pa.get("warning"))
+
+
+def _parts_platform_penalty_m(parts: list, wheel: bool) -> float:
+    """후보 조합(parts)의 승강장 감점 합 — 실계산 전 근사 정렬에 쓴다."""
+    if not wheel:
+        return 0.0
+    return sum(_platform_penalty_m(_subway_platform_access(p, wheel))
+               for p in parts if p.get("kind") == "subway")
+
 
 def _walk_leg(frm, to, profile, allowed, label_from, label_to, to_is_entrance: bool = False):
     """도보 leg 1개 — 기존 보행 라우팅 재사용. 15m 미만은 leg 생략(None).
@@ -600,6 +669,22 @@ def _transit_step(leg, boarding: bool) -> dict:
                                                         "(승강기)" if ax.get("has_elevator") else "")
             coord = [leg["alight"]["lat"], leg["alight"]["lng"]]
             maneuver = "subway_alight"
+    # 리프트만 있는 승강장 (v1.35.0) — 승차 스텝은 승차·하차 두 쪽을 모두, 하차 스텝은 하차 쪽만 말한다.
+    # 승차 직전이 이용자가 경로를 바꿀 수 있는 마지막 시점이라, 내릴 역의 리프트도 탈 때 미리 알린다.
+    # 앱은 스텝 문장(instruction)을 그대로 읽으므로 경고를 문장 끝에 붙여 안내 음성에도 실리게 한다.
+    # 승차 스텝에서 내릴 역(하차 쪽) 경고는 짧은 문장으로 한다 — 전체 문장(크기·할 일)은 하차 스텝과 경로
+    # 요약에 있다. 승차 승강장 자체가 리프트뿐이면 승차 스텝이 그 쪽의 "해당 스텝"이므로 전체 문장을 쓴다.
+    flagged, notes = [], []
+    if leg["kind"] == "subway":
+        pam = leg.get("platform_access") or {}
+        for side in (("board", "alight") if boarding else ("alight",)):
+            pa = pam.get(side)
+            if pa and pa.get("warning"):
+                flagged.append(pa)
+                notes.append(station_exits.lift_only_short(pa) if (boarding and side == "alight")
+                             else pa["warning"])
+    if flagged:
+        instruction = instruction.rstrip(" .") + ". 주의: " + " ".join(notes)
     leg_ref = {"kind": leg["kind"]}
     if leg["kind"] == "bus":
         leg_ref.update({"route_id": str(leg["route"]["route_id"]),
@@ -617,10 +702,25 @@ def _transit_step(leg, boarding: bool) -> dict:
            "coord": [round(coord[0], 7), round(coord[1], 7)],
            "link_type": leg["kind"], "link_name": None,
            "leg_ref": leg_ref,
-           "warnings": leg["warnings"] if boarding else []}
+           "warnings": _step_warnings(leg, boarding, flagged, notes)}
+    if flagged:
+        out["platform_access"] = flagged    # 화면이 별도 주의 줄로 그린다(기계 판독용)
     if not boarding and leg.get("egress"):
         out["egress"] = leg["egress"]       # 화면이 역 안/밖을 묻고 해당 문장을 쓴다(#77)
     return out
+
+
+def _step_warnings(leg, boarding: bool, flagged: list, notes: list) -> list:
+    """대중교통 스텝의 경고 목록.
+
+    승차 스텝은 종전처럼 leg 경고 전체를 싣되, 리프트 승강장 경고만은 이 스텝에서 쓴 문장(notes — 하차
+    쪽은 짧은 문장)으로 바꾼다. 하차 스텝은 하차 쪽 리프트 경고(전체 문장)만 싣는다.
+    """
+    if not boarding:
+        return list(notes)
+    full = {pa["warning"] for pa in flagged}
+    out = [w for w in leg["warnings"] if w not in full]
+    return out + [n for n in notes if n not in out]
 
 
 def _station_exit_step(leg) -> dict:
@@ -799,6 +899,10 @@ def _rank_low_floor(cands: list, judge, profile, origin) -> list:
                 secs += p["stop_cnt"] * transit.BUS_SEC_PER_STOP + lowfloor.BOARDING_OVERHEAD_SEC
             else:
                 secs += p["station_cnt"] * transit.SUBWAY_SEC_PER_STATION + transit.SUBWAY_ACCESS_SEC
+        # 리프트만 있는 승강장 감점(v1.35.0)을 초로 환산 — 저상 우선 정렬은 시간 키라 같은 무게를 초로 준다
+        pen = _parts_platform_penalty_m(c["parts"], _is_wheelchair(profile))
+        if pen and profile.speed_mps:
+            secs += pen / profile.speed_mps
         if part is None:
             j = {"tier": 1, "wait_sec": 0.0, "source": "none", "reason": "no bus leg"}
         else:
@@ -928,6 +1032,14 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                 cands, lf_expanded = wider, True
             elif not cands and wider:
                 cands = wider
+    wheel = _is_wheelchair(profile)
+    if wheel and not lf_mode and cands:
+        # 근사 정렬에도 승강장 감점을 넣는다(v1.35.0). 실계산은 상위 8개만 하므로, 리프트 경로가
+        # 근사 순위에서 앞을 다 차지하면 리프트를 피하는 조합이 실계산 대상에 들지 못한다.
+        # (저상 우선 모드는 _rank_low_floor 가 같은 감점을 초로 넣어 이미 정렬했다)
+        for c in cands:
+            c["score"] = c["score"] + _parts_platform_penalty_m(c["parts"], wheel)
+        cands.sort(key=lambda c: c["score"])
     if not cands:
         raise HTTPException(
             status_code=404,
@@ -976,6 +1088,13 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         sl["board_exit"] = station_exits.exit_brief(bx)
                     if ax:
                         sl["alight_exit"] = station_exits.exit_brief(ax)
+                    # 승차·하차 승강장 접근 판정(v1.35.0) — 휠체어 프로필의 리프트만 있는 쪽은 leg 경고에 넣는다.
+                    # leg 경고는 승차 스텝과 경로 요약(summary.warnings)으로 그대로 이어진다.
+                    sl["platform_access"] = _subway_platform_access(part, wheel)
+                    for side in ("board", "alight"):
+                        pa = sl["platform_access"][side]
+                        if pa and pa.get("warning") and pa["warning"] not in sl["warnings"]:
+                            sl["warnings"].append(pa["warning"])
                     built.append(sl)
             actual = sum(l["summary"]["total_distance_m"] for l in built
                          if l["kind"] == "walk")
@@ -983,6 +1102,10 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             actual += sum(l.get("station_cnt", 0) for l in built) * transit.STATION_PENALTY_M
             actual += sum(1 for l in built if l["kind"] != "walk") * transit.TRANSIT_LEG_PENALTY_M
             actual += 200 * sum(len(l.get("warnings", [])) for l in built if l["kind"] == "walk")
+            # 리프트만 있는 승강장 감점(v1.35.0) — LIFT_ONLY_PLATFORM_PENALTY_M 설명 참조
+            plat_pen = sum(_platform_penalty_m(l.get("platform_access")) for l in built
+                           if l["kind"] == "subway")
+            actual += plat_pen
             key = actual
             if lf_mode:
                 # 실제 도보 소요로 다시 판정 — 근사로는 탈 수 있던 차량을 실경로에서는 놓칠 수 있다
@@ -990,6 +1113,8 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                 secs = sum(l["summary"]["duration_sec"] for l in built if l["kind"] == "walk")
                 secs += sum(l.get("est_duration_sec", 0) for l in built if l["kind"] != "walk")
                 secs += lowfloor.BOARDING_OVERHEAD_SEC * sum(1 for l in built if l["kind"] == "bus")
+                if plat_pen and profile.speed_mps:
+                    secs += plat_pen / profile.speed_mps     # 시간 키에서도 같은 무게로 감점한다
                 if part is None:
                     j = cand["low_floor"]
                 else:
@@ -1026,7 +1151,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             # 빠지고 "내린 승강장 쪽 승강기" 안내가 나오지 않는다. 전체 조회가 안 되면 요약으로 대신한다.
             fac_full = _station_facilities_cached(leg["alight"]) or leg["alight"].get("facilities") or {}
             leg["egress"] = station_exits.egress_guide(
-                leg["alight"]["name"], leg["board"]["name"], fac_full, ax)
+                leg["alight"]["name"], leg["board"]["name"], fac_full, ax, line=leg.get("line"))
 
     # ── 통합 요약·geometry·steps ──
     walk_legs = [l for l in legs if l["kind"] == "walk"]
@@ -1038,6 +1163,17 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     warnings = sorted(set(
         w for l in walk_legs for w in l["summary"]["warnings"]
     ) | set(w for l in legs for w in l.get("warnings", [])))
+    # 리프트만 있는 승강장 경고는 맨 앞에 둔다(v1.35.0) — 이용자가 출발 전에 가장 먼저 들어야 할 위험이다.
+    # 같은 내용을 기계가 읽을 수 있게 platform_access(경고가 붙은 판정 목록)와 적용한 감점으로도 싣는다.
+    plat_flags = [pa for l in transit_legs if l["kind"] == "subway"
+                  for pa in ((l.get("platform_access") or {}).get("board"),
+                             (l.get("platform_access") or {}).get("alight"))
+                  if pa and pa.get("warning")]
+    plat_warn = []
+    for pa in plat_flags:
+        if pa["warning"] not in plat_warn:
+            plat_warn.append(pa["warning"])
+    warnings = plat_warn + [w for w in warnings if w not in plat_warn]
 
     geometry, steps = [], []
     for i, leg in enumerate(legs):
@@ -1096,6 +1232,9 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
         },
         "eta_note": ETA_NOTE if not (lf_mode and lf_info.get("tier") in (1, 2)) else ETA_NOTE_LOW_FLOOR,
         "warnings": warnings,
+        # 리프트만 있는 승강장(v1.35.0) — 휠체어 프로필에서 경고가 붙은 판정만. 없으면 빈 목록.
+        "platform_access": plat_flags,
+        "platform_access_penalty_m": LIFT_ONLY_PLATFORM_PENALTY_M * len(plat_flags),
     }
 
     route_id = "r_%s" % uuid.uuid4().hex[:10]
@@ -1268,7 +1407,20 @@ def _plan_from_station(req: PlanRequest) -> dict:
     step = {"maneuver": "station_start", "instruction": ins,
             "distance_m": 0, "duration_sec": 0, "coord": coord,
             "link_type": "walk", "link_name": None, "egress": guide, "warnings": []}
+    # 내린 승강장에 리프트만 있으면(휠체어 프로필) 출발 스텝 경고·경로 요약 맨 앞에도 싣는다(v1.35.0).
+    # 역 안 문장(egress.inside)에는 리프트 위치·크기·할 일이 이미 들어 있다.
+    # summary.platform_access 에는 싣지 않는다 — 그 필드는 "이 경로가 리프트만 있는 승강장을 지나간다"는 뜻이다.
+    # 역 안 출발의 내린 승강장은 첫 스텝(station_start)·egress 가 설명하고, 거기에도 실으면 경고를 두 번 말하게 된다.
+    pa = guide.get("platform_access")
+    lift_warn = None
+    if wheel and pa and pa.get("access") == "lift_only":
+        pa["warning"] = lift_warn = station_exits.lift_only_warning(pa)
+        step["warnings"] = [lift_warn]
+        step["platform_access"] = [pa]
     for r in payload.get("routes") or []:
+        if lift_warn:
+            sm = r.setdefault("summary", {})
+            sm["warnings"] = [lift_warn] + [w for w in (sm.get("warnings") or []) if w != lift_warn]
         r["steps"] = [dict(step)] + list(r.get("steps") or [])
         for i, s_ in enumerate(r["steps"]):      # 스텝 번호 계약 유지 — 앞에 붙인 만큼 다시 매긴다
             s_["idx"] = i
