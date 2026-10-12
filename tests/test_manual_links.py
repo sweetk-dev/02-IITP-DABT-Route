@@ -111,8 +111,24 @@ def test_repo_links_file_is_valid():
                         "data", "manual_links", "anyang.json")
     links = ml.load_links(path)
     ids = [l["id"] for l in links]
-    assert len(ids) == len(set(ids)) and len(ids) >= 6
+    assert len(ids) == len(set(ids)) and len(ids) >= 3
     ml.validate_links(links)          # 레포 목록은 항상 검사를 통과해야 한다
+
+
+def test_repo_links_exclude_gwanak_fare_zone_passage():
+    """관악역 2층 대합실 통로는 개찰구 안(운임 구역)이다(사전답사 2026-10-01).
+
+    출구를 바꾸려고 지나갈 수 있는 길이 아니므로 목록에 두지 않는다 — 두면 1번 출구로 들고 나는 경로가
+    개찰구 안 대합실을 지나가게 안내한다. 1번 ↔ 2번 출구는 역사 아래 만안로(GWANAK-01·02)로 잇는다.
+    """
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "data", "manual_links", "anyang.json")
+    links = ml.load_links(path)
+    ids = {l["id"] for l in links}
+    assert not ids & {"GWANAK-04", "GWANAK-05", "GWANAK-06"}
+    assert {"GWANAK-01", "GWANAK-02", "GWANAK-03"} <= ids
+    assert not any("대합실" in (l.get("link_name") or "") for l in links)
 
 
 def test_validate_rejects_swapped_or_far_geometry():
