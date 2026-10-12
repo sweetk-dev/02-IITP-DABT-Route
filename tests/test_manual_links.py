@@ -128,7 +128,38 @@ def test_repo_links_exclude_gwanak_fare_zone_passage():
     ids = {l["id"] for l in links}
     assert not ids & {"GWANAK-04", "GWANAK-05", "GWANAK-06"}
     assert {"GWANAK-01", "GWANAK-02", "GWANAK-03"} <= ids
-    assert not any("대합실" in (l.get("link_name") or "") for l in links)
+    gwanak = [l for l in links if str(l["id"]).startswith("GWANAK")]
+    assert not any("대합실" in (l.get("link_name") or "") or l.get("link_type") == "elevator" for l in gwanak)
+
+
+def test_repo_links_route_gwanak_exits_via_street():
+    """레포 목록을 관악역 주변 축소 그래프에 적용하면 1번 ↔ 2번 출구가 역사 아래 만안로로 이어진다.
+
+    도로 노드 ID 는 운영 그래프와 같은 3903318504(역사 아래 만안로)·4696341341(경수대로1273번길).
+    좌표는 출구 링크 길이(21m·42m·25m)에 맞춘 근삿값이다.
+    """
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "data", "manual_links", "anyang.json")
+    G = nx.Graph()
+    G.add_node(3903318504, lat=37.4185572, lon=126.9090177, node_type="unknown")      # 역사 아래 만안로
+    G.add_node(4696341341, lat=37.4190700, lon=126.9094400, node_type="unknown")      # 경수대로1273번길
+    G.add_node(1, lat=37.4183000, lon=126.9083000, node_type="unknown")               # 만안로 서쪽
+    G.add_edge(3903318504, 1, length=80, slope=0.3, link_type="sidewalk")
+    report = ml.apply_manual_links(G, ml.load_links(path))
+    assert all(r["status"] == "added" for r in report if str(r["id"]).startswith("GWANAK"))
+    by_id = {r["id"]: r for r in report}
+    exit1, exit2 = by_id["GWANAK-01"]["u"], by_id["GWANAK-02"]["u"]
+    assert exit1 != exit2
+    path_nodes = nx.shortest_path(G, exit1, exit2, weight="length")
+    assert path_nodes == [exit1, 3903318504, exit2]
+    dist = nx.shortest_path_length(G, exit1, exit2, weight="length")
+    assert 55 <= dist <= 70
+    # 1번 출구에서 동쪽 이면도로(김중업 방면)까지 승강기·대합실 링크 없이 간다
+    east = nx.shortest_path(G, exit1, 4696341341, weight="length")
+    for u, v in zip(east, east[1:]):
+        e = G.edges[u, v]
+        assert e.get("link_type") != "elevator" and "대합실" not in (e.get("link_name") or "")
 
 
 def test_validate_rejects_swapped_or_far_geometry():
