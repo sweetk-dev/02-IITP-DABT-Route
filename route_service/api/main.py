@@ -35,6 +35,7 @@ from ..poi import landmarks as poi_landmarks
 from ..poi import buildings as poi_buildings
 from ..poi import directory as poi_directory
 from ..poi import food as poi_food
+from ..poi import culture as poi_culture
 from ..transit import gbis_live
 from ..transit import planner as transit
 from ..transit import low_floor as lowfloor
@@ -1700,6 +1701,43 @@ def toilet_nearby(
     metrics.tag(result_cnt=len(items))
     return {"source": poi_store.STORE.source, "radius_m": radius_m,
             "accessible_only": accessible_only, "count": len(items), "items": items}
+
+
+# ────────────────────────── 장애인 문화·체육 시설 (v1.36.0) ──────────────────────────
+@app.get("/culture/nearby", tags=["support"], dependencies=[Depends(auth)])
+def culture_nearby(
+    lat: float = Query(...),
+    lng: float = Query(...),
+    types: str = Query(",".join(poi_culture.CULTURE_TYPES),
+                       description="braille_lib | booknarae_lib | sports_fac | sports_org (콤마 구분)"),
+    radius_m: float = Query(5000, ge=100, le=50000),
+    limit: int = Query(3, ge=1, le=20, description="종류별 반경 안 최대 건수"),
+    fallback: bool = Query(True, description="반경 안이 0건인 종류는 반경 밖 가까운 곳을 beyond_radius 로 붙인다"),
+    fallback_limit: int = Query(2, ge=1, le=5),
+    fallback_max_m: float = Query(poi_culture.FALLBACK_MAX_M, ge=1000, le=100000,
+                                  description="반경 밖으로 찾아 주는 최대 거리 — 이보다 먼 곳은 붙이지 않는다"),
+):
+    """점자도서관 · 책나래 신청 도서관 · 장애인체육시설 · 장애인체육회 근접 조회(경기도 자료).
+
+    종류별로 반경 안 가까운 순 `limit` 개. 반경 안이 0건인 종류만 반경 밖 가장 가까운 곳을
+    `beyond_radius=true` 로 붙인다 — 점자도서관·체육시설은 경기도 전체에 5곳씩이라 반경으로만 자르면
+    거의 늘 "없음" 이 되기 때문이다. 다만 `fallback_max_m`(기본 30km)보다 먼 곳은 붙이지 않는다.
+    경기도 자료라 서울 등 인접 시·도의 더 가까운 시설은 빠져 있다(응답 `region_note`).
+    `in_service_area` 는 경로 안내 지역(경로망 범위) 안인지다.
+    """
+    tlist = [t.strip() for t in types.split(",") if t.strip()]
+    bad = [t for t in tlist if t not in poi_culture.CULTURE_TYPES]
+    if bad:
+        raise HTTPException(status_code=400, detail="지원하지 않는 유형: %s" % ",".join(bad))
+    res = poi_culture.culture_near(poi_store.STORE, lat, lng, tlist, radius_m, limit,
+                                   fallback, fallback_limit, fallback_max_m)
+    for it in res["items"]:
+        # 경로 안내 가능 여부 — 이용자 화면이 '여기로 안내' 를 보일지 정한다(범위 밖이면 경로가 실패한다)
+        it["in_service_area"] = _in_bbox(it["lat"], it["lng"])
+    metrics.tag(culture_types=",".join(tlist), result_cnt=len(res["items"]))
+    return {"source": poi_store.STORE.source, "radius_m": radius_m, "count": len(res["items"]),
+            "count_by_type": res["count_by_type"], "within_by_type": res["within_by_type"],
+            "region_note": poi_culture.REGION_NOTE, "items": res["items"]}
 
 
 # ────────────────────────── 음식점·건물 편의시설·명부 (v1.31.0) ──────────────────────────

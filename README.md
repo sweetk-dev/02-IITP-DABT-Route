@@ -263,6 +263,19 @@ python scripts/build_network.py --source osm --place "Anyang-si, ..." \
   쪽 **출구에서** 계획하고, 맨 앞에 `station_start` 스텝(내린 승강장 승강기 → 출구 승강기, `egress.inside`)을 붙인다.
   응답 최상위 `station_start` 에 역·방향·출구·안내를 싣는다. 방향을 모르면 승강장 설비를 '모름'으로 두고 위치만 알린다.
 
+### 장애인 문화·체육 시설 근접 조회 (v1.36.0)
+
+- `GET /culture/nearby?lat&lng&types=braille_lib,booknarae_lib,sports_fac,sports_org&radius_m=5000&limit=3&fallback=true&fallback_limit=2`
+  — 01 `poi_culture_sports_facility`(08 `GG_CULTURE` 가 매월 적재, 경기도 전체 302곳). 종류는 점자도서관(5) ·
+  책나래 신청 도서관(260 — 장애인 도서 무료 택배 대출 '책나래'를 신청할 수 있는 공공도서관) · 장애인체육시설(5) ·
+  시군 장애인체육회(32, 단체 사무국).
+- 종류별 반경 안 가까운 순 `limit` 개. **반경 안이 0건인 종류만** 반경 밖 가장 가까운 곳을 `beyond_radius=true` 로
+  붙인다(점자도서관은 안양에 없어 가장 가까운 곳도 수원·성남이다). 반경 안이 있으면 먼 곳을 섞지 않는다.
+  반경 밖도 `fallback_max_m`(기본 30km)까지만 찾는다. 경기도 자료라 서울 등 인접 시·도의 시설은 없다.
+- 항목: `type_label`·`type_desc`(이용자에게 풀어 줄 한 줄 설명)·이름·주소·전화·홈페이지·`dist_m`·`in_service_area`
+  (경로망 범위 안 — 밖이면 경로 안내가 되지 않는다). 응답 `within_by_type`(반경 안 건수)·`region_note`(경기도 자료).
+- 활성 행 전량을 정규화해 TTL 캐시에 두고 거리를 계산한다(수백 행). 파일 백엔드: `data/poi/culture_sports_facility.json`(논리삭제 행 제외).
+
 ### 음식점 · 건물 편의시설 · 공공건물 화장실 · 명부 (v1.31.0)
 
 통합DB 에 적재돼 있으나 쓰지 않던 데이터를 조회 API 로 연다.
