@@ -688,7 +688,9 @@ def _transit_step(leg, boarding: bool) -> dict:
             if bx:
                 instruction += " (%s번 출구%s 이용)" % (bx["exit_no"],
                                                    " 승강기" if bx.get("has_elevator") else "")
-            coord = [leg["board"]["lat"], leg["board"]["lng"]]
+            # 안내 시점 (v1.40.0) — 앱은 스텝 좌표에 닿을 때 그 스텝 문장을 말한다. 역 대표점이면 이미 승강장에 들어간 뒤라
+            # 역 안 이동 안내가 쓸모없다(실기기 모의 주행 2026-10-20). 승차 출구(승강기) 앞에서 말하게 한다.
+            coord = [bx["lat"], bx["lng"]] if bx else [leg["board"]["lat"], leg["board"]["lng"]]
             maneuver = "subway_board"
         else:
             instruction = "%s역에서 하차합니다" % leg["alight"]["name"]
@@ -696,7 +698,11 @@ def _transit_step(leg, boarding: bool) -> dict:
             if ax:
                 instruction += " — %s번 출구%s로 나갑니다" % (ax["exit_no"],
                                                         "(승강기)" if ax.get("has_elevator") else "")
-            coord = [leg["alight"]["lat"], leg["alight"]["lng"]]
+            # 하차 지점 (v1.40.0) — 노선 선형이 있으면 선로 위 하차 승강장 점(구간 끝점). 역 대표점은 역사 건물 쪽이라
+            # 열차가 서는 곳과 수십 m 떨어져 있다.
+            geo = leg.get("geometry") or []
+            coord = (geo[-1] if leg.get("geometry_source") == "rail_osm" and geo
+                     else [leg["alight"]["lat"], leg["alight"]["lng"]])
             maneuver = "subway_alight"
     # 리프트만 있는 승강장 (v1.35.0) — 승차 스텝은 승차·하차 두 쪽을 모두, 하차 스텝은 하차 쪽만 말한다.
     # 승차 직전이 이용자가 경로를 바꿀 수 있는 마지막 시점이라, 내릴 역의 리프트도 탈 때 미리 알린다.
@@ -719,8 +725,13 @@ def _transit_step(leg, boarding: bool) -> dict:
         pam = leg.get("platform_access") or {}
         ingress = station_exits.ingress_guide(leg["board"]["name"], leg.get("board_exit"),
                                               pam.get("board"), pam.get("alight"), leg["alight"]["name"])
-        if ingress["inside"]:
-            instruction = instruction.rstrip(" .") + ". " + ". ".join(x.rstrip(" .") for x in ingress["inside"])
+        if ingress.get("speech"):
+            # 음성 문장 (v1.40.0) — 출구 앞에서 할 일 → 탈 열차·내릴 역 → 탑승 칸 순서로 짧게. 설비 위치 문구는 화면(ingress.inside)에만.
+            parts = [ingress["speech"],
+                     "%s %d개 역 뒤 %s역에서 내립니다" % (leg["line"], leg["station_cnt"], leg["alight"]["name"])]
+            if ingress.get("car"):
+                parts.append(ingress["car"]["text"])
+            instruction = ". ".join(p.rstrip(" .") for p in parts)
     if flagged:
         instruction = instruction.rstrip(" .") + ". 주의: " + " ".join(notes)
     leg_ref = {"kind": leg["kind"]}

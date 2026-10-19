@@ -52,7 +52,7 @@ def test_car_hint_from_alight_platform_elevator_door():
     pa = ex.platform_access("명학", "south", MYEONGHAK_FAC, "alight")
     h = ex.car_hint(pa, "명학역")
     assert (h["car"], h["door"], h["where"]) == (10, 4, "맨 뒤")
-    assert h["text"] == "내릴 명학역 승강기가 10-4 출입문 앞에 있어 10번째 칸(맨 뒤)에 타면 내려서 가깝습니다"
+    assert h["text"] == "10번째 칸(맨 뒤)에 타면 명학역 승강기가 가깝습니다"
     pa_n = ex.platform_access("명학", "north", MYEONGHAK_FAC, "alight")
     assert ex.car_hint(pa_n, "명학")["where"] == "맨 앞"                         # 1-1
     # 칸 번호가 없는 문구 · 승강기 없는 승강장 — 추측하지 않는다
@@ -67,9 +67,12 @@ def test_ingress_guide_orders_exit_elevator_gate_platform_car():
     assert g["inside"] == [
         "2번 출구 승강기로 역에 들어갑니다 — (1F) 2번 출입구 옆",
         "개찰구를 지나 안양 방향 승강장 승강기를 탑니다 — (1F) 안양역 방향 승강장 진행방향 앞쪽 끝",
-        "내릴 명학역 승강기가 10-4 출입문 앞에 있어 10번째 칸(맨 뒤)에 타면 내려서 가깝습니다",
+        "10번째 칸(맨 뒤)에 타면 명학역 승강기가 가깝습니다",
     ]
     assert g["car"]["car"] == 10
+    # 음성 문장은 할 일만 짧게 — 설비 위치 문구((1F) …)는 화면용 inside 에만 (v1.40.0)
+    assert g["speech"] == "관악역 2번 출구 승강기입니다. 역에 들어가 개찰구를 지나 안양 방향 승강장으로 가세요"
+    assert "(1F)" not in g["speech"]
     # 출구 정보가 없으면 출구 문장 없이 승강장·칸만
     g2 = ex.ingress_guide("관악", None, ex.platform_access("관악", "south", GWANAK_FAC, "board"), None, "명학")
     assert len(g2["inside"]) == 1 and g2["car"] is None
@@ -85,10 +88,19 @@ def test_board_step_speaks_ingress():
            "platform_access": {"board": ex.platform_access("관악", "south", GWANAK_FAC, "board"),
                                "alight": ex.platform_access("명학", "south", MYEONGHAK_FAC, "alight")}}
     st = m._transit_step(leg, boarding=True)
-    assert st["instruction"].startswith("관악역에서 1호선에 승차합니다 — 2개 역 이동 (2번 출구 승강기 이용). "
-                                        "2번 출구 승강기로 역에 들어갑니다")
-    assert "10번째 칸(맨 뒤)" in st["instruction"] and st["ingress"]["car"]["car"] == 10
-    assert "ingress" not in m._transit_step(leg, boarding=False)
+    assert st["instruction"] == ("관악역 2번 출구 승강기입니다. 역에 들어가 개찰구를 지나 안양 방향 승강장으로 가세요. "
+                                 "1호선 2개 역 뒤 명학역에서 내립니다. 10번째 칸(맨 뒤)에 타면 명학역 승강기가 가깝습니다")
+    assert st["ingress"]["car"]["car"] == 10
+    # v1.40.0 — 승차 안내는 승차 출구(승강기) 앞에서 말하도록 스텝 좌표가 출구다(역 대표점이면 이미 승강장 안)
+    assert st["coord"] == [37.418838, 126.90946]
+    al = m._transit_step(leg, boarding=False)
+    assert "ingress" not in al
+    assert al["coord"] == [37.384435, 126.935579]          # 노선 선형이 없는 leg 는 역 대표점
+    leg2 = dict(leg, geometry=[[37.4198, 126.9084], [37.3843, 126.9358]], geometry_source="rail_osm")
+    assert m._transit_step(leg2, boarding=False)["coord"] == [37.3843, 126.9358]   # 선로 위 하차 승강장 점
+    nobx = dict(leg, board_exit=None, platform_access={})
+    st3 = m._transit_step(nobx, boarding=True)
+    assert st3["coord"] == [37.419578, 126.908476] and st3["instruction"].startswith("관악역에서 1호선에 승차합니다")
 
 
 # ── 3) 지하철 구간 노선 선형 ─────────────────────────────────────────
