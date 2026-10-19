@@ -157,6 +157,14 @@ def exit_options(name: str, facilities: dict, wheelchair: bool) -> list:
         ex["elevator"] = elev.get(ex["exit_no"])
         ex["lift"] = lifts.get(ex["exit_no"])
         ex["has_elevator"] = (ex["exit_no"] in elev) if elev else None
+        # 출구 승강기 지상 위치 (v1.39.0) — OSM 출구 노드는 계단 출입구라, 휠체어 프로필은 승강기 앞에서
+        # 도보 구간을 시작·끝내야 한다(현장 점검 2026-10-16: 관악역 2번·명학역 1번 출구가 계단 쪽으로 안내됨).
+        # 계단 출입구 좌표는 stairs_lat/lng 로 남긴다. 휠체어가 아니면 종전처럼 출입구 좌표를 쓴다.
+        at = ex.get("elevator_at")
+        if wheelchair and ex["has_elevator"] and isinstance(at, dict) and at.get("lat") is not None:
+            ex["stairs_lat"], ex["stairs_lng"] = ex["lat"], ex["lng"]
+            ex["lat"], ex["lng"] = float(at["lat"]), float(at["lng"])
+            ex["at"] = "elevator"
     if wheelchair and elev:
         with_elev = [e for e in exits if e["exit_no"] in elev]
         if with_elev:
@@ -177,9 +185,12 @@ def nearest_exits(opts: list, pt, k: int = 3) -> list:
 
 
 def exit_brief(ex: dict) -> dict:
-    return {"exit_no": ex["exit_no"], "lat": ex["lat"], "lng": ex["lng"],
-            "has_elevator": ex.get("has_elevator"), "elevator": ex.get("elevator"),
-            "lift": ex.get("lift")}
+    out = {"exit_no": ex["exit_no"], "lat": ex["lat"], "lng": ex["lng"],
+           "has_elevator": ex.get("has_elevator"), "elevator": ex.get("elevator"),
+           "lift": ex.get("lift")}
+    if ex.get("at"):           # "elevator" — 좌표가 출구 승강기 앞이다(v1.39.0). 없으면 출입구(계단일 수 있음)
+        out["at"] = ex["at"]
+    return out
 
 
 # 노선 방향 판정용 — LINES 순서(북 → 남) 바깥의 역·종착역 이름. 설비 문구는 "○○역 방향",
@@ -495,6 +506,64 @@ def egress_guide(station_name: str, board_name: str, facilities: dict, exit_sel:
         # 승강장 위나 바로 옆의 GPS 는 튀므로 이 윤곽에서 충분히 떨어져야 역 밖으로 본다.
         "area": platforms_for(name),
     }
+
+
+_DOOR_RE = re.compile(r"(\d{1,2})\s*-\s*(\d)\s*(?:번\s*)?출입문")
+
+
+def car_hint(pa_alight: dict, alight_name: str):
+    """탑승 칸 안내 (v1.39.0) — 내릴 역 승강장 승강기가 몇 번째 칸 앞인지 알려 준다.
+
+    현장 점검(2026-10-16)에서 "탑승 칸 안내가 없어" 참여자가 직접 칸을 정했다. 하차 승강장 승강기 설비 문구에
+    "10-4 출입문 앞" 처럼 칸-문 번호가 있으면 그 칸에 타라고 말한다(칸 번호는 열차 진행 방향 앞에서부터 —
+    관악 하행 승강기 1-1 = 맨 앞 칸, 명학 하행 승강기 10-4 = 맨 뒤 칸, 시나리오서 확인값).
+    번호가 없으면 None — 칸을 추측해 말하지 않는다.
+      pa_alight   : platform_access(..., side="alight") 결과
+      alight_name : 내릴 역 이름
+    반환: {"car": 10, "door": 4, "where": "맨 뒤", "text": "..."} 또는 None
+    """
+    if not pa_alight or pa_alight.get("access") != "elevator":
+        return None
+    m = _DOOR_RE.search(pa_alight.get("elevator") or "")
+    if not m:
+        return None
+    car, door = int(m.group(1)), int(m.group(2))
+    # 수도권 1·4호선 전동차는 10칸 — 앞·뒤 표현은 이 기준으로만 붙인다
+    where = ("맨 앞" if car == 1 else "앞쪽" if car <= 3 else "맨 뒤" if car == 10
+             else "뒤쪽" if car >= 8 else "가운데")
+    return {"car": car, "door": door, "where": where,
+            "text": "내릴 %s역 승강기가 %d-%d 출입문 앞에 있어 %d번째 칸(%s)에 타면 내려서 가깝습니다"
+                    % (_key(alight_name), car, door, car, where)}
+
+
+def ingress_guide(board_name: str, board_exit: dict, pa_board: dict, pa_alight: dict,
+                  alight_name: str) -> dict:
+    """승차 전 역 안 이동 안내 (v1.39.0) — 하차 쪽 egress_guide 와 짝.
+
+    현장 점검(2026-10-16) 관악역에서 "플랫폼으로 가는 승강기를 안내하지 않았다". 지금까지 승차 스텝은
+    "○번 출구 승강기 이용"만 말했다. 출구 승강기 → 개찰구 → 승차 승강장 승강기 순서와 탑승 칸을 문장으로 만든다.
+    반환: {"station", "inside": [문장...], "car": car_hint 결과|None}
+    """
+    name = _key(board_name)
+    inside = []
+    bx = board_exit or {}
+    if bx.get("elevator"):
+        inside.append("%s번 출구 승강기로 역에 들어갑니다 — %s" % (bx["exit_no"], bx["elevator"]))
+    elif bx.get("has_elevator") is False and bx.get("lift"):
+        inside.append("%s번 출구는 휠체어리프트로 들어갑니다 — %s" % (bx["exit_no"], bx["lift"]))
+    elif bx.get("exit_no"):
+        inside.append("%s번 출구로 역에 들어갑니다" % bx["exit_no"])
+    pa = pa_board or {}
+    if pa.get("access") == "elevator" and pa.get("elevator"):
+        inside.append("개찰구를 지나 %s 승강장 승강기를 탑니다 — %s" % (_which_platform(pa), pa["elevator"]))
+    elif pa.get("access") == "lift_only":
+        inside.append("개찰구를 지나 %s 승강장으로 갑니다 — 승강장 쪽에는 휠체어리프트만 있습니다" % _which_platform(pa))
+    elif pa:
+        inside.append("개찰구를 지나 %s 승강장으로 갑니다" % _which_platform(pa))
+    car = car_hint(pa_alight, alight_name)
+    if car:
+        inside.append(car["text"])
+    return {"station": name, "inside": inside, "car": car}
 
 
 def arrival_choices(station_name: str) -> list:
