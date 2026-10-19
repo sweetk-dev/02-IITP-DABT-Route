@@ -122,6 +122,14 @@ def test_plan_to_tour_poi(client):
     assert route["steps"][-1]["maneuver"] == "arrive"
     assert len(route["geometry"]) >= 2
     assert route["landmarks"] == []                  # 파일 백엔드 — 랜드마크 원천 없음 (#88)
+    # 지도 표시용 횡단보도 목록 (#118) — 항목 키가 고정이고 crossing 스텝의 관리번호는 목록에 있다
+    assert isinstance(route["crosswalks"], list)
+    for c in route["crosswalks"]:
+        assert set(c) == {"id", "lat", "lng", "length_m", "role"} and c["role"] in ("cross", "side", "near")
+    ids = {c["id"] for c in route["crosswalks"]}
+    for st in route["steps"]:
+        if st.get("crosswalk_id"):
+            assert st["crosswalk_id"] in ids
 
 
 def test_plan_attaches_landmarks(client, monkeypatch):
