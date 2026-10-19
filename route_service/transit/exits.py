@@ -532,17 +532,16 @@ def car_hint(pa_alight: dict, alight_name: str):
     where = ("맨 앞" if car == 1 else "앞쪽" if car <= 3 else "맨 뒤" if car == 10
              else "뒤쪽" if car >= 8 else "가운데")
     return {"car": car, "door": door, "where": where,
-            "text": "내릴 %s역 승강기가 %d-%d 출입문 앞에 있어 %d번째 칸(%s)에 타면 내려서 가깝습니다"
-                    % (_key(alight_name), car, door, car, where)}
+            "text": "%d번째 칸(%s)에 타면 %s역 승강기가 가깝습니다" % (car, where, _key(alight_name))}
 
 
 def ingress_guide(board_name: str, board_exit: dict, pa_board: dict, pa_alight: dict,
                   alight_name: str) -> dict:
-    """승차 전 역 안 이동 안내 (v1.39.0) — 하차 쪽 egress_guide 와 짝.
+    """승차 전 역 안 이동 안내 (v1.39.0, 음성 문장 v1.40.0) — 하차 쪽 egress_guide 와 짝.
 
     현장 점검(2026-10-16) 관악역에서 "플랫폼으로 가는 승강기를 안내하지 않았다". 지금까지 승차 스텝은
     "○번 출구 승강기 이용"만 말했다. 출구 승강기 → 개찰구 → 승차 승강장 승강기 순서와 탑승 칸을 문장으로 만든다.
-    반환: {"station", "inside": [문장...], "car": car_hint 결과|None}
+    반환: {"station", "inside": [화면용 문장...], "car": car_hint 결과|None, "speech": 음성용 짧은 문장}
     """
     name = _key(board_name)
     inside = []
@@ -563,7 +562,15 @@ def ingress_guide(board_name: str, board_exit: dict, pa_board: dict, pa_alight: 
     car = car_hint(pa_alight, alight_name)
     if car:
         inside.append(car["text"])
-    return {"station": name, "inside": inside, "car": car}
+    # 음성 문장 (v1.40.0) — 역에 들어가기 직전(출구 승강기 앞)에 한 번 말한다. 위치 설명(설비 문구)은 화면(inside)에만 두고
+    # 할 일만 짧게: "관악역 2번 출구 승강기입니다. 역에 들어가 개찰구를 지나 안양 방향 승강장으로 가세요."
+    head = []
+    if bx.get("exit_no"):
+        head.append("%s역 %s번 출구%s입니다" % (name, bx["exit_no"],
+                                            " 승강기" if bx.get("elevator") else (" 휠체어리프트" if bx.get("lift") else "")))
+    if pa:
+        head.append("역에 들어가 개찰구를 지나 %s 승강장으로 가세요" % _which_platform(pa))
+    return {"station": name, "inside": inside, "car": car, "speech": ". ".join(head)}
 
 
 def arrival_choices(station_name: str) -> list:
