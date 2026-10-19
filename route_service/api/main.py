@@ -41,6 +41,7 @@ from ..transit import gbis_live
 from ..transit import planner as transit
 from ..transit import low_floor as lowfloor
 from ..transit import exits as station_exits
+from ..transit import rail
 from .schemas import (
     AccessReportRequest,
     Destination,
@@ -615,6 +616,17 @@ def _bus_leg(part):
     }
 
 
+def _platform_anchor(st: dict):
+    """역 기준점 — 승강장 윤곽이 있으면 모든 꼭짓점의 평균(승강장 중심), 없으면 역 대표점 (v1.39.0)."""
+    pts = [p for ring in station_exits.platforms_for(st.get("name") or "") for p in ring]
+    if pts:
+        c = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+        # 같은 이름의 다른 역(또는 좌표가 다른 자료)과 섞이지 않게 — 역 대표점에서 300m 안일 때만 쓴다
+        if transit.haversine_m(c[0], c[1], st["lat"], st["lng"]) <= 300:
+            return c
+    return (st["lat"], st["lng"])
+
+
 def _subway_leg(part):
     warnings = []
     for s in (part["board"], part["alight"]):
@@ -628,13 +640,23 @@ def _subway_leg(part):
                 "elevator_cnt": s.get("elevator_cnt", 0)}
     dist = transit.haversine_m(part["board"]["lat"], part["board"]["lng"],
                                part["alight"]["lat"], part["alight"]["lng"])
+    # 지도선 (v1.39.0) — 노선 선형(OSM 철도 본선)을 따라 승강장 중심 ↔ 승강장 중심 구간을 자른다.
+    # 선형이 없거나 역이 선로에서 멀면 종전처럼 역 대표점 직선(geometry_source "straight").
+    geometry = rail.segment(part.get("line"), _platform_anchor(part["board"]), _platform_anchor(part["alight"]))
+    if geometry:
+        geometry_source = "rail_osm"
+        dist = rail.length_m(geometry)
+    else:
+        geometry_source = "straight"
+        geometry = [[round(part["board"]["lat"], 7), round(part["board"]["lng"], 7)],
+                    [round(part["alight"]["lat"], 7), round(part["alight"]["lng"], 7)]]
     return {
         "kind": "subway",
         "line": part["line"],
         "board": _st(part["board"]), "alight": _st(part["alight"]),
         "station_cnt": part["station_cnt"],
-        "geometry": [[round(part["board"]["lat"], 7), round(part["board"]["lng"], 7)],
-                     [round(part["alight"]["lat"], 7), round(part["alight"]["lng"], 7)]],
+        "geometry": geometry,
+        "geometry_source": geometry_source,
         "est_distance_m": round(dist),
         "est_duration_sec": part["station_cnt"] * transit.SUBWAY_SEC_PER_STATION
                             + transit.SUBWAY_ACCESS_SEC,
@@ -690,6 +712,15 @@ def _transit_step(leg, boarding: bool) -> dict:
                 flagged.append(pa)
                 notes.append(station_exits.lift_only_short(pa) if (boarding and side == "alight")
                              else pa["warning"])
+    # 승차 전 역 안 이동 (v1.39.0) — 출구 승강기 → 개찰구 → 승차 승강장 승강기, 그리고 탑승 칸.
+    # 앱은 스텝 문장을 그대로 읽으므로 문장에 붙이고, 화면용으로 구조화한 값도 싣는다.
+    ingress = None
+    if boarding and leg["kind"] == "subway":
+        pam = leg.get("platform_access") or {}
+        ingress = station_exits.ingress_guide(leg["board"]["name"], leg.get("board_exit"),
+                                              pam.get("board"), pam.get("alight"), leg["alight"]["name"])
+        if ingress["inside"]:
+            instruction = instruction.rstrip(" .") + ". " + ". ".join(x.rstrip(" .") for x in ingress["inside"])
     if flagged:
         instruction = instruction.rstrip(" .") + ". 주의: " + " ".join(notes)
     leg_ref = {"kind": leg["kind"]}
@@ -714,6 +745,8 @@ def _transit_step(leg, boarding: bool) -> dict:
         out["platform_access"] = flagged    # 화면이 별도 주의 줄로 그린다(기계 판독용)
     if not boarding and leg.get("egress"):
         out["egress"] = leg["egress"]       # 화면이 역 안/밖을 묻고 해당 문장을 쓴다(#77)
+    if ingress:
+        out["ingress"] = ingress            # 승차 전 역 안 이동·탑승 칸 (v1.39.0)
     return out
 
 

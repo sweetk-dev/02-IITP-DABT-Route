@@ -285,7 +285,7 @@ def test_unmarked_manual_crossing_is_guided_as_unmarked_and_not_listed():
 
 
 def test_repo_links_myeonghak_exit_to_art_center_entrance():
-    """레포 목록의 MH-* 는 명학역 1번 출구 → 안양아트센터 정문을 안양로 교차로 횡단보도로 잇는다.
+    """레포 목록의 MH-* 는 명학역 1번 출구 승강기 → 안양아트센터 정문을 안양로 교차로 횡단보도로 잇는다.
 
     운영 그래프와 같은 ID·좌표의 노드 세 개(만안로·안양로112번길 교차점 457325894, 안양로111번길 북측 보도 끝
     TN0008712, 안양로111번길·문예로36번길 교차점 3832486056)만 둔 축소 그래프에 적용한다. 관리번호 1581(안양로112번길) → 1569(안양로, 21m) → 1570(안양로111번길)
@@ -300,14 +300,32 @@ def test_repo_links_myeonghak_exit_to_art_center_entrance():
     G.add_node(3832486056, lat=37.3845648, lon=126.9323928, node_type="crossing")      # 안양로111번길·문예로36번길
     report = ml.apply_manual_links(G, ml.load_links(path))
     mh = {r["id"]: r for r in report if str(r["id"]).startswith("MH-")}
-    assert len(mh) == 14 and all(r["status"] == "added" for r in mh.values())
+    assert len(mh) == 16 and all(r["status"] == "added" for r in mh.values())
     exit1, ent = mh["MH-01"]["u"], mh["MH-13"]["v"]
     nodes = nx.shortest_path(G, exit1, ent, weight="length")
     assert 457325894 not in nodes and 3832486056 not in nodes
     crossings = [G.edges[u, v] for u, v in zip(nodes, nodes[1:]) if G.edges[u, v]["link_type"] == "crossing"]
-    assert [c.get("cw_mgmt_no") for c in crossings] == ["2024121581", "2024121569", "2024121570", None]
+    # v1.39.0 — 출발점이 계단 출입구가 아니라 출구 승강기(만안로 서측)라 112번길 입구 횡단보도(1030)를 먼저 건넌다
+    assert [c.get("cw_mgmt_no") for c in crossings] == ["2024121030", "2024121581", "2024121569", "2024121570", None]
+    assert abs(G.nodes[exit1]["lat"] - 37.38507) < 1e-6 and abs(G.nodes[exit1]["lon"] - 126.93493) < 1e-6
     assert crossings[-1].get("unmarked") is True
     dist = nx.shortest_path_length(G, exit1, ent, weight="length")
     assert 330 <= dist <= 400
     # 정문 끝점은 실측 출입구 좌표(entrances.json 의 값)와 같은 자리다 — 실측 출입구는 노드에 스냅된다
     assert abs(G.nodes[ent]["lat"] - 37.384688) < 1e-6 and abs(G.nodes[ent]["lon"] - 126.931893) < 1e-6
+
+
+def test_repo_links_gwanak_exit2_elevator_joins_plaza():
+    """관악역 2번 출구 승강기(계단 출입구에서 남동쪽 약 20m)는 2번 출구 앞 광장·1253번길 갈림과 이어진다 (v1.39.0)."""
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "data", "manual_links", "anyang.json")
+    G = nx.Graph()
+    G.add_node(3903318504, lat=37.4185572, lon=126.9090177, node_type="unknown")      # 역사 아래 만안로
+    G.add_node(4696341341, lat=37.4189940, lon=126.9094900, node_type="crossing")     # 1253번길·1273번길 갈림
+    report = ml.apply_manual_links(G, ml.load_links(path))
+    by_id = {r["id"]: r for r in report}
+    assert by_id["GW2-EV1"]["status"] == "added" and by_id["GW2-EV2"]["status"] == "added"
+    ev = by_id["GW2-EV1"]["u"]
+    assert abs(G.nodes[ev]["lat"] - 37.418838) < 1e-6
+    assert set(G.neighbors(ev)) == {4696341341, by_id["GWANAK-02"]["u"]}   # 광장(계단 출입구 앞)과 같은 노드
