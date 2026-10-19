@@ -3,6 +3,7 @@
 import math
 
 import networkx as nx
+import pytest
 
 from route_service.topomap import manual_links as ml
 
@@ -194,4 +195,50 @@ def test_valid_geometry_still_applies():
                                      "geometry": [[p["lat"], p["lon"]]]}])
     ml.validate_links([{"id": "G-03", "from": {"node": 1}, "to": {"node": 3},
                         "geometry": [[p["lat"], p["lon"]]]}])
-    assert rep[0]["status"] == "added" and G.edges[1, 3]["geometry"] == [(p["lat"], p["lon"])]
+    # 저장 geometry 는 양 끝 노드 좌표를 포함한다(v1.37.0) — 끝점과 같은 중간점은 한 번만
+    q = G.nodes[3]
+    assert rep[0]["status"] == "added" and G.edges[1, 3]["geometry"] == [(p["lat"], p["lon"]), (q["lat"], q["lon"])]
+
+
+# ── v1.37.0 (#118) 횡단보도 관리번호·경로선 끝점 ─────────────────────────────
+
+def test_crossing_cw_mgmt_no_stored():
+    G = _graph()
+    rep = ml.apply_manual_links(G, [{"id": "X-01", "from": {"node": 1}, "to": {"node": 3},
+                                     "link_type": "crossing", "cw_mgmt_no": " 2024121334 "}])
+    assert rep[0]["status"] == "added"
+    assert G.edges[1, 3]["cw_mgmt_no"] == "2024121334"
+
+
+def test_cw_mgmt_no_absent_keeps_old_shape():
+    G = _graph()
+    ml.apply_manual_links(G, [{"id": "X-02", "from": {"node": 1}, "to": {"node": 3}, "link_type": "crossing"}])
+    assert "cw_mgmt_no" not in G.edges[1, 3]
+
+
+def test_cw_mgmt_no_only_on_crossing():
+    with pytest.raises(ml.ManualLinkError):
+        ml.validate_links([{"id": "X-03", "from": {"node": 1}, "to": {"node": 3},
+                            "link_type": "sidewalk", "cw_mgmt_no": "2024121334"}])
+    with pytest.raises(ml.ManualLinkError):
+        ml.validate_links([{"id": "X-04", "from": {"node": 1}, "to": {"node": 3},
+                            "link_type": "crossing", "cw_mgmt_no": ""}])
+    with pytest.raises(ml.ManualLinkError):
+        ml.validate_links([{"id": "X-05", "from": {"node": 1}, "to": {"node": 3},
+                            "link_type": "crossing", "cw_mgmt_no": 2024121334}])
+
+
+def test_geometry_stored_with_endpoints_so_route_line_is_continuous():
+    """중간점만 저장하면 edge_coords 가 끝 노드를 빼고 그려 경로선이 끊긴다."""
+    from route_service.engine.graph import edge_coords
+    G = _graph()
+    mid = _ll(25, 20)
+    ml.apply_manual_links(G, [{"id": "X-06", "from": {"node": 1}, "to": {"node": 3},
+                               "geometry": [[mid["lat"], mid["lon"]]]}])
+    c = edge_coords(G, 1, 3)
+    assert c[0] == (G.nodes[1]["lat"], G.nodes[1]["lon"])
+    assert c[-1] == (G.nodes[3]["lat"], G.nodes[3]["lon"])
+    assert len(c) == 3
+    # 반대 방향으로 읽어도 끝점이 맞는다
+    r = edge_coords(G, 3, 1)
+    assert r[0] == (G.nodes[3]["lat"], G.nodes[3]["lon"])

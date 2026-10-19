@@ -835,3 +835,13 @@ def test_prefetch_swallows_unexpected_errors(monkeypatch):
     items = [({"board": {"poi_id": "S%d" % i, "lat": 37.0, "lng": 127.0},
                "route": {"route_id": "R%d" % i, "name": str(i)}}, float(i)) for i in range(1, 4)]
     judge.prefetch(items)       # 예외가 올라오지 않아야 한다
+
+
+def test_multimodal_route_collects_walk_leg_crosswalks(client):
+    """대중교통 경로의 횡단보도 목록은 도보 구간 목록을 진행 순서대로 이은 것이다 (#118)."""
+    r = _plan(client)
+    assert r.status_code == 200, r.text
+    route = r.json()["routes"][0]
+    walk = [l for l in route["legs"] if l["kind"] == "walk"]
+    assert walk and all(isinstance(l["crosswalks"], list) for l in walk)
+    assert route["crosswalks"] == [c for l in walk for c in l["crosswalks"]]

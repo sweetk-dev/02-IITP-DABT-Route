@@ -32,6 +32,7 @@ from ..engine.overrides import apply_overrides
 from ..poi import store as poi_store
 from ..poi import support as poi_support
 from ..poi import landmarks as poi_landmarks
+from ..engine import crosswalks as cw_marks
 from ..poi import buildings as poi_buildings
 from ..poi import directory as poi_directory
 from ..poi import food as poi_food
@@ -387,11 +388,14 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
     route_id = "r_%s" % uuid.uuid4().hex[:10]
     routes = []
     for r in result["routes"]:
+        st = build_steps(G, r["path"], profile)
         routes.append(
             {
                 "summary": r["summary"],
                 "geometry": r["geometry"],
-                "steps": build_steps(G, r["path"], profile),
+                "steps": st,
+                # 지도 표시용 횡단보도 위치 (#118) — 건너는 것·옆길·경로 옆
+                "crosswalks": cw_marks.for_path(G, r["path"], st),
             }
         )
     if routes:   # 길안내 중 주변 랜드마크 (#88) — 1안에만 붙인다
@@ -528,12 +532,14 @@ def _walk_leg(frm, to, profile, allowed, label_from, label_to, to_is_entrance: b
         return None      # 같은 지점으로 스냅되는 지척 이동 — leg 생략
     result = plan(NET, o_sel[0], d_sel[0], profile, 1, relax=True, graph=H)
     r = result["routes"][0]
+    st = build_steps(H, r["path"], profile)
     leg = {
         "kind": "walk",
         "from_label": label_from, "to_label": label_to,
         "summary": r["summary"],
         "geometry": r["geometry"],
-        "steps": build_steps(H, r["path"], profile),
+        "steps": st,
+        "crosswalks": cw_marks.for_path(H, r["path"], st),   # #118
         "fallback": result["fallback"],
     }
     # 보행망 단절 가능성 — 짧은 직선을 크게 우회하면 위상 문제일 확률이 높다(#30 안양역)
@@ -1250,6 +1256,8 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         "resolved_by": target["source"],
                         "note": _entrance_note(target)},
         "routes": [{"summary": summary, "geometry": geometry, "steps": steps, "legs": legs,
+                    # 도보 구간의 횡단보도를 진행 순서대로 모은다 (#118)
+                    "crosswalks": [c for l in walk_legs for c in (l.get("crosswalks") or [])],
                     # 주변 랜드마크 (#88) — 도보 구간 옆만(버스·지하철 탑승 중에는 말하지 않는다)
                     "landmarks": poi_landmarks.for_route(
                         poi_store.STORE, geometry, [l["geometry"] for l in walk_legs if l.get("geometry")])}],
