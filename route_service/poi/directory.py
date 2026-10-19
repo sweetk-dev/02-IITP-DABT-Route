@@ -8,8 +8,10 @@
     ``emp_dis_dev_support_org``(발달장애인 지원기관의 제공 서비스 10종 표시)를 이름으로 합친다.
   · 장애인 표준사업장 — ``emp_dis_std_workplace``(한국장애인고용공단 인증, 업종·주소·전화).
 
-두 명부 모두 정기 갱신이 아니다(적재 시점이 응답의 ``base_date``). 기관 사정은 바뀔 수 있으므로
-비서는 "전화로 확인" 을 함께 안내한다.
+두 명부 모두 원천(공공데이터포털 파일데이터)이 연 1회 안팎으로 새 판을 낸다. 08 수집기가 판을
+쌓아 두므로(``src_base_dt`` = 원천 판 기준일, 2026-10 추가) 여기서는 **가장 최근 판만** 읽는다.
+응답의 ``base_date`` 는 그 판의 기준일이다(판 기준일이 비어 있는 옛 행만 있으면 적재 시점).
+기관 사정은 바뀔 수 있으므로 비서는 "전화로 확인" 을 함께 안내한다.
 """
 from __future__ import annotations
 
@@ -67,6 +69,20 @@ def _date(v):
     return str(v)[:10] if v else None
 
 
+# 판별 보관 표에서 가장 최근 판만 고르는 조건(2026-10).
+#  - 08 ODCLOUD_EMP 수집기가 이전 판을 지우지 않고 src_base_dt(원천 판 기준일)로 구분해 쌓는다.
+#  - 조건이 없으면 같은 기관이 판 수만큼 겹쳐 나온다.
+#  - IS NOT DISTINCT FROM: 판 기준일이 아직 모두 비어 있는(NULL) DB 에서도 지금처럼 전체 행을 돌려준다.
+def _latest_edition_sql(table: str) -> str:
+    return (" AND src_base_dt IS NOT DISTINCT FROM"
+            " (SELECT max(src_base_dt) FROM %s)" % table)
+
+
+def _base_of(r):
+    """행의 기준 날짜 — 원천 판 기준일이 있으면 그것, 없으면 적재 시점."""
+    return r.get("src_base_dt") or r.get("created_at")
+
+
 def providers(store, service: str = "", district: str = "", q: str = "",
               sigungu: str = "안양", limit: int = 10) -> dict:
     """서비스 제공기관. 같은 기관의 여러 서비스 행은 하나로 묶는다."""
@@ -84,8 +100,9 @@ def providers(store, service: str = "", district: str = "", q: str = "",
             "  FROM selfdiag_provider", {}) if anyang else []
         variants = sigungu_variants(sigungu) or [""]
         dev = store._query(
-            "SELECT org_name, region, " + ", ".join(DEV_ORG_SERVICES) + ", created_at"
-            "  FROM emp_dis_dev_support_org WHERE region LIKE ANY(:pats)",
+            "SELECT org_name, region, " + ", ".join(DEV_ORG_SERVICES) + ", created_at, src_base_dt"
+            "  FROM emp_dis_dev_support_org WHERE region LIKE ANY(:pats)"
+            + _latest_edition_sql("emp_dis_dev_support_org"),
             {"pats": ["%%%s%%" % v for v in variants]})
     groups = {}
     base = []
@@ -122,7 +139,7 @@ def providers(store, service: str = "", district: str = "", q: str = "",
                 g["services"].append(s)
         if DEVORG_SOURCE not in g["sources"]:
             g["sources"].append(DEVORG_SOURCE)
-        base.append(r.get("created_at"))
+        base.append(_base_of(r))
     words = _service_words(service)
     qk = _key(q)
     out = []
@@ -135,7 +152,7 @@ def providers(store, service: str = "", district: str = "", q: str = "",
             continue
         out.append(g)
     out.sort(key=lambda g: (g["tel"] is None, g["name"]))
-    base = [b for b in base if b]
+    base = [_date(b) for b in base if b]  # date·datetime 섞여도 비교되도록 문자열(YYYY-MM-DD)로 맞춤
     return {"items": out[:limit], "count": min(len(out), limit), "total": len(out),
             "base_date": _date(max(base)) if base else None}
 
@@ -149,8 +166,9 @@ def workplaces(store, sigungu: str = "안양", q: str = "", district: str = "", 
     else:
         variants = sigungu_variants(sigungu) or [""]
         rows = store._query(
-            "SELECT company_name, address, tel, business_item, type, cert_date, created_at"
-            "  FROM emp_dis_std_workplace WHERE address LIKE ANY(:pats)",
+            "SELECT company_name, address, tel, business_item, type, cert_date, created_at, src_base_dt"
+            "  FROM emp_dis_std_workplace WHERE address LIKE ANY(:pats)"
+            + _latest_edition_sql("emp_dis_std_workplace"),
             {"pats": ["%%%s%%" % v for v in variants]})
     variants = sigungu_variants(sigungu)
     qq = (q or "").strip()
@@ -168,8 +186,8 @@ def workplaces(store, sigungu: str = "안양", q: str = "", district: str = "", 
         out.append({"name": name, "addr": addr, "tel": _clean(r.get("tel")) or None,
                     "business": item or None, "type": _clean(r.get("type")) or None,
                     "cert_date": _date(r.get("cert_date")), "source_label": WORKPLACE_SOURCE})
-        base.append(r.get("created_at"))
+        base.append(_base_of(r))
     out.sort(key=lambda x: x["name"])
-    base = [b for b in base if b]
+    base = [_date(b) for b in base if b]  # date·datetime 섞여도 비교되도록 문자열(YYYY-MM-DD)로 맞춤
     return {"items": out[:limit], "count": min(len(out), limit), "total": len(out),
             "base_date": _date(max(base)) if base else None}
