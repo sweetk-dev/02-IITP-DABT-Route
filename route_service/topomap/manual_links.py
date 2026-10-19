@@ -11,6 +11,7 @@
       "to": {...}, "link_type": "sidewalk", "link_name": "...", "slope": 0.0,
       "width": null, "geometry": [[lat, lon], ...] (선택), "length": (선택, 없으면 계산),
       "cw_mgmt_no": "2024121334" (선택, crossing 링크 — 안양시 횡단보도 관리번호),
+      "unmarked": true (선택, crossing 링크 — 횡단보도 표시가 없는 횡단. cw_mgmt_no 와 함께 둘 수 없다),
       "source": "...", "confidence": 0.8, "note": "..."} ] }
 
 끝점 규칙
@@ -26,6 +27,9 @@ geometry 좌표 범위와 끝점 대비 거리).
   cw_mgmt_no  : crossing 링크에만 — 자동 파이프라인의 횡단 링크와 같은 키라서 스텝의 crosswalk_id 와
                 응답의 횡단보도 목록에 그대로 실린다(v1.37.0) — 정제 링크(derived)와 달리
   프로필별 활성 하한(derived_min_confidence)을 받지 않는다. 사람이 확인한 링크이기 때문이다.
+  unmarked    : crossing 링크에만 — 정제로 이은 이면도로 횡단(#67)과 같은 키다. 스텝은 "이면도로를 건너 … 횡단보도
+                표시가 없으니 차량을 살피세요" 로 안내하고, 응답의 횡단보도 목록(지도 줄무늬 표시)에는 싣지 않는다(v1.38.0).
+                표시 없는 곳을 횡단보도처럼 안내·표시하면 이용자가 신호·차량을 살피지 않을 수 있다.
 같은 두 노드 사이에 이미 링크가 있으면 건너뛴다(exists).
 """
 from __future__ import annotations
@@ -93,6 +97,15 @@ def validate_links(links: list) -> None:
                 raise ManualLinkError("%s: cw_mgmt_no 는 빈 값이 아닌 문자열" % lid)
             if it.get("link_type", "sidewalk") != "crossing":
                 raise ManualLinkError("%s: cw_mgmt_no 는 crossing 링크에만 둔다" % lid)
+        um = it.get("unmarked")
+        if um is not None:
+            # 문자열 "false" 같은 값이 참으로 읽히지 않게 bool 만 받는다
+            if not isinstance(um, bool):
+                raise ManualLinkError("%s: unmarked 는 true/false" % lid)
+            if um and it.get("link_type", "sidewalk") != "crossing":
+                raise ManualLinkError("%s: unmarked 는 crossing 링크에만 둔다" % lid)
+            if um and cw is not None:
+                raise ManualLinkError("%s: 횡단보도 관리번호(cw_mgmt_no)가 있는 횡단은 unmarked 일 수 없다" % lid)
         geom = it.get("geometry")
         if geom is not None and (not isinstance(geom, list) or any(len(pt) != 2 for pt in geom)):
             raise ManualLinkError("%s: geometry 는 [[lat, lon], ...]" % lid)
@@ -250,6 +263,8 @@ def apply_manual_links(G, links: list) -> list:
                    source=it.get("source"), note=it.get("note"))
         if it.get("cw_mgmt_no"):
             G[u][v]["cw_mgmt_no"] = str(it["cw_mgmt_no"]).strip()
+        if it.get("unmarked") is True:          # 표시 없는 횡단 — 안내 문구·횡단보도 목록이 이 키를 본다(v1.38.0)
+            G[u][v]["unmarked"] = True
         report.append({"id": lid, "status": "added", "u": u, "v": v, "length": length,
                        "created": [n for n, c in ((u, cu), (v, cv)) if c],
                        "snapped_m": [s for s in (su, sv) if s is not None]})

@@ -242,3 +242,72 @@ def test_geometry_stored_with_endpoints_so_route_line_is_continuous():
     # 반대 방향으로 읽어도 끝점이 맞는다
     r = edge_coords(G, 3, 1)
     assert r[0] == (G.nodes[3]["lat"], G.nodes[3]["lon"])
+
+
+# ── v1.38.0 명학역 1번 출구 ~ 안양아트센터 정문(MH-*) · 표시 없는 횡단(unmarked) ─────────────
+
+def test_unmarked_crossing_stored():
+    G = _graph()
+    rep = ml.apply_manual_links(G, [{"id": "U-01", "from": {"node": 1}, "to": {"node": 3},
+                                     "link_type": "crossing", "unmarked": True}])
+    assert rep[0]["status"] == "added" and G.edges[1, 3]["unmarked"] is True
+    # 키가 없거나 false 면 속성을 두지 않는다(종전 횡단 링크와 같은 모양)
+    G2 = _graph()
+    ml.apply_manual_links(G2, [{"id": "U-02", "from": {"node": 1}, "to": {"node": 3},
+                                "link_type": "crossing", "unmarked": False}])
+    assert "unmarked" not in G2.edges[1, 3]
+
+
+def test_unmarked_validation():
+    base = {"id": "U-03", "from": {"node": 1}, "to": {"node": 3}, "link_type": "crossing"}
+    ml.validate_links([dict(base, unmarked=True)])
+    with pytest.raises(ml.ManualLinkError, match="true/false"):
+        ml.validate_links([dict(base, unmarked="false")])          # 문자열은 참으로 읽힐 수 있다
+    with pytest.raises(ml.ManualLinkError, match="crossing 링크에만"):
+        ml.validate_links([dict(base, link_type="sidewalk", unmarked=True)])
+    with pytest.raises(ml.ManualLinkError, match="unmarked 일 수 없다"):
+        ml.validate_links([dict(base, unmarked=True, cw_mgmt_no="2024121569")])
+
+
+def test_unmarked_manual_crossing_is_guided_as_unmarked_and_not_listed():
+    """수동 링크의 unmarked 는 정제 링크와 같은 키라서 안내 문구·횡단보도 목록이 그대로 따른다."""
+    from route_service.engine import crosswalks as cwmod
+    from route_service.engine.profiles import PROFILES
+    from route_service.engine.steps import build_steps
+    G = _graph()
+    ml.apply_manual_links(G, [{"id": "U-04", "from": {"node": 2}, "to": {"node": 3},
+                               "link_type": "crossing", "unmarked": True}])
+    path = [1, 2, 3, 4]
+    steps = build_steps(G, path, PROFILES["wheelchair_manual"])
+    cross = [s for s in steps if s.get("link_type") == "crossing"]
+    assert cross and "횡단보도 표시가 없으니" in cross[0]["instruction"]
+    assert not [c for c in cwmod.for_path(G, path, steps) if c["role"] == "cross"]
+
+
+def test_repo_links_myeonghak_exit_to_art_center_entrance():
+    """레포 목록의 MH-* 는 명학역 1번 출구 → 안양아트센터 정문을 안양로 교차로 횡단보도로 잇는다.
+
+    운영 그래프와 같은 ID·좌표의 노드 세 개(만안로·안양로112번길 교차점 457325894, 안양로111번길 북측 보도 끝
+    TN0008712, 안양로111번길·문예로36번길 교차점 3832486056)만 둔 축소 그래프에 적용한다. 관리번호 1581(안양로112번길) → 1569(안양로, 21m) → 1570(안양로111번길)
+    → 표시 없는 문예로36번길 입구 순서로 건너고, 교차점 도로 중심선 노드를 지나지 않는다.
+    """
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "data", "manual_links", "anyang.json")
+    G = nx.Graph()
+    G.add_node(457325894, lat=37.3853152, lon=126.9348889, node_type="unknown")
+    G.add_node("TN0008712", lat=37.38438468, lon=126.93194379, node_type="sidewalk")
+    G.add_node(3832486056, lat=37.3845648, lon=126.9323928, node_type="crossing")      # 안양로111번길·문예로36번길
+    report = ml.apply_manual_links(G, ml.load_links(path))
+    mh = {r["id"]: r for r in report if str(r["id"]).startswith("MH-")}
+    assert len(mh) == 14 and all(r["status"] == "added" for r in mh.values())
+    exit1, ent = mh["MH-01"]["u"], mh["MH-13"]["v"]
+    nodes = nx.shortest_path(G, exit1, ent, weight="length")
+    assert 457325894 not in nodes and 3832486056 not in nodes
+    crossings = [G.edges[u, v] for u, v in zip(nodes, nodes[1:]) if G.edges[u, v]["link_type"] == "crossing"]
+    assert [c.get("cw_mgmt_no") for c in crossings] == ["2024121581", "2024121569", "2024121570", None]
+    assert crossings[-1].get("unmarked") is True
+    dist = nx.shortest_path_length(G, exit1, ent, weight="length")
+    assert 330 <= dist <= 400
+    # 정문 끝점은 실측 출입구 좌표(entrances.json 의 값)와 같은 자리다 — 실측 출입구는 노드에 스냅된다
+    assert abs(G.nodes[ent]["lat"] - 37.384688) < 1e-6 and abs(G.nodes[ent]["lon"] - 126.931893) < 1e-6
