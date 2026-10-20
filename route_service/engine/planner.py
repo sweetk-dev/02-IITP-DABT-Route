@@ -101,6 +101,17 @@ def edge_passable(data: dict, profile: Profile, max_slope_deg: float) -> bool:
     return True
 
 
+def is_alley(data: dict) -> bool:
+    """이면도로 판정 (v1.42.0) — 보도 없는 차도 링크 중 '○○번길' 또는 이름 없는 것.
+
+    '경수대로'·'예술공원로' 같은 큰길 이름의 차도 링크는 이면도로가 아니다(보도 미구축 구간일 뿐).
+    """
+    if data.get("link_type") != "road":
+        return False
+    name = (data.get("link_name") or "").strip()
+    return name == "" or name.endswith("번길")
+
+
 def edge_cost(data: dict, profile: Profile, penalty: float = 1.0) -> float:
     length = max(float(data["length"]), 0.1)
     slope = float(data["slope"])
@@ -110,6 +121,8 @@ def edge_cost(data: dict, profile: Profile, penalty: float = 1.0) -> float:
         # 권장 초과 구간은 우회로가 있으면 피하되, 우회가 몇 배로 길어지면 그냥 지난다 (v1.20.0)
         cost *= 1.0 + float(getattr(profile, "slope_over_penalty", 1.0)) * over
     cost *= profile.penalize.get(data["link_type"], 1.0)
+    if is_alley(data):
+        cost *= profile.penalize.get("alley", 1.0)     # 큰길 우선 (v1.42.0)
     conf = data.get("confidence")
     if conf is not None and data.get("topo_source") == "derived":
         cost *= 1.0 + DERIVED_COST_LAMBDA * (1.0 - float(conf))
