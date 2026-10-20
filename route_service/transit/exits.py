@@ -535,6 +535,39 @@ def car_hint(pa_alight: dict, alight_name: str):
             "text": "%d번째 칸(%s)에 타면 %s역 승강기가 가깝습니다" % (car, where, _key(alight_name))}
 
 
+def _ingress_override(name: str, exit_no, pa: dict):
+    """station_exits.json 의 출구별 승차 안내(ingress) 중 이 승강장 방향(toward) 것. 없으면 None."""
+    if not exit_no or not pa or not pa.get("toward"):
+        return None
+    for ex in _load().get(name) or []:
+        if str(ex.get("exit_no")) == str(exit_no):
+            return (ex.get("ingress") or {}).get(pa["toward"])
+    return None
+
+
+def _ingress_from_override(name: str, ov: dict, car, alight_name: str) -> dict:
+    """현장 동선(ingress)으로 승차 안내를 만든다 (v1.41.0).
+
+    승강기에서 내리는 출입문(landing)과 탈 칸(car_hint)이 다르면 "승강장 끝 10-4까지 이동해 타면
+    명학역에서 내리자마자 승강기입니다" 처럼 이동할 곳을 말한다. 현장 확인(2026-10-20): 관악역 안양 방향
+    승강기에서 내리면 1-1 앞이고, 명학역 하차 승강기는 10-4 앞 — 관악역에서 10-4까지 이동해 탄다.
+    """
+    inside = list(ov.get("inside") or [])
+    land = str(ov.get("landing") or "")
+    if car:
+        target = "%d-%d" % (car["car"], car["door"])
+        if land and land != target:
+            end = "승강장 끝 " if car["car"] in (1, 10) else ""
+            car = dict(car, text="%s%s까지 이동해 타면 %s역에서 내리자마자 승강기입니다" % (end, target, _key(alight_name)))
+        inside.append(car["text"])
+    out = {"station": name, "inside": inside, "car": car, "speech": ov.get("speech") or ""}
+    if land:
+        out["landing"] = land
+    if ov.get("gate"):
+        out["gate"] = ov["gate"]
+    return out
+
+
 def ingress_guide(board_name: str, board_exit: dict, pa_board: dict, pa_alight: dict,
                   alight_name: str) -> dict:
     """승차 전 역 안 이동 안내 (v1.39.0, 음성 문장 v1.40.0) — 하차 쪽 egress_guide 와 짝.
@@ -560,6 +593,11 @@ def ingress_guide(board_name: str, board_exit: dict, pa_board: dict, pa_alight: 
     elif pa:
         inside.append("개찰구를 지나 %s 승강장으로 갑니다" % _which_platform(pa))
     car = car_hint(pa_alight, alight_name)
+    # 출구별 현장 동선 (v1.41.0) — 설비 자료만으로는 '일반 개찰구'로 안내하게 되는 역(관악역 안양 방향: 맞이방 옆
+    # 승강기 전용 개찰구 → 승강기 → 1-1 앞)은 station_exits.json 의 ingress 를 그대로 쓴다.
+    ov = _ingress_override(name, bx.get("exit_no"), pa)
+    if ov:
+        return _ingress_from_override(name, ov, car, alight_name)
     if car:
         inside.append(car["text"])
     # 음성 문장 (v1.40.0) — 역에 들어가기 직전(출구 승강기 앞)에 한 번 말한다. 위치 설명(설비 문구)은 화면(inside)에만 두고
