@@ -10,7 +10,8 @@
   v1.20.0 — 종전에는 max_slope_deg 가 하드 필터였다. 등고선 기반 5m DEM 은 짧은 링크에서 경사가 튀어
   실제로는 평탄한 직행로(안양문화원→안양세무서 정류장 205m)가 잘리고 649m 우회가 나왔다(실증 2026-09-03).
 - avoid         : 통행 불가 link_type (계단·육교 등)
-- penalize      : 통행은 가능하나 비용을 가중하는 link_type -> 가중치 배수
+- penalize      : 통행은 가능하나 비용을 가중하는 link_type -> 가중치 배수.
+                  특수 키 "alley" = 이면도로('○○번길'·이름 없는 차도) 추가 배수("road" 배수 위에 곱함, v1.42.0)
 - min_width_m   : 유효 보도폭 하한(데이터에 width 가 있을 때만 적용)
 - speed_mps     : 소요시간 추정용 평균 이동속도
 - slope_factor  : 비용 = length * (1 + slope_factor * slope_deg)
@@ -65,7 +66,10 @@ PROFILES = {
         avoid=("steps", "overpass", "underpass"),
         # road 가중: 보도(sidewalk)가 있는 우회로가 있으면 이면도로·차도 통행을
         # 뒤로 미룬다. 하드 차단이 아니라 가중이므로 보도 미비 구간은 여전히 통행 가능.
-        penalize={"crossing": 1.2, "ramp": 1.1, "road": 1.25, "unknown": 1.1},
+        penalize={"crossing": 1.2, "ramp": 1.1, "road": 1.25, "unknown": 1.1,
+                  # 큰길 우선 (v1.42.0) — 현장 점검(2026-10-20) 경수대로1196번길: 1.5m 안팎 담장 골목·비포장.
+                  # 이면도로 묶음이 큰길 보도보다 짧으면 골목으로 질러가던 것을 큰길로 돌린다.
+                  "alley": 1.5},
         min_width_m=0.9,
         requires_curb_cut=True,
         hard_slope_deg=8.0,
@@ -79,8 +83,9 @@ PROFILES = {
         speed_mps=1.1,
         slope_factor=0.15,
         avoid=("steps", "overpass", "underpass"),
-        penalize={"crossing": 1.1, "road": 1.2, "unknown": 1.1},
-        min_width_m=0.9,
+        penalize={"crossing": 1.1, "road": 1.2, "unknown": 1.1, "alley": 1.5},
+        # 전동휠체어 최소 통행 폭 1.2m (v1.42.0, 현장 판단 — 0.9m 는 수동휠체어 기준)
+        min_width_m=1.2,
         requires_curb_cut=True,
         hard_slope_deg=10.0,
         slope_over_penalty=0.6,
