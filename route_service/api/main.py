@@ -32,6 +32,7 @@ from ..engine.overrides import apply_overrides
 from ..poi import store as poi_store
 from ..poi import support as poi_support
 from ..poi import landmarks as poi_landmarks
+from ..engine import crosswalks as cw_marks
 from ..poi import buildings as poi_buildings
 from ..poi import directory as poi_directory
 from ..poi import food as poi_food
@@ -40,6 +41,7 @@ from ..transit import gbis_live
 from ..transit import planner as transit
 from ..transit import low_floor as lowfloor
 from ..transit import exits as station_exits
+from ..transit import rail
 from .schemas import (
     AccessReportRequest,
     Destination,
@@ -387,11 +389,14 @@ def _plan_core(origin_lat, origin_lng, dest: Destination, profile_id: str,
     route_id = "r_%s" % uuid.uuid4().hex[:10]
     routes = []
     for r in result["routes"]:
+        st = build_steps(G, r["path"], profile)
         routes.append(
             {
                 "summary": r["summary"],
                 "geometry": r["geometry"],
-                "steps": build_steps(G, r["path"], profile),
+                "steps": st,
+                # 지도 표시용 횡단보도 위치 (#118) — 건너는 것·옆길·경로 옆
+                "crosswalks": cw_marks.for_path(G, r["path"], st),
             }
         )
     if routes:   # 길안내 중 주변 랜드마크 (#88) — 1안에만 붙인다
@@ -528,12 +533,14 @@ def _walk_leg(frm, to, profile, allowed, label_from, label_to, to_is_entrance: b
         return None      # 같은 지점으로 스냅되는 지척 이동 — leg 생략
     result = plan(NET, o_sel[0], d_sel[0], profile, 1, relax=True, graph=H)
     r = result["routes"][0]
+    st = build_steps(H, r["path"], profile)
     leg = {
         "kind": "walk",
         "from_label": label_from, "to_label": label_to,
         "summary": r["summary"],
         "geometry": r["geometry"],
-        "steps": build_steps(H, r["path"], profile),
+        "steps": st,
+        "crosswalks": cw_marks.for_path(H, r["path"], st),   # #118
         "fallback": result["fallback"],
     }
     # 보행망 단절 가능성 — 짧은 직선을 크게 우회하면 위상 문제일 확률이 높다(#30 안양역)
@@ -609,6 +616,17 @@ def _bus_leg(part):
     }
 
 
+def _platform_anchor(st: dict):
+    """역 기준점 — 승강장 윤곽이 있으면 모든 꼭짓점의 평균(승강장 중심), 없으면 역 대표점 (v1.39.0)."""
+    pts = [p for ring in station_exits.platforms_for(st.get("name") or "") for p in ring]
+    if pts:
+        c = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+        # 같은 이름의 다른 역(또는 좌표가 다른 자료)과 섞이지 않게 — 역 대표점에서 300m 안일 때만 쓴다
+        if transit.haversine_m(c[0], c[1], st["lat"], st["lng"]) <= 300:
+            return c
+    return (st["lat"], st["lng"])
+
+
 def _subway_leg(part):
     warnings = []
     for s in (part["board"], part["alight"]):
@@ -622,13 +640,23 @@ def _subway_leg(part):
                 "elevator_cnt": s.get("elevator_cnt", 0)}
     dist = transit.haversine_m(part["board"]["lat"], part["board"]["lng"],
                                part["alight"]["lat"], part["alight"]["lng"])
+    # 지도선 (v1.39.0) — 노선 선형(OSM 철도 본선)을 따라 승강장 중심 ↔ 승강장 중심 구간을 자른다.
+    # 선형이 없거나 역이 선로에서 멀면 종전처럼 역 대표점 직선(geometry_source "straight").
+    geometry = rail.segment(part.get("line"), _platform_anchor(part["board"]), _platform_anchor(part["alight"]))
+    if geometry:
+        geometry_source = "rail_osm"
+        dist = rail.length_m(geometry)
+    else:
+        geometry_source = "straight"
+        geometry = [[round(part["board"]["lat"], 7), round(part["board"]["lng"], 7)],
+                    [round(part["alight"]["lat"], 7), round(part["alight"]["lng"], 7)]]
     return {
         "kind": "subway",
         "line": part["line"],
         "board": _st(part["board"]), "alight": _st(part["alight"]),
         "station_cnt": part["station_cnt"],
-        "geometry": [[round(part["board"]["lat"], 7), round(part["board"]["lng"], 7)],
-                     [round(part["alight"]["lat"], 7), round(part["alight"]["lng"], 7)]],
+        "geometry": geometry,
+        "geometry_source": geometry_source,
         "est_distance_m": round(dist),
         "est_duration_sec": part["station_cnt"] * transit.SUBWAY_SEC_PER_STATION
                             + transit.SUBWAY_ACCESS_SEC,
@@ -660,7 +688,9 @@ def _transit_step(leg, boarding: bool) -> dict:
             if bx:
                 instruction += " (%s번 출구%s 이용)" % (bx["exit_no"],
                                                    " 승강기" if bx.get("has_elevator") else "")
-            coord = [leg["board"]["lat"], leg["board"]["lng"]]
+            # 안내 시점 (v1.40.0) — 앱은 스텝 좌표에 닿을 때 그 스텝 문장을 말한다. 역 대표점이면 이미 승강장에 들어간 뒤라
+            # 역 안 이동 안내가 쓸모없다(실기기 모의 주행 2026-10-20). 승차 출구(승강기) 앞에서 말하게 한다.
+            coord = [bx["lat"], bx["lng"]] if bx else [leg["board"]["lat"], leg["board"]["lng"]]
             maneuver = "subway_board"
         else:
             instruction = "%s역에서 하차합니다" % leg["alight"]["name"]
@@ -668,7 +698,11 @@ def _transit_step(leg, boarding: bool) -> dict:
             if ax:
                 instruction += " — %s번 출구%s로 나갑니다" % (ax["exit_no"],
                                                         "(승강기)" if ax.get("has_elevator") else "")
-            coord = [leg["alight"]["lat"], leg["alight"]["lng"]]
+            # 하차 지점 (v1.40.0) — 노선 선형이 있으면 선로 위 하차 승강장 점(구간 끝점). 역 대표점은 역사 건물 쪽이라
+            # 열차가 서는 곳과 수십 m 떨어져 있다.
+            geo = leg.get("geometry") or []
+            coord = (geo[-1] if leg.get("geometry_source") == "rail_osm" and geo
+                     else [leg["alight"]["lat"], leg["alight"]["lng"]])
             maneuver = "subway_alight"
     # 리프트만 있는 승강장 (v1.35.0) — 승차 스텝은 승차·하차 두 쪽을 모두, 하차 스텝은 하차 쪽만 말한다.
     # 승차 직전이 이용자가 경로를 바꿀 수 있는 마지막 시점이라, 내릴 역의 리프트도 탈 때 미리 알린다.
@@ -684,6 +718,20 @@ def _transit_step(leg, boarding: bool) -> dict:
                 flagged.append(pa)
                 notes.append(station_exits.lift_only_short(pa) if (boarding and side == "alight")
                              else pa["warning"])
+    # 승차 전 역 안 이동 (v1.39.0) — 출구 승강기 → 개찰구 → 승차 승강장 승강기, 그리고 탑승 칸.
+    # 앱은 스텝 문장을 그대로 읽으므로 문장에 붙이고, 화면용으로 구조화한 값도 싣는다.
+    ingress = None
+    if boarding and leg["kind"] == "subway":
+        pam = leg.get("platform_access") or {}
+        ingress = station_exits.ingress_guide(leg["board"]["name"], leg.get("board_exit"),
+                                              pam.get("board"), pam.get("alight"), leg["alight"]["name"])
+        if ingress.get("speech"):
+            # 음성 문장 (v1.40.0) — 출구 앞에서 할 일 → 탈 열차·내릴 역 → 탑승 칸 순서로 짧게. 설비 위치 문구는 화면(ingress.inside)에만.
+            parts = [ingress["speech"],
+                     "%s %d개 역 뒤 %s역에서 내립니다" % (leg["line"], leg["station_cnt"], leg["alight"]["name"])]
+            if ingress.get("car"):
+                parts.append(ingress["car"]["text"])
+            instruction = ". ".join(p.rstrip(" .") for p in parts)
     if flagged:
         instruction = instruction.rstrip(" .") + ". 주의: " + " ".join(notes)
     leg_ref = {"kind": leg["kind"]}
@@ -708,6 +756,8 @@ def _transit_step(leg, boarding: bool) -> dict:
         out["platform_access"] = flagged    # 화면이 별도 주의 줄로 그린다(기계 판독용)
     if not boarding and leg.get("egress"):
         out["egress"] = leg["egress"]       # 화면이 역 안/밖을 묻고 해당 문장을 쓴다(#77)
+    if ingress:
+        out["ingress"] = ingress            # 승차 전 역 안 이동·탑승 칸 (v1.39.0)
     return out
 
 
@@ -1052,6 +1102,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     # 근사 스코어 순 상위 후보를 전부 실계산해 비교한다 — 도보 근사(직선×배율)와
     # 실제 휠체어 경로(계단·경사·단절 우회)의 괴리로 1순위가 최악일 수 있다(리뷰 #2).
     built_cands, last_err = [], None
+    implausible = []            # 이상치 점검(v1.43.0)으로 버린 후보의 사유
     for cand in cands[:8]:      # 근사-실계산 괴리 보정 폭 — 도보 leg 계산은 저렴하다
         try:
             built = []
@@ -1097,6 +1148,13 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         if pa and pa.get("warning") and pa["warning"] not in sl["warnings"]:
                             sl["warnings"].append(pa["warning"])
                     built.append(sl)
+            # 완성 경로 이상치 점검(v1.43.0) — 순환 노선 한 바퀴 돌기처럼 상식 밖인 후보는 버린다.
+            # 버려진 후보만 남으면 아래에서 404(대중교통 경로 없음)로 끝나고, 호출자(12)는 도보를 쓴다.
+            bad = transit.implausible_reason(built, origin, tgt)
+            if bad:
+                implausible.append(bad)
+                logger.info("대중교통 후보 제외(이상치): %s", bad)
+                continue
             actual = sum(l["summary"]["total_distance_m"] for l in built
                          if l["kind"] == "walk")
             actual += sum(l.get("stop_cnt", 0) for l in built) * transit.STOP_PENALTY_M
@@ -1134,6 +1192,13 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             last_err = e
             continue
     legs = min(built_cands, key=lambda x: x[0])[1] if built_cands else None
+    if legs is None and implausible and last_err is None:
+        # 만들 수는 있었지만 전부 상식 밖이었다(v1.43.0) — '대중교통 경로 없음'으로 답해 도보를 쓰게 한다
+        raise HTTPException(
+            status_code=404,
+            detail="이용할 만한 대중교통 경로를 찾지 못했습니다 — 도보 경로를 이용하세요 (%s)"
+                   % implausible[0],
+        )
     if legs is None:
         raise HTTPException(
             status_code=422,
@@ -1250,6 +1315,8 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         "resolved_by": target["source"],
                         "note": _entrance_note(target)},
         "routes": [{"summary": summary, "geometry": geometry, "steps": steps, "legs": legs,
+                    # 도보 구간의 횡단보도를 진행 순서대로 모은다 (#118)
+                    "crosswalks": [c for l in walk_legs for c in (l.get("crosswalks") or [])],
                     # 주변 랜드마크 (#88) — 도보 구간 옆만(버스·지하철 탑승 중에는 말하지 않는다)
                     "landmarks": poi_landmarks.for_route(
                         poi_store.STORE, geometry, [l["geometry"] for l in walk_legs if l.get("geometry")])}],

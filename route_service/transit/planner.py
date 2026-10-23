@@ -24,6 +24,8 @@
 """
 from __future__ import annotations
 
+import math
+
 from ..engine.geo import haversine_m
 
 # 추정 파라미터 — 실증 실측으로 보정한다
@@ -37,6 +39,14 @@ STOP_NEAR_STATION_M = 350       # 역 환승용 정류장 탐색 반경
 STATION_RADIUS_M = 700          # 인근 역 탐색 반경 (walk_bus_subway)
 STATION_RADIUS_SUBWAY_ONLY_M = 3000   # walk_subway 전용 역 탐색 반경 (#73)
 MAX_CANDIDATE_STOPS = 6
+# 하차(목적지 쪽) 정류장 후보 수 (v1.43.0).
+# 종전에는 출발·목적지 모두 '가까운 6곳'만 봤다. 2026-10-22 실증에서 관악역 → 김중업건축박물관을
+# 마을버스 6-2번으로 계획할 때, 바로 다음 정류장(안양예술공원 09115, 목적지 411m)이 목적지에서
+# 8번째로 가까워 후보에서 빠지고, 6번째인 같은 이름의 길 건너 정류장(09119, 354m)만 남았다.
+# 그 정류장은 순환 노선을 한 바퀴 돈 뒤(순번 66) 지나므로 58정거장·19.2km 탑승이 계획되었다.
+# 목적지 쪽은 반경(STOP_RADIUS_M) 안의 정류장을 넉넉히 본다. 출발 쪽은 저상버스 실시간 판정
+# 조회가 승차 정류장 수에 비례하므로 종전 6곳을 유지한다(조회 예산 3초).
+MAX_TARGET_STOPS = 20
 MAX_WALK_LEG_M = 5000           # 도보 leg 상한(직선×배율 근사 기준, #73)
 
 MODES = ("walk_bus", "walk_subway", "walk_bus_subway")
@@ -52,6 +62,60 @@ def uses_subway(mode: str) -> bool:
 
 def station_radius_for(mode: str) -> float:
     return float(STATION_RADIUS_SUBWAY_ONLY_M if mode == "walk_subway" else STATION_RADIUS_M)
+
+# 과다 탑승 차단 (v1.43.0) — 승·하차 정류장 직선거리에 비해 정거장 수가 지나치게 많은 조합을 버린다.
+# 순환 노선은 같은 이름의 정류장을 왕복 두 번 지나므로, 길 건너 정류장에서 내리는 조합이
+# '한 바퀴 돌기'가 될 수 있다(위 MAX_TARGET_STOPS 설명의 58정거장 사례).
+# 허용 정거장 수 = max(BUS_RIDE_MIN_STOPS, ceil(직선거리 / BUS_RIDE_SPACING_M × BUS_RIDE_STOP_FACTOR)).
+#   · BUS_RIDE_SPACING_M 300m — 도심 정류장 간격(400~600m)보다 짧게 잡아 정상 노선을 넉넉히 허용
+#   · BUS_RIDE_STOP_FACTOR 2.5 — 노선이 직선의 2배 넘게 돌아가도 허용
+#   · BUS_RIDE_MIN_STOPS 8 — 가까운 거리는 노선 굴곡이 커도 8정거장까지는 허용
+# 예) 관악역→길 건너 안양예술공원(직선 593m): 허용 8 < 58 → 제외 / 바로 다음 정류장 1 → 허용
+BUS_RIDE_SPACING_M = 300.0
+BUS_RIDE_STOP_FACTOR = 2.5
+BUS_RIDE_MIN_STOPS = 8
+
+# 완성 경로 이상치 점검 (v1.43.0) — 실계산이 끝난 후보에 마지막으로 적용한다(api.main).
+# 정거장 수 규칙(위)은 근사이고, 실제 탑승 거리(정류장 경로 길이)·총거리는 조립 뒤에야 안다.
+#   · 버스 탑승 거리 > max(BUS_RIDE_SLACK_M, BUS_RIDE_MAX_RATIO × 승·하차 직선거리) → 후보 제외
+#   · 경로 총거리 > max(ROUTE_DETOUR_MIN_M, ROUTE_DETOUR_MAX_RATIO × 출발·목적지 직선거리) → 후보 제외
+# 2026-10-22 사례: 출발·목적지 직선 785m 에 총 20,161m(25.7배), 버스 탑승 19,214m(승·하차 직선 593m의 32배).
+BUS_RIDE_MAX_RATIO = 3.0
+BUS_RIDE_SLACK_M = 1500.0
+ROUTE_DETOUR_MAX_RATIO = 4.0
+ROUTE_DETOUR_MIN_M = 2000.0
+
+
+def implausible_reason(legs, origin, target):
+    """조립된 대중교통 경로가 상식 밖이면 사유 문자열, 정상이면 None (v1.43.0).
+
+    legs: api.main 이 만든 leg 목록(walk 는 summary.total_distance_m, 버스·지하철은 est_distance_m).
+    origin/target: (lat, lng).
+    """
+    for l in legs:
+        if l.get("kind") != "bus":
+            continue
+        b, a = l.get("board") or {}, l.get("alight") or {}
+        if b.get("lat") is None or a.get("lat") is None:
+            continue
+        straight = haversine_m(b["lat"], b["lng"], a["lat"], a["lng"])
+        ride = float(l.get("est_distance_m") or 0.0)
+        if ride > max(BUS_RIDE_SLACK_M, BUS_RIDE_MAX_RATIO * straight):
+            return ("버스 %s번 탑승 거리 %.0fm 가 승·하차 정류장 직선거리 %.0fm 에 비해 과다"
+                    % ((l.get("route") or {}).get("name") or "?", ride, straight))
+    total = sum((l.get("summary") or {}).get("total_distance_m", 0.0) if l.get("kind") == "walk"
+                else float(l.get("est_distance_m") or 0.0) for l in legs)
+    od = haversine_m(origin[0], origin[1], target[0], target[1])
+    if total > max(ROUTE_DETOUR_MIN_M, ROUTE_DETOUR_MAX_RATIO * od):
+        return "경로 총거리 %.0fm 가 출발·목적지 직선거리 %.0fm 에 비해 과다" % (total, od)
+    return None
+
+
+def max_ride_stops(board_lat, board_lng, alight_lat, alight_lng) -> int:
+    """승·하차 정류장 직선거리로 정한 탑승 허용 정거장 수 (v1.43.0, 과다 탑승 차단)."""
+    straight = haversine_m(board_lat, board_lng, alight_lat, alight_lng)
+    return max(BUS_RIDE_MIN_STOPS, int(math.ceil(straight / BUS_RIDE_SPACING_M * BUS_RIDE_STOP_FACTOR)))
+
 
 # 스코어 환산(도보 m 단위) — 낮을수록 좋다
 STOP_PENALTY_M = 150            # 버스 한 정거장
@@ -133,6 +197,10 @@ def _direct_bus_pairs(stops_a, stops_b, origin=None, target=None, route_ok=None)
                     for sb in (r.get("station_seq") or []):
                         if sa < sb and (best is None or sb - sa < best[2]):
                             best = (sa, sb, sb - sa)
+                if best and best[2] > max_ride_stops(a["lat"], a["lng"], b["lat"], b["lng"]):
+                    # 과다 탑승(순환 노선 한 바퀴 돌기 등) — v1.43.0. 같은 노선의 다른 하차 정류장
+                    # 후보(바로 다음 정류장 등)가 있으면 그쪽이 선택된다.
+                    best = None
                 if best:
                     pairs.append({
                         "walk_a_m": da, "walk_b_m": db,
@@ -189,7 +257,10 @@ def search(origin, target, mode, stops_near, stations, stop_radius_m=None,
     stops_o = stops_t = []
     if bus_ok:
         stops_o = nearest(stops_near(o[0], o[1], radius), o[0], o[1], radius, k)
-        stops_t = nearest(stops_near(t[0], t[1], radius), t[0], t[1], radius, k)
+        # 목적지 쪽은 반경 안 후보를 넉넉히 본다(v1.43.0, MAX_TARGET_STOPS 설명). 호출자가 k 를
+        # 넓혀 부르면(저상 우선 확장 탐색) 그 값과 MAX_TARGET_STOPS 중 큰 쪽을 쓴다.
+        stops_t = nearest(stops_near(t[0], t[1], radius), t[0], t[1], radius,
+                          max(k, MAX_TARGET_STOPS))
 
     def _legs_ok(*walks):
         return all(w <= MAX_WALK_LEG_M for w in walks)
