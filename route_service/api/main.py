@@ -1102,6 +1102,7 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     # 근사 스코어 순 상위 후보를 전부 실계산해 비교한다 — 도보 근사(직선×배율)와
     # 실제 휠체어 경로(계단·경사·단절 우회)의 괴리로 1순위가 최악일 수 있다(리뷰 #2).
     built_cands, last_err = [], None
+    implausible = []            # 이상치 점검(v1.43.0)으로 버린 후보의 사유
     for cand in cands[:8]:      # 근사-실계산 괴리 보정 폭 — 도보 leg 계산은 저렴하다
         try:
             built = []
@@ -1147,6 +1148,13 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                         if pa and pa.get("warning") and pa["warning"] not in sl["warnings"]:
                             sl["warnings"].append(pa["warning"])
                     built.append(sl)
+            # 완성 경로 이상치 점검(v1.43.0) — 순환 노선 한 바퀴 돌기처럼 상식 밖인 후보는 버린다.
+            # 버려진 후보만 남으면 아래에서 404(대중교통 경로 없음)로 끝나고, 호출자(12)는 도보를 쓴다.
+            bad = transit.implausible_reason(built, origin, tgt)
+            if bad:
+                implausible.append(bad)
+                logger.info("대중교통 후보 제외(이상치): %s", bad)
+                continue
             actual = sum(l["summary"]["total_distance_m"] for l in built
                          if l["kind"] == "walk")
             actual += sum(l.get("stop_cnt", 0) for l in built) * transit.STOP_PENALTY_M
@@ -1184,6 +1192,13 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             last_err = e
             continue
     legs = min(built_cands, key=lambda x: x[0])[1] if built_cands else None
+    if legs is None and implausible and last_err is None:
+        # 만들 수는 있었지만 전부 상식 밖이었다(v1.43.0) — '대중교통 경로 없음'으로 답해 도보를 쓰게 한다
+        raise HTTPException(
+            status_code=404,
+            detail="이용할 만한 대중교통 경로를 찾지 못했습니다 — 도보 경로를 이용하세요 (%s)"
+                   % implausible[0],
+        )
     if legs is None:
         raise HTTPException(
             status_code=422,
