@@ -202,6 +202,7 @@ def test_collect_api_end_to_end(tmp_path, monkeypatch):
     import json as _json
     import pickle
     from fastapi.testclient import TestClient
+    from conftest import API_AUTH, TEST_API_TOKEN
 
     net = tmp_path / "network.gpickle"
     with open(net, "wb") as f:
@@ -210,15 +211,17 @@ def test_collect_api_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setenv("NETWORK_VERSION", "test-collect")
     monkeypatch.setenv("POI_BACKEND", "none")
     monkeypatch.setenv("POI_DB_DSN", "")
-    monkeypatch.setenv("ROUTE_API_TOKEN", "")
+    monkeypatch.setenv("ROUTE_API_TOKEN", TEST_API_TOKEN)
 
+    import importlib as _importlib
     import route_service.config as config
+    _importlib.reload(config)       # Settings 기본값은 import 시점 env 로 고정 — 시험용 토큰 반영
     config._settings = None
     import importlib
     import route_service.api.main as main
     importlib.reload(main)
 
-    with TestClient(main.app) as client:
+    with TestClient(main.app, headers=API_AUTH) as client:
         # 제보 → 즉시 경고 반영
         res = client.post("/report/accessibility",
                           json={"lat": 37.3900, "lng": 126.9505, "reason": "curb"})
@@ -450,7 +453,7 @@ def test_db_engine_gets_connect_timeout(monkeypatch):
 
 def test_photo_base64_data_url_prefix_and_strict_decode():
     import base64
-    raw = bytes(range(256)) * 4
+    raw = b"\xff\xd8\xff\xe0" + bytes(range(256)) * 4   # JPEG 앞머리(형식 검사 v1.44.0)
     b64 = base64.b64encode(raw).decode()
     for sent in (b64, "data:image/jpeg;base64," + b64, "data:image/png;charset=utf-8;base64," + b64,
                  "\n".join(b64[i:i + 76] for i in range(0, len(b64), 76))):

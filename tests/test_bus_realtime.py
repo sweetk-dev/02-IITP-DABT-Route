@@ -13,6 +13,7 @@ import sys
 
 import pytest
 from fastapi.testclient import TestClient
+from conftest import API_AUTH, TEST_API_TOKEN
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from conftest import make_graph  # noqa: E402
@@ -191,7 +192,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("NETWORK_VERSION", "test-1")
     monkeypatch.setenv("POI_BACKEND", "file")
     monkeypatch.setenv("POI_DATA_DIR", str(poi_dir))
-    monkeypatch.setenv("ROUTE_API_TOKEN", "")
+    monkeypatch.setenv("ROUTE_API_TOKEN", TEST_API_TOKEN)
     monkeypatch.setenv("DATA_GO_KR_API_KEY", "test-key")
 
     import importlib
@@ -200,7 +201,7 @@ def client(tmp_path, monkeypatch):
     cfg._settings = None
     import route_service.api.main as m
     importlib.reload(m)
-    with TestClient(m.app) as c:
+    with TestClient(m.app, headers=API_AUTH) as c:
         # 외부 호출을 실측 응답으로 대체
         live = _live({"getBusArrivalListv2": ARRIVAL_BODY, "getBusLocationListv2": LOCATION_BODY})
         m.gbis_live.LIVE = live
