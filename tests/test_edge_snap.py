@@ -13,6 +13,7 @@ import sys
 import networkx as nx
 import pytest
 from fastapi.testclient import TestClient
+from conftest import API_AUTH, TEST_API_TOKEN
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -128,13 +129,13 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("NETWORK_PATH", str(net)); monkeypatch.setenv("NETWORK_VERSION", "test-1")
     monkeypatch.setenv("POI_BACKEND", "file"); monkeypatch.setenv("POI_DATA_DIR", str(poi_dir))
     monkeypatch.setenv("ENTRANCES_PATH", str(poi_dir / "entrances.json"))
-    monkeypatch.setenv("ROUTE_API_TOKEN", "")
+    monkeypatch.setenv("ROUTE_API_TOKEN", TEST_API_TOKEN)
     import importlib
     import route_service.config as cfg
     importlib.reload(cfg); cfg._settings = None
     import route_service.api.main as m
     importlib.reload(m)
-    with TestClient(m.app) as c:
+    with TestClient(m.app, headers=API_AUTH) as c:
         yield c
 
 

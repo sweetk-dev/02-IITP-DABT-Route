@@ -34,6 +34,24 @@ OVERRIDE_ATTRS = ("warning", "curb_cut", "tactile_paving", "width", "passable")
 APPROVAL_ONLY_ATTRS = ("curb_cut", "tactile_paving", "width", "passable")
 MAX_POINTS_PER_CALL = 5000
 MAX_PHOTO_BYTES = 2 * 1024 * 1024
+# 제보 사진 base64 문자열의 길이 상한(요청 본문 검증용). 디코드 상한 MAX_PHOTO_BYTES 에서 계산한다.
+#   · base64 는 3바이트를 4글자로 늘린다            → ceil(2MiB / 3) * 4 = 2,796,204자
+#   · 76자마다 줄을 나눈(CRLF 2자) 형식도 받는다      → × 78/76
+#   · "data:image/jpeg;base64," 같은 data URL 접두 → + 256자 여유
+# 이동경로 안내 화면은 촬영 사진을 긴 변 1280px·JPEG 품질 0.8 로 다시 그려 보내므로 보통 수백 KB 로,
+# 이 상한의 1/4 에도 못 미친다. 상한을 넘는 문자열은 디코드해 봐야 2MB 검사에서 어차피 거부된다.
+MAX_PHOTO_B64_CHARS = -(-MAX_PHOTO_BYTES // 3) * 4 * 78 // 76 + 256
+
+# 제보 사진으로 받는 형식(허용 목록). 저장한 사진은 관리 화면에서 브라우저로 열리므로, 브라우저가
+# 이미지로만 해석하는 형식만 받는다. 근거:
+#   · image/jpeg — 이동경로 안내 화면은 사진을 canvas 로 다시 그려 항상 JPEG 로 보낸다(주 경로).
+#   · image/png · image/webp — 다른 호출자가 원본을 그대로 보낼 때를 위한 일반 웹 이미지 형식.
+#   HEIC 등 브라우저가 바로 표시하지 못하는 형식은 받지 않는다(안내 화면은 JPEG 로 바꿔 보낸다).
+# SVG(스크립트를 담을 수 있다)·HTML 등은 허용하지 않는다. 형식 판정은 신고값(photo_mime)이 아니라
+# 디코드한 바이트의 앞머리(매직 바이트)로 한다 — 신고값은 호출자가 마음대로 적을 수 있다.
+ALLOWED_PHOTO_MIMES = ("image/jpeg", "image/png", "image/webp")
+# 흔히 쓰이는 비표준 표기는 표준 이름으로 맞춘다.
+_PHOTO_MIME_ALIASES = {"image/jpg": "image/jpeg", "image/pjpeg": "image/jpeg"}
 # DB 접속 타임아웃(초). 드라이버 기본값은 무제한이라, DB 호스트가 응답하지 않으면 운영체제 TCP 타임아웃
 # (1~2분)까지 요청 처리 스레드가 묶인다. 같은 망 안의 DB 는 접속에 0.1초도 걸리지 않으므로 5초면
 # 일시 지연은 넘기고 장애는 빨리 드러난다. 호출자(API)는 예외를 받아 503 으로 응답한다.
@@ -63,6 +81,66 @@ def decode_photo(photo_b64: str) -> bytes:
     if len(photo) > MAX_PHOTO_BYTES:
         raise ValueError("사진이 너무 큽니다 (2MB 이하)")
     return photo
+
+
+class PhotoTypeError(ValueError):
+    """허용하지 않는 사진 형식이거나, 신고한 형식(photo_mime)과 실제 파일 형식이 다르다.
+
+    ValueError 의 하위 클래스라 종전 호출자(ValueError 를 잡는 곳)도 그대로 동작한다.
+    API 는 이 예외를 400 으로 돌려준다(형식 자체가 받지 않는 입력이라는 뜻).
+    """
+
+
+def sniff_photo_mime(data: bytes) -> str | None:
+    """바이트 앞머리(매직 바이트)로 사진 형식을 판정한다. 허용 형식이 아니면 None.
+
+      JPEG : FF D8 FF
+      PNG  : 89 50 4E 47 0D 0A 1A 0A
+      WebP : "RIFF" <4바이트 크기> "WEBP"
+    저장 시 검증과 응답 시 Content-Type 결정에 같은 함수를 쓴다 — 저장된 신고값은 믿지 않는다.
+    """
+    if not data:
+        return None
+    b = bytes(data[:12])
+    if b[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if b[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(b) >= 12 and b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def normalize_photo_mime(mime: str | None) -> str | None:
+    """신고된 MIME 을 비교용으로 정리한다 — 소문자, 매개변수(';' 뒤) 제거, 별칭 통일."""
+    if not mime:
+        return None
+    m = mime.split(";", 1)[0].strip().lower()
+    return _PHOTO_MIME_ALIASES.get(m, m) or None
+
+
+def validate_photo(photo_b64: str, photo_mime: str | None) -> tuple[bytes, str]:
+    """제보 사진을 디코드하고 형식을 검증해 (바이트, 판정한 MIME) 을 돌려준다.
+
+    · 디코드·크기 검사는 decode_photo(잘못된 base64·2MB 초과는 ValueError → API 422).
+    · 실제 형식은 매직 바이트로 판정한다. 허용 목록 밖이면 PhotoTypeError(→ API 400).
+    · photo_mime 을 함께 보냈으면 허용 목록 안이어야 하고 실제 형식과 같아야 한다.
+      다르면 PhotoTypeError — 이미지가 아닌 내용을 이미지라고 신고해 저장하는 것을 막는다.
+    · 저장하는 MIME 은 신고값이 아니라 판정값이다(photo_mime 을 비워 보내도 형식이 채워진다).
+    """
+    photo = decode_photo(photo_b64)
+    actual = sniff_photo_mime(photo)
+    if actual is None:
+        raise PhotoTypeError("사진은 JPEG·PNG·WebP 형식만 받습니다")
+    declared = normalize_photo_mime(photo_mime)
+    if declared is not None:
+        if declared not in ALLOWED_PHOTO_MIMES:
+            raise PhotoTypeError("사진 형식(photo_mime)은 %s 중 하나여야 합니다"
+                                 % ", ".join(ALLOWED_PHOTO_MIMES))
+        if declared != actual:
+            raise PhotoTypeError("사진 형식(photo_mime=%s)이 실제 파일 형식(%s)과 다릅니다"
+                                 % (declared, actual))
+    return photo, actual
 
 
 def _connect_args(dsn: str) -> dict:
@@ -211,7 +289,11 @@ class CollectStore:
             reason = "etc"
         photo = None
         if photo_b64:
-            photo = decode_photo(photo_b64)      # data URL 접두 제거 + 엄격 디코드 + 크기 검사
+            # data URL 접두 제거 + 엄격 디코드 + 크기 검사 + 형식(매직 바이트) 검사.
+            # 저장하는 MIME 은 판정값으로 바꾼다 — 신고값을 그대로 저장하면 응답 Content-Type 으로 쓰일 수 있다.
+            photo, photo_mime = validate_photo(photo_b64, photo_mime)
+        else:
+            photo_mime = None                    # 사진 없이 형식만 온 경우는 저장하지 않는다
 
         if self.backend == "memory":
             with self._lock:

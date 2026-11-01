@@ -15,6 +15,7 @@ import threading
 
 import pytest
 from fastapi.testclient import TestClient
+from conftest import API_AUTH, TEST_API_TOKEN
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from conftest import make_graph  # noqa: E402
@@ -186,7 +187,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("NETWORK_VERSION", "test-1")
     monkeypatch.setenv("POI_BACKEND", "file")
     monkeypatch.setenv("POI_DATA_DIR", str(poi_dir))
-    monkeypatch.setenv("ROUTE_API_TOKEN", "")
+    monkeypatch.setenv("ROUTE_API_TOKEN", TEST_API_TOKEN)
     monkeypatch.setenv("DATA_GO_KR_API_KEY", "test-key")
 
     import importlib
@@ -211,7 +212,7 @@ def client(tmp_path, monkeypatch):
             if key in url:
                 return body
         raise AssertionError("예상치 못한 URL: %s" % url)
-    with TestClient(m.app) as c:
+    with TestClient(m.app, headers=API_AUTH) as c:
         m.gbis_live.LIVE = gbis_live.GbisLive(api_key="k", fetch=fetch, cache_ttl_sec=60)
         c.calls = calls
         c.responses = responses
@@ -547,7 +548,7 @@ def busy_client(tmp_path, monkeypatch):
     monkeypatch.setenv("NETWORK_VERSION", "test-1")
     monkeypatch.setenv("POI_BACKEND", "file")
     monkeypatch.setenv("POI_DATA_DIR", str(poi_dir))
-    monkeypatch.setenv("ROUTE_API_TOKEN", "")
+    monkeypatch.setenv("ROUTE_API_TOKEN", TEST_API_TOKEN)
     monkeypatch.setenv("DATA_GO_KR_API_KEY", "test-key")
 
     import importlib
@@ -556,7 +557,7 @@ def busy_client(tmp_path, monkeypatch):
     cfg._settings = None
     import route_service.api.main as m
     importlib.reload(m)
-    with TestClient(m.app) as c:
+    with TestClient(m.app, headers=API_AUTH) as c:
         c.main = m
         yield c
 

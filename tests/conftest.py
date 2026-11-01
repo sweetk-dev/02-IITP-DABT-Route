@@ -35,6 +35,13 @@ def pytest_sessionfinish(session, exitstatus):
 
 from route_service.engine.graph import NetworkStore  # noqa: E402
 
+# 인증(v1.44.0) — 토큰이 설정되지 않은 서버는 보호 엔드포인트를 503 으로 거부한다.
+# API 테스트는 시험용 토큰을 환경변수로 설정하고, TestClient 기본 헤더로 그 토큰을 보낸다.
+TEST_API_TOKEN = "test-route-api-token"
+TEST_ADMIN_TOKEN = "test-route-admin-token"
+API_AUTH = {"Authorization": "Bearer %s" % TEST_API_TOKEN}
+ADMIN_AUTH = {"Authorization": "Bearer %s" % TEST_ADMIN_TOKEN}
+
 
 def make_graph() -> nx.Graph:
     G = nx.Graph()

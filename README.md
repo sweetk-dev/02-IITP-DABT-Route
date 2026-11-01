@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.43.0 |
+| 02-IITP-DABT-Route | v1.44.0 |
 
 ## 구조
 
@@ -114,6 +114,8 @@ docker run -d --name route-api -p 18100:18100 \
     -e ENTRANCES_PATH=/app/data/poi/entrances.json \
     -e POI_BACKEND=db \
     -e POI_DB_DSN='postgresql+psycopg2://<user>:<pw>@<host>:5432/<db>' \
+    -e ROUTE_API_TOKEN='<일반 토큰>' \
+    -e ROUTE_ADMIN_TOKEN='<관리 토큰>' \
     route-api
 
 curl -s localhost:18100/health
@@ -146,10 +148,29 @@ curl -s localhost:18100/meta/network
 | POST | `/track/log` | 주행 GPS 트랙 적재 (참여자 식별자 없음 — `route_id` 익명) |
 | POST | `/report/accessibility` | 접근성 오류 제보 — 접수 즉시 '이용자 제보(미확인)' 경고 부착 |
 | GET | `/report/accessibility` | 제보 목록 (관리 콘솔용) |
-| GET | `/report/accessibility/{id}/photo` | 제보 사진 |
+| GET | `/report/accessibility/{id}/photo` | 제보 사진 — JPEG·PNG·WebP 로 판정된 것만 이미지로, 그 외는 내려받기(`application/octet-stream`) |
 | PATCH | `/report/accessibility/{id}` | 검토 — confirm(확정) / reject(기각) / apply(속성 반영, 승인제) |
 | DELETE | `/report/accessibility/{id}` | **제보 삭제** — 오검·중복·시험 제보 정리. 파생 오버라이드도 함께 사라진다 |
-| POST | `/admin/reload-network` | 그래프 무중단 교체 — `path` 는 `NETWORK_PATH` 가 있는 디렉터리 하위만 허용(밖이면 400), 읽지 못하는 파일이면 종전 그래프를 유지하고 422 |
+| POST | `/admin/reload-network` | 그래프 무중단 교체 — `path` 는 `NETWORK_PATH` 가 있는 디렉터리 하위만 허용(밖이면 400), 읽지 못하는 파일이면 종전 그래프를 유지하고 422. **관리 토큰** |
+| POST | `/admin/reload-overrides` | 오버라이드만 재적용(그래프 로드 없이). **관리 토큰** |
+
+### 인증 · 제보 사진 형식 (v1.44.0)
+
+| 구분 | 엔드포인트 | 헤더 | 토큰 미설정 서버 |
+|---|---|---|---|
+| 공개 | `/health` · `/meta/network` · `/profiles` · API 문서(`/docs`·`/redoc`·`/openapi.json`) | 없음 | 그대로 응답 |
+| 일반 | 위와 관리 엔드포인트를 뺀 전부 (경로·조회·트랙·제보 등록·목록·사진·검토·삭제) | `Authorization: Bearer <ROUTE_API_TOKEN>` | 503 |
+| 관리 | `/admin/*` | `Authorization: Bearer <ROUTE_ADMIN_TOKEN>` | 503 |
+
+- 토큰이 틀리거나 없으면 401. 관리 엔드포인트에 일반 토큰을 보내도 401 이다.
+- 토큰이 설정되지 않은 서버는 검사를 건너뛰지 않고 503 으로 거부한다(설정 누락이 전면 개방이 되지 않게). 기동 로그에 미설정 경고가 남는다.
+- 토큰 비교는 상수 시간 비교(`hmac.compare_digest`).
+- 제보 사진(`photo_base64`)은 JPEG·PNG·WebP 만 받는다. 형식은 디코드한 바이트의 앞머리(매직 바이트)로 판정하고,
+  `photo_mime` 을 보냈으면 판정 결과와 같아야 한다. 허용 형식 밖이거나 서로 다르면 400, base64 오류·2MB 초과는 422.
+  저장하는 형식은 판정값이다.
+- 사진 응답의 `Content-Type` 은 저장값이 아니라 바이트를 다시 판정해 정한다. 허용 형식이 아니면(이전 저장분 포함)
+  `application/octet-stream` + `Content-Disposition: attachment`. 모든 사진 응답에 `X-Content-Type-Options: nosniff`,
+  `Content-Security-Policy: default-src 'none'; img-src 'self' data:; sandbox`.
 
 ### 경로 탐색 예시
 

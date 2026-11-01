@@ -116,6 +116,7 @@ def test_api_passable_override_refreshes_snap_candidates(tmp_path, monkeypatch):
     import importlib
     import pickle
     from fastapi.testclient import TestClient
+    from conftest import API_AUTH, TEST_API_TOKEN
 
     net = tmp_path / "network.gpickle"
     with open(net, "wb") as f:
@@ -123,13 +124,13 @@ def test_api_passable_override_refreshes_snap_candidates(tmp_path, monkeypatch):
     monkeypatch.setenv("NETWORK_PATH", str(net))
     monkeypatch.setenv("POI_BACKEND", "none")
     monkeypatch.setenv("POI_DB_DSN", "")
-    monkeypatch.setenv("ROUTE_API_TOKEN", "")
+    monkeypatch.setenv("ROUTE_API_TOKEN", TEST_API_TOKEN)
     import route_service.config as cfg
     importlib.reload(cfg)
     cfg._settings = None
     import route_service.api.main as m
     importlib.reload(m)
-    with TestClient(m.app) as c:
+    with TestClient(m.app, headers=API_AUTH) as c:
         assert "N3" in m.NET.reachable_nodes(WM, 12.0)
         rid = c.post("/report/accessibility",
                      json={"lat": 37.39045, "lng": 126.9511, "reason": "blocked"}).json()["report_id"]

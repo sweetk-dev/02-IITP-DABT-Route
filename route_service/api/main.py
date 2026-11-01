@@ -2,10 +2,16 @@
 """경로 추천 API.
 
 12-AccessistantAI 가 도구(Function Calling)로 호출한다.
-인증: ROUTE_API_TOKEN 이 설정된 경우 Authorization: Bearer <token> 필수.
+인증(v1.44.0)
+  · 보호 엔드포인트: Authorization: Bearer <ROUTE_API_TOKEN> 필수.
+  · 관리 엔드포인트(/admin/*): Authorization: Bearer <ROUTE_ADMIN_TOKEN> 필수 — 일반 토큰은 받지 않는다.
+  · 토큰이 설정되지 않은 서버는 해당 엔드포인트를 503 으로 거부한다(설정 누락 = 전면 개방이 되지 않게).
+  · 인증 없이 열려 있는 것은 상태 확인용 /health · /meta/network · /profiles 와 API 문서(/docs·/redoc·
+    /openapi.json) 뿐이다. /health 는 컨테이너 헬스체크(Dockerfile HEALTHCHECK)가 토큰 없이 부른다.
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import os
 import time
@@ -16,6 +22,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
 from .. import __version__
 from .. import metrics
@@ -75,6 +82,13 @@ def _apply_overrides_safe() -> dict:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # 인증 설정 점검 — 누락이면 해당 엔드포인트가 503 으로 거부되므로 기동 로그에서 바로 보이게 한다.
+    if not settings.api_token:
+        logger.error("ROUTE_API_TOKEN 미설정 — 보호 엔드포인트가 모두 503 으로 거부됩니다")
+    if not settings.admin_token:
+        logger.warning("ROUTE_ADMIN_TOKEN 미설정 — 관리 엔드포인트(/admin/*)가 503 으로 거부됩니다")
+    elif settings.admin_token == settings.api_token:
+        logger.warning("ROUTE_ADMIN_TOKEN 이 ROUTE_API_TOKEN 과 같습니다 — 관리 권한 분리가 되지 않습니다")
     poi_store.configure(settings)
     collect_store.configure(settings)
     metrics.configure(settings)
@@ -161,12 +175,47 @@ def _cache_put(route_id: str, payload: dict):
         ROUTE_CACHE.popitem(last=False)
 
 
-def auth(authorization: str = Header(default="")):
-    if not settings.api_token:
-        return True
-    if authorization != "Bearer %s" % settings.api_token:
-        raise HTTPException(status_code=401, detail="인증 토큰이 올바르지 않습니다")
+def _bearer_matches(authorization: str, expected: str) -> bool:
+    """Authorization 헤더가 `Bearer <expected>` 인지 비교한다.
+
+    토큰 비교는 hmac.compare_digest(상수 시간)로 한다. `!=` 는 앞에서부터 다른 글자를 만나면 바로
+    끝나므로, 응답 시간 차이로 토큰을 한 글자씩 맞춰 볼 여지가 생긴다. 바이트로 바꿔 비교하는 것은
+    compare_digest 가 str 에는 ASCII 만 받기 때문이다(비ASCII 헤더가 와도 예외 없이 불일치로 끝난다).
+    """
+    scheme, _, presented = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer":
+        return False
+    return hmac.compare_digest(presented.strip().encode("utf-8"), expected.encode("utf-8"))
+
+
+def _require_token(authorization: str, expected: str) -> bool:
+    """토큰 검사 공통부 — 설정 누락은 503, 불일치는 401.
+
+    종전에는 토큰이 설정되지 않으면 검사 없이 통과시켰다(fail-open). 그러면 설정 한 줄이 빠진 서버가
+    그래프 교체·제보 삭제까지 누구에게나 열린다. 이제는 설정이 없으면 거부한다(fail-closed).
+    503 은 '호출자의 잘못이 아니라 서버 설정 문제'라는 뜻이다 — 호출자가 토큰을 바꿔 재시도할 일이 아니다.
+    """
+    if not expected:
+        raise HTTPException(status_code=503, detail="서버 인증 설정이 완료되지 않았습니다")
+    if not _bearer_matches(authorization, expected):
+        raise HTTPException(status_code=401, detail="인증 토큰이 올바르지 않습니다",
+                            headers={"WWW-Authenticate": "Bearer"})
     return True
+
+
+def auth(authorization: str = Header(default="")):
+    """일반 보호 엔드포인트 — ROUTE_API_TOKEN."""
+    return _require_token(authorization, settings.api_token)
+
+
+def admin_auth(authorization: str = Header(default="")):
+    """관리 엔드포인트(/admin/*) — ROUTE_ADMIN_TOKEN.
+
+    그래프 교체는 서버 파일을 그래프로 읽어 들이는 작업이라 일반 호출보다 권한을 좁힌다. 일반 토큰은
+    음성 비서 서버 등 여러 호출자가 나눠 갖지만, 관리 토큰은 운영 담당만 갖는다. 관리 엔드포인트는
+    일반 토큰을 받지 않는다(401).
+    """
+    return _require_token(authorization, settings.admin_token)
 
 
 # ────────────────────────── meta ──────────────────────────
@@ -1990,6 +2039,8 @@ def report_accessibility(req: AccessReportRequest):
             req.lat, req.lng, req.reason, req.detail, req.route_id,
             req.photo_base64, req.photo_mime,
         )
+    except collect_store.PhotoTypeError as e:   # 허용 형식 밖·신고 형식 불일치 (ValueError 보다 먼저)
+        raise HTTPException(status_code=400, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
@@ -2015,11 +2066,37 @@ def list_accessibility_reports(
 @app.get("/report/accessibility/{report_id}/photo", tags=["collect"],
          dependencies=[Depends(auth)])
 def report_photo(report_id: int):
-    photo, mime = collect_store.STORE.get_report_photo(report_id)
+    """제보 사진 바이트.
+
+    Content-Type 은 저장된 신고값(photo_mime)이 아니라 바이트의 매직 바이트로 다시 판정한다.
+    v1.44.0 이전에 저장된 사진은 형식 검사 없이 들어왔으므로, 저장값을 그대로 쓰면 이미지가 아닌
+    내용이 브라우저에서 문서로 열릴 수 있다. 판정 결과가 허용 형식(JPEG·PNG·WebP)이면 그 형식으로
+    표시하고, 아니면 application/octet-stream + 내려받기(attachment)로 돌려 브라우저가 열지 않게 한다.
+
+    모든 사진 응답에 붙이는 헤더:
+      · X-Content-Type-Options: nosniff — 브라우저가 내용을 보고 형식을 추측하지 않게 한다.
+      · Content-Security-Policy: default-src 'none'; img-src 'self' data:; sandbox
+        — 이 응답이 문서로 열리더라도 스크립트·외부 자원 로드를 막고 고유 출처(sandbox)로 격리한다.
+    """
+    photo, _stored_mime = collect_store.STORE.get_report_photo(report_id)
     if photo is None:
         raise HTTPException(status_code=404, detail="사진이 없습니다")
-    from fastapi.responses import Response
-    return Response(content=bytes(photo), media_type=mime or "image/jpeg")
+    data = bytes(photo)
+    kind = collect_store.sniff_photo_mime(data)
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": _PHOTO_CSP,
+    }
+    if kind in collect_store.ALLOWED_PHOTO_MIMES:
+        headers["Content-Disposition"] = 'inline; filename="report-%d.%s"' % (report_id, _PHOTO_EXT[kind])
+        return Response(content=data, media_type=kind, headers=headers)
+    headers["Content-Disposition"] = 'attachment; filename="report-%d.bin"' % report_id
+    return Response(content=data, media_type="application/octet-stream", headers=headers)
+
+
+# 제보 사진 응답 헤더 — report_photo 주석 참고
+_PHOTO_CSP = "default-src 'none'; img-src 'self' data:; sandbox"
+_PHOTO_EXT = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
 
 
 @app.patch("/report/accessibility/{report_id}", tags=["collect"],
@@ -2077,9 +2154,9 @@ def _network_file_or_400(path: str) -> str:
     return target
 
 
-@app.post("/admin/reload-network", tags=["admin"], dependencies=[Depends(auth)])
+@app.post("/admin/reload-network", tags=["admin"], dependencies=[Depends(admin_auth)])
 def reload_network(path: str = Query(None), version: str = Query(None)):
-    """그래프 교체(융기원 원본 도착 시 무중단 반영). 오버라이드도 재적용된다.
+    """그래프 교체(융기원 원본 도착 시 무중단 반영). 오버라이드도 재적용된다. 관리 토큰 필요.
 
     path 는 설정된 네트워크 파일이 있는 디렉터리 아래여야 한다(범위 밖 400, 없는 파일 404).
     파일이 손상됐거나 그래프 형식이 아니면 422 — 이 경우 종전 그래프로 계속 운행한다.
@@ -2105,9 +2182,13 @@ def reload_network(path: str = Query(None), version: str = Query(None)):
     return meta
 
 
-@app.post("/admin/reload-overrides", tags=["admin"], dependencies=[Depends(auth)])
+@app.post("/admin/reload-overrides", tags=["admin"], dependencies=[Depends(admin_auth)])
 def reload_overrides():
-    """오버라이드만 재적용 (그래프 로드 없이). 콘솔에서 일괄 검토 후 호출."""
+    """오버라이드만 재적용 (그래프 로드 없이). 일괄 검토 후 운영 담당이 호출 — 관리 토큰 필요.
+
+    제보 검토(PATCH)·삭제(DELETE)는 처리 직후 오버라이드를 스스로 재적용하므로 관리 콘솔이
+    이 엔드포인트를 부를 필요는 없다.
+    """
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
     return _apply_overrides_safe()
