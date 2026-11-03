@@ -16,6 +16,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
+from ..collect.store import MAX_PHOTO_B64_CHARS
+
 
 class Coord(BaseModel):
     lat: float = Field(..., ge=-90, le=90)
@@ -120,7 +122,11 @@ class AccessReportRequest(BaseModel):
     reason: str = Field(..., description="curb | no_sidewalk | no_crossing | steep | blocked | etc")
     detail: Optional[str] = Field(None, max_length=500)
     route_id: Optional[str] = Field(None, max_length=20)
-    photo_base64: Optional[str] = Field(None, description="사진 1장 (base64, 2MB 이하)")
+    # 길이 상한은 디코드 상한(2MB)에서 계산한 값이다(collect.store.MAX_PHOTO_B64_CHARS 주석).
+    # 본문 검증 단계에서 먼저 잘라 내야 큰 문자열을 디코드하느라 메모리·CPU 를 쓰지 않는다.
+    photo_base64: Optional[str] = Field(
+        None, max_length=MAX_PHOTO_B64_CHARS,
+        description="사진 1장 (base64, 디코드 2MB 이하, JPEG·PNG·WebP)")
     photo_mime: Optional[str] = Field(None, max_length=40)
 
 

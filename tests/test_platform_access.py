@@ -71,6 +71,7 @@ def _make_client(tmp_path, monkeypatch, stations, facilities):
     import importlib
     import pickle
     from fastapi.testclient import TestClient
+    from conftest import API_AUTH, TEST_API_TOKEN
     from conftest import make_graph
 
     net = tmp_path / "network.gpickle"
@@ -95,7 +96,7 @@ def _make_client(tmp_path, monkeypatch, stations, facilities):
     monkeypatch.setenv("NETWORK_VERSION", "test-1")
     monkeypatch.setenv("POI_BACKEND", "file")
     monkeypatch.setenv("POI_DATA_DIR", str(poi_dir))
-    monkeypatch.setenv("ROUTE_API_TOKEN", "")
+    monkeypatch.setenv("ROUTE_API_TOKEN", TEST_API_TOKEN)
     monkeypatch.setenv("METRICS_LOG_PATH", str(log))
     monkeypatch.setattr(ex, "_PLATFORMS", {})
     monkeypatch.setattr(ex, "_DATA", {})
@@ -111,7 +112,7 @@ def _make_client(tmp_path, monkeypatch, stations, facilities):
     # 경쟁한다. 실제 지리에서는 역방향 조합의 도보가 길어 지는 일이 없으므로, 여기서는 반경으로 뺀다.
     monkeypatch.setattr(m.transit, "STATION_RADIUS_SUBWAY_ONLY_M", 60)
     monkeypatch.setattr(m.transit, "STATION_RADIUS_M", 60)
-    return m, TestClient(m.app)
+    return m, TestClient(m.app, headers=API_AUTH)
 
 
 def _st(pid, name, lat, lng):

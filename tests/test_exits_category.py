@@ -111,6 +111,7 @@ def client(tmp_path, monkeypatch):
     import importlib
     import pickle
     from fastapi.testclient import TestClient
+    from conftest import API_AUTH, TEST_API_TOKEN
     from conftest import make_graph
 
     net = tmp_path / "network.gpickle"
@@ -172,7 +173,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("NETWORK_VERSION", "test-1")
     monkeypatch.setenv("POI_BACKEND", "file")
     monkeypatch.setenv("POI_DATA_DIR", str(poi_dir))
-    monkeypatch.setenv("ROUTE_API_TOKEN", "")
+    monkeypatch.setenv("ROUTE_API_TOKEN", TEST_API_TOKEN)
     monkeypatch.setenv("METRICS_LOG_PATH", str(log))
     # 합성 보행망 위에 출구를 둔다 — 명학 1번(목적지 쪽), 2번(반대편), 안양 1번
     monkeypatch.setattr(ex, "_PLATFORMS", {})   # 합성 역 — 승강장 윤곽 없음(역 중심 기준 판정)
@@ -188,7 +189,7 @@ def client(tmp_path, monkeypatch):
     import route_service.api.main as m
     importlib.reload(m)
     m._FAC_CACHE.clear()
-    with TestClient(m.app) as c:
+    with TestClient(m.app, headers=API_AUTH) as c:
         c.log_path = log
         yield c
 

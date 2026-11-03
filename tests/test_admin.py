@@ -9,8 +9,10 @@ from fastapi.testclient import TestClient
 
 from conftest import make_graph
 
-TOKEN = "test-admin-token"
+TOKEN = "test-admin-token"                       # 관리 토큰 (ROUTE_ADMIN_TOKEN)
 AUTH = {"Authorization": "Bearer %s" % TOKEN}
+API_TOKEN = "test-api-token"                     # 일반 토큰 (ROUTE_API_TOKEN) — 관리 엔드포인트에는 쓸 수 없다
+API = {"Authorization": "Bearer %s" % API_TOKEN}
 
 
 def _client(tmp_path, monkeypatch, token):
@@ -23,7 +25,8 @@ def _client(tmp_path, monkeypatch, token):
     monkeypatch.setenv("NETWORK_VERSION", "test-1")
     monkeypatch.setenv("POI_BACKEND", "none")
     monkeypatch.setenv("POI_DB_DSN", "")
-    monkeypatch.setenv("ROUTE_API_TOKEN", token)
+    monkeypatch.setenv("ROUTE_API_TOKEN", API_TOKEN)
+    monkeypatch.setenv("ROUTE_ADMIN_TOKEN", token)
     import route_service.config as cfg
     importlib.reload(cfg)
     cfg._settings = None
@@ -43,6 +46,9 @@ def admin(tmp_path, monkeypatch):
 def test_admin_requires_matching_token(admin):
     assert admin.post("/admin/reload-network").status_code == 401
     assert admin.post("/admin/reload-overrides", headers={"Authorization": "Bearer x"}).status_code == 401
+    # 관리 엔드포인트는 일반 토큰을 받지 않는다 (v1.44.0)
+    assert admin.post("/admin/reload-network", headers=API).status_code == 401
+    assert admin.post("/admin/reload-overrides", headers=API).status_code == 401
     r = admin.post("/admin/reload-network", headers=AUTH)
     assert r.status_code == 200, r.text
     assert r.json()["node_cnt"] == 4 and "overrides" in r.json()
@@ -101,7 +107,7 @@ def test_reload_network_keeps_current_graph_when_file_is_broken(admin):
         assert admin.main.NET.meta["node_cnt"] == 4
         assert len(admin.main.NET.node_index[0]) == 4
     # 종전 그래프로 경로 탐색이 계속된다
-    r = admin.post("/route/plan", headers=AUTH, json={
+    r = admin.post("/route/plan", headers=API, json={
         "origin": {"lat": 37.3900, "lng": 126.9500},
         "destination": {"type": "coord", "lat": 37.3909, "lng": 126.9511}, "profile": "wheelchair_manual"})
     assert r.status_code == 200, r.text

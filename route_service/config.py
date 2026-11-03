@@ -27,8 +27,13 @@ class Settings:
     entrances_path: str = os.environ.get("ENTRANCES_PATH", "data/poi/entrances.json")
     entrance_max_walk_m: float = float(os.environ.get("ENTRANCE_MAX_WALK_M", "120"))
 
-    # 서비스
+    # 서비스 — 인증 토큰 (값은 .env 에만)
+    # ROUTE_API_TOKEN  : 일반 호출(경로·조회·수집·제보 검토) 토큰. 비어 있으면 보호 엔드포인트는
+    #                    통과시키지 않고 503 으로 거부한다(설정 누락이 '전면 개방'이 되지 않도록).
+    # ROUTE_ADMIN_TOKEN: 관리 엔드포인트(/admin/* — 그래프 교체·오버라이드 재적용) 전용 토큰.
+    #                    일반 토큰과 다른 값으로 둔다. 비어 있으면 관리 엔드포인트는 503.
     api_token: str = os.environ.get("ROUTE_API_TOKEN", "")
+    admin_token: str = os.environ.get("ROUTE_ADMIN_TOKEN", "")
     allowed_origins: list = field(
         default_factory=lambda: _split(
             os.environ.get("ALLOWED_ORIGINS", "http://127.0.0.1:18000,http://localhost:18000")
