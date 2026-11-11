@@ -10,7 +10,7 @@
 
 | 레포 | 버전 |
 |---|---|
-| 02-IITP-DABT-Route | v1.44.0 |
+| 02-IITP-DABT-Route | v1.44.1 |
 
 ## 구조
 
@@ -37,6 +37,12 @@ scripts/
   planning.py          배치 경로 탐색 CLI (기존 스크립트 호환)
 tests/                 pytest (합성 보행망 기반)
 ```
+
+## 설치 패키지 버전 고정 (v1.44.1)
+
+`constraints.txt` 가 서비스 이미지에 설치되는 패키지 버전을 고정한다. `requirements.txt` 는 필요한 패키지와 하한만 적고,
+Dockerfile 이 `pip install -c constraints.txt -r requirements.txt` 로 함께 읽는다. 버전을 올릴 때는 해당 줄을 고치고
+테스트와 경로 탐색을 확인한 뒤 커밋한다. `requirements.txt` 에 패키지를 추가하면 `constraints.txt` 에도 버전을 넣는다.
 
 ## 설치 · 실행
 
