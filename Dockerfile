@@ -14,8 +14,9 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# constraints.txt 가 설치 버전을 고정한다 — 다시 빌드해도 같은 버전이 설치된다
+COPY requirements.txt constraints.txt ./
+RUN pip install --no-cache-dir -c constraints.txt -r requirements.txt
 
 COPY route_service/ ./route_service/
 COPY scripts/ ./scripts/
