@@ -153,6 +153,12 @@ def exit_options(name: str, facilities: dict, wheelchair: bool) -> list:
         no = _exit_no(lf.get("exit_no"))
         if no:
             lifts.setdefault(no, lf.get("detail_loc"))
+    # 출구 번호 정정 (v1.44.2) — 설비 자료의 출구 번호가 현장과 다른 승강기(안양역: 자료 '2번 출입구 — 1번출구
+    # 맞이방 서쪽', 현장은 서쪽 1번 출구 승강기)는 station_exits.json 의 elevator_db_exit 로 그 출구 승강기로 옮긴다.
+    for ex in exits:
+        src = _exit_no((ex.get("elevator_db_exit") or {}).get("exit_no"))
+        if src and src in elev and ex["exit_no"] not in elev:
+            elev[ex["exit_no"]] = elev.pop(src)
     for ex in exits:
         ex["elevator"] = elev.get(ex["exit_no"])
         ex["lift"] = lifts.get(ex["exit_no"])
