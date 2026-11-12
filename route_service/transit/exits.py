@@ -454,6 +454,87 @@ def lift_only_short(pa: dict) -> str:
     return "내릴 %s역 승강장(%s)에는 휠체어리프트만 있습니다." % (pa["station"], _which_platform(pa))
 
 
+# ── 말하기용 위치 문구 (v1.45.0) ─────────────────────────────────────────
+# 설비 자료의 위치 문구는 층 표시와 양 끝 층 설명이 한 줄에 붙어 있다.
+#   "(1F) 금정역 방향 승강장 10-4 출입문 앞(2F) 2번 출입구 계단 및 맞이방 연결통로"
+# 이걸 그대로 읽으면 길고, 이용자가 지금 서 있는 층과 상관없는 설명까지 듣는다(2회차 준비 실기기 확인).
+# 이용자가 승강기를 찾는 층(승강장·맞이방·지상) 쪽 설명 하나만 골라 짧게 만든다. 원문은 platform·exit 값에 그대로 둔다.
+_FLOOR_TAG_RE = re.compile(r"\(\s*(B?\d+)\s*F?\s*\)")
+_FLOOR_WRAP_RE = re.compile(r"^\s*(B?\d+)\s*F\s*\((.*)\)\s*$")
+_PLATFORM_HEAD_RE = re.compile(r"^.*?(?:방향|방면)?\s*(?:상행|하행)?\s*승강장\s*")
+_CONCOURSE_WORDS = ("맞이방", "대합실", "연결통로", "이동통로", "개찰")
+
+
+def _loc_segments(txt: str) -> list:
+    """위치 문구를 층별 조각으로 — [(층, 설명)]. 층 표시가 없으면 [(None, 전체)]."""
+    txt = (txt or "").strip()
+    m = _FLOOR_WRAP_RE.match(txt)
+    if m:                                     # "1F(석수역 방향 상행승강장 계단 옆)"
+        return [(m.group(1), m.group(2))]
+    parts = _FLOOR_TAG_RE.split(txt)
+    if len(parts) == 1:
+        return [(None, txt)]
+    # parts = [층 표시 앞, 층1, 설명1, 층2, 설명2, ...] — 층 표시 앞 글("1 3번 해당사항 없음 /")은 버린다
+    return [(parts[i], parts[i + 1]) for i in range(1, len(parts) - 1, 2) if parts[i + 1].strip()]
+
+
+def _loc_clean(t: str) -> str:
+    t = re.sub(r"\s*엘리베이터\s*", " ", t or "")
+    t = re.sub(r"(\d+)\s*-\s*(\d)\s*출입문\s*앞", r"\1-\2 출입문 앞", t)
+    t = re.sub(r"(\d)\s*번\s*출구", r"\1번 출구", t)
+    t = t.replace("진행방향", "진행 방향")
+    t = re.sub(r"\s{2,}", " ", t).strip(" ,/·")
+    return t
+
+
+def _strip_exit_no(t: str, exit_no) -> str:
+    """"1번 출입구 및 맞이방 연결통로" → "맞이방 연결통로" — 문장 앞에서 이미 출구 번호를 말한다."""
+    if not exit_no:
+        return t
+    # "N번 출입구 및 …"·"N번 출구 쪽 …"·"N번 출구 맞이방 …" 만 뗀다 — "2번 출입구 방향 계단 옆"은 그대로 둔다
+    out = re.sub(r"^%s\s*번\s*출(?:입)?구\s*(?:쪽\s*|및\s*|(?=맞이방))" % re.escape(str(exit_no)), "", t).strip()
+    return out if len(out) >= 4 else t
+
+
+def say_loc(txt: str, where: str, exit_no=None) -> str:
+    """이용자가 승강기를 찾는 층(where = platform | concourse | ground) 기준 짧은 위치 설명.
+
+    platform  : 승강장에서 찾는다 — "7-2 출입문 앞", 칸 번호가 없으면 승강장 이름 뒤 설명("계단 옆")
+    concourse : 맞이방에서 찾는다 — 맞이방·연결통로 쪽 설명, 없으면 승강장 쪽 설명에 "승강장"을 붙인다
+    ground    : 역 밖(지상)에서 찾는다 — 맞이방이 아닌 쪽 설명
+    알아볼 수 없는 문구는 층 표시만 떼고 그대로 돌려준다(지어내지 않는다).
+    """
+    segs = [(f, _loc_clean(t)) for f, t in _loc_segments(txt)]
+    segs = [(f, t) for f, t in segs if t]
+    if not segs:
+        return ""
+    conc = [t for _, t in segs if any(w in t for w in _CONCOURSE_WORDS)]
+    plat = [t for _, t in segs if "승강장" in t or _DOOR_RE.search(t)]
+    if where == "platform":
+        t = plat[0] if plat else segs[0][1]
+        m = _DOOR_RE.search(t)
+        if m:
+            return "%s-%s 출입문 앞" % (m.group(1), m.group(2))
+        rest = _PLATFORM_HEAD_RE.sub("", t).strip() if ("승강장" in t and "(" not in t) else t
+        if re.fullmatch(r"\d{1,2}-\d", rest or ""):
+            return "승강장 %s 앞" % rest          # "승강장 10-4" 처럼 칸 번호만 있는 문구
+        return rest or t
+    if where == "concourse":
+        if conc:
+            return _strip_exit_no(conc[0], exit_no)
+        if plat:
+            short = say_loc(plat[0], "platform")
+            return "승강장 " + short if short and not short.startswith("승강장") else short
+        return _strip_exit_no(segs[-1][1], exit_no)
+    # ground
+    other = [t for _, t in segs if t not in conc]
+    return _strip_exit_no(other[0] if other else segs[0][1], exit_no)
+
+
+def _with_loc(head: str, loc: str) -> str:
+    return "%s — %s" % (head, loc) if loc else head
+
+
 def egress_guide(station_name: str, board_name: str, facilities: dict, exit_sel: dict,
                  travel: str = None, line: str = None) -> dict:
     """하차 후 안내 — 역 안(승강장) 기준 문장 목록과 역 밖(출구) 기준 문장.
@@ -474,25 +555,30 @@ def egress_guide(station_name: str, board_name: str, facilities: dict, exit_sel:
     inside = []
     arr_elev = [p for p in arrival if p["kind"] == "elevator"]
     arr_lift = [p for p in arrival if p["kind"] == "lift"]
+    # 위치 문구는 말하기용으로 줄인다 (v1.45.0) — say_loc. 원문은 platform 값에 그대로 있다.
     if arr_elev:
-        inside.append("내린 승강장의 승강기로 이동합니다 — %s" % arr_elev[0]["detail_loc"])
+        door = say_loc(arr_elev[0]["detail_loc"], "platform")
+        if _DOOR_RE.search(arr_elev[0]["detail_loc"]):
+            inside.append("내린 승강장의 %s 승강기로 이동합니다" % door)
+        else:
+            inside.append(_with_loc("내린 승강장의 승강기로 이동합니다", door))
     elif arr_lift:
         # 리프트만 있는 승강장 (v1.35.0) — 위치만 알려서는 이용자가 무엇을 해야 할지 모른다.
         # 리프트 크기(자료에 있을 때만)와 실제 행동(호출 버튼·역무실 연락)을 함께 말한다.
         lf = arr_lift[0]
         size = lift_size_text(lf)
         inside.append("내린 승강장 쪽에는 휠체어리프트만 있습니다 — %s%s. %s"
-                      % (lf["detail_loc"], "(%s)" % size if size else "", LIFT_ACTION))
+                      % (say_loc(lf["detail_loc"], "platform"), "(%s)" % size if size else "", LIFT_ACTION))
     elif unknown:
-        inside.append("역 안 승강기 위치 — %s" % unknown[0]["detail_loc"])
+        inside.append(_with_loc("역 안 승강기 위치", say_loc(unknown[0]["detail_loc"], "platform")))
     elif plat:
         inside.append("내린 승강장 쪽 승강기 정보가 없습니다 — 역무원에게 확인하세요")
     if exit_sel:
         no = exit_sel["exit_no"]
         if exit_sel.get("elevator"):
-            inside.append("%s번 출구 승강기로 나갑니다 — %s" % (no, exit_sel["elevator"]))
+            inside.append(_with_loc("%s번 출구 승강기로 나갑니다" % no, say_loc(exit_sel["elevator"], "concourse", no)))
         elif exit_sel.get("has_elevator") is False and exit_sel.get("lift"):
-            inside.append("%s번 출구는 휠체어리프트로 나갑니다 — %s" % (no, exit_sel["lift"]))
+            inside.append(_with_loc("%s번 출구는 휠체어리프트로 나갑니다" % no, say_loc(exit_sel["lift"], "concourse", no)))
         else:
             inside.append("%s번 출구로 나갑니다" % no)
         outside = ("%s역 %s번 출구 앞에서 도보 안내를 시작합니다. 다른 출구로 나오셨다면 "
@@ -586,14 +672,17 @@ def ingress_guide(board_name: str, board_exit: dict, pa_board: dict, pa_alight: 
     inside = []
     bx = board_exit or {}
     if bx.get("elevator"):
-        inside.append("%s번 출구 승강기로 역에 들어갑니다 — %s" % (bx["exit_no"], bx["elevator"]))
+        inside.append(_with_loc("%s번 출구 승강기로 역에 들어갑니다" % bx["exit_no"],
+                                say_loc(bx["elevator"], "ground", bx["exit_no"])))
     elif bx.get("has_elevator") is False and bx.get("lift"):
-        inside.append("%s번 출구는 휠체어리프트로 들어갑니다 — %s" % (bx["exit_no"], bx["lift"]))
+        inside.append(_with_loc("%s번 출구는 휠체어리프트로 들어갑니다" % bx["exit_no"],
+                                say_loc(bx["lift"], "ground", bx["exit_no"])))
     elif bx.get("exit_no"):
         inside.append("%s번 출구로 역에 들어갑니다" % bx["exit_no"])
     pa = pa_board or {}
     if pa.get("access") == "elevator" and pa.get("elevator"):
-        inside.append("개찰구를 지나 %s 승강장 승강기를 탑니다 — %s" % (_which_platform(pa), pa["elevator"]))
+        inside.append(_with_loc("개찰구를 지나 %s 승강장 승강기를 탑니다" % _which_platform(pa),
+                                say_loc(pa["elevator"], "concourse")))
     elif pa.get("access") == "lift_only":
         inside.append("개찰구를 지나 %s 승강장으로 갑니다 — 승강장 쪽에는 휠체어리프트만 있습니다" % _which_platform(pa))
     elif pa:

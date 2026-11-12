@@ -32,8 +32,8 @@ def test_station_start_guide_uses_answered_direction():
     exit2 = {"exit_no": "2", "lat": 37.4189, "lng": 126.9092, "has_elevator": True,
              "elevator": "(1F) 2번 출구 옆", "lift": None}
     down = ex.station_start_guide("관악", "south", GWANAK_FAC, exit2)   # 서울 쪽에서 옴 → 하행 승강장
-    assert down["inside"][0] == "내린 승강장의 승강기로 이동합니다 — (1F) 안양역 방향 승강장 진행방향 앞쪽 끝"
-    assert down["inside"][-1] == "2번 출구 승강기로 나갑니다 — (1F) 2번 출구 옆"
+    assert down["inside"][0] == "내린 승강장의 승강기로 이동합니다 — 진행 방향 앞쪽 끝"
+    assert down["inside"][-1] == "2번 출구 승강기로 나갑니다 — 2번 출구 옆"
     assert down["question"] is None and down["travel"] == "south"
     up = ex.station_start_guide("관악", "north", GWANAK_FAC, exit2)     # 안양 쪽에서 옴 → 상행(리프트뿐)
     assert up["inside"][0].startswith("내린 승강장 쪽에는 휠체어리프트만 있습니다")
@@ -73,12 +73,12 @@ def test_inside_station_plans_from_exit_with_start_step(client):
     assert step["maneuver"] == "station_start"
     assert step["instruction"] == "명학역 안에서 출발합니다. 1번 출구(승강기)로 나간 뒤 걸어서 이동합니다"
     assert step["coord"] == [37.3905, 126.9511]
-    assert any("금정역 방향" in t for t in step["egress"]["inside"])          # 안양 쪽에서 왔다 = 하행
+    assert any("10-4" in t for t in step["egress"]["inside"])          # 안양 쪽에서 왔다 = 하행(금정 방향 10-4)
     assert body["origin"]["label"] == "명학역 1번 출구"
     assert "station_nearby" not in body
     north = client.post("/route/plan", json={"origin": NEAR_MYEONGHAK, "destination": DEST,
                                               "origin_station": {"name": "명학", "travel": "north"}}).json()
-    assert any("안양역 방향" in t for t in north["station_start"]["egress"]["inside"])
+    assert any("1-1" in t for t in north["station_start"]["egress"]["inside"])
 
 
 def test_inside_station_bad_input(client):
@@ -131,7 +131,7 @@ def test_station_without_exit_data_still_gets_inside_step(client, monkeypatch):
     st = body["routes"][0]["steps"][0]
     assert st["maneuver"] == "station_start" and body["station_start"]["exit"] is None
     assert st["instruction"] == "명학역 안에서 출발합니다. 출구로 나간 뒤 걸어서 이동합니다"
-    assert any("금정역 방향" in t for t in st["egress"]["inside"])
+    assert any("10-4" in t for t in st["egress"]["inside"])
     # 출구 자료가 없으면 역 근처라도 묻지 않는다(안내할 출구가 없다)
     plain = client.post("/route/plan", json={"origin": NEAR_MYEONGHAK, "destination": DEST}).json()
     assert "station_nearby" not in plain

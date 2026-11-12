@@ -73,8 +73,8 @@ def test_ingress_guide_orders_exit_elevator_gate_platform_car():
     g1 = ex.ingress_guide("관악", bx1, ex.platform_access("관악", "south", GWANAK_FAC, "board"),
                           ex.platform_access("명학", "south", MYEONGHAK_FAC, "alight"), "명학")
     assert g1["inside"] == [
-        "1번 출구 승강기로 역에 들어갑니다 — (1F) 1번 출입구 옆",
-        "개찰구를 지나 안양 방향 승강장 승강기를 탑니다 — (1F) 안양역 방향 승강장 진행방향 앞쪽 끝",
+        "1번 출구 승강기로 역에 들어갑니다 — 1번 출입구 옆",
+        "개찰구를 지나 안양 방향 승강장 승강기를 탑니다 — 승강장 진행 방향 앞쪽 끝",
         "10번째 칸(맨 뒤)에 타면 명학역 승강기가 가깝습니다",
     ]
     assert g1["speech"] == "관악역 1번 출구 승강기입니다. 역에 들어가 개찰구를 지나 안양 방향 승강장으로 가세요"
