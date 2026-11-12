@@ -147,6 +147,11 @@ def _astar(G, start, goal, profile, max_slope_deg, penalized_edges=None):
     return nx.astar_path(G, start, goal, heuristic=heuristic, weight=weight)
 
 
+def _merge_reports(ws):
+    from route_service.engine.steps import merge_report_warnings   # 순환 import 방지 — 호출 때 불러온다
+    return merge_report_warnings(ws)
+
+
 def _summarize(G, path, profile, slope_coverage: float = 1.0) -> dict:
     dist = 0.0
     slopes = []
@@ -205,7 +210,7 @@ def _summarize(G, path, profile, slope_coverage: float = 1.0) -> dict:
         "elevator_cnt": counts["elevator"],
         "ramp_cnt": counts["ramp"],
         "accessibility_score": round(score, 2),
-        "warnings": sorted(set(warnings)),
+        "warnings": _merge_reports(sorted(set(warnings))),
     }
 
 
