@@ -211,13 +211,13 @@ def test_station_start_lift_text_has_location_size_and_action():
     exit2 = {"exit_no": "2", "lat": 37.4189, "lng": 126.9092, "has_elevator": True,
              "elevator": "(1F) 2번 출입구 옆", "lift": None}
     up = ex.station_start_guide("관악", "north", GWANAK_ROW, exit2)
-    assert up["inside"][0] == ("내린 승강장 쪽에는 휠체어리프트만 있습니다 — 1F(석수역 방향 상행승강장 계단 옆)"
+    assert up["inside"][0] == ("내린 승강장 쪽에는 휠체어리프트만 있습니다 — 계단 옆"
                                "(폭 800mm·길이 1,100mm). 승강장의 리프트 호출 버튼을 누르거나 역무실에 연락해 "
                                "역무원을 불러 주세요")
     assert up["platform_access"]["access"] == "lift_only"
-    # 승강기 쪽 문장은 종전 그대로
+    # 승강기 쪽 문장 — 위치는 말하기용으로 줄인다(v1.45.0)
     down = ex.station_start_guide("관악", "south", GWANAK_ROW, exit2)
-    assert down["inside"][0] == "내린 승강장의 승강기로 이동합니다 — (1F) 안양역 방향 승강장 진행방향 앞쪽 끝"
+    assert down["inside"][0] == "내린 승강장의 승강기로 이동합니다 — 진행 방향 앞쪽 끝"
     assert down["platform_access"]["access"] == "elevator"
 
 
@@ -270,7 +270,7 @@ def test_all_candidates_lift_only_keeps_best_with_warning(tmp_path, monkeypatch)
     # 후보 part 의 내부 메모 키는 응답으로 나가지 않는다
     assert "_platform_access_memo" not in json.dumps(body, ensure_ascii=False)
     # 하차 뒤 역 안 문장도 같은 판정(리프트 위치·크기·할 일)
-    assert alight["egress"]["inside"][0].startswith("내린 승강장 쪽에는 휠체어리프트만 있습니다 — 1F(석수역")
+    assert alight["egress"]["inside"][0].startswith("내린 승강장 쪽에는 휠체어리프트만 있습니다 — 계단 옆")
     assert "역무원을 불러 주세요" in alight["egress"]["inside"][0]
 
 

@@ -30,8 +30,8 @@ def test_egress_text_names_exit1():
     e1 = ex.exit_options("안양", ANYANG_FAC, wheelchair=True)[0]
     g = ex.egress_guide("안양", "관악", ANYANG_FAC, e1)
     assert g["exit"]["exit_no"] == "1"
-    assert g["inside"][0] == "내린 승강장의 승강기로 이동합니다 — (1F) 명학역 방향 승강장 7-2 출입문앞"
-    assert g["inside"][1] == "1번 출구 승강기로 나갑니다 — (2F) 1번출구 맞이방 서쪽"
+    assert g["inside"][0] == "내린 승강장의 7-2 출입문 앞 승강기로 이동합니다"
+    assert g["inside"][1] == "1번 출구 승강기로 나갑니다 — 맞이방 서쪽"
     assert g["outside"].startswith("안양역 1번 출구 앞에서")
 
 

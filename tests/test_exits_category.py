@@ -212,7 +212,7 @@ def test_walk_subway_uses_exit_nearest_destination(client):
     assert sub["alight_exit"]["exit_no"] == "1" and sub["alight_exit"]["has_elevator"] is True
     eg = sub["egress"]
     assert eg["exit"]["exit_no"] == "1"
-    assert any("금정역 방향" in line for line in eg["inside"])     # 하차 승강장 쪽 승강기
+    assert any("10-4" in line for line in eg["inside"])     # 하차 승강장(금정 방향) 쪽 승강기
     assert eg["inside"][-1].startswith("1번 출구 승강기로 나갑니다")
     mans = [s["maneuver"] for s in route["steps"]]
     i = mans.index("subway_alight")
@@ -313,7 +313,7 @@ def test_egress_uses_full_facility_list_not_truncated_brief(client, tmp_path):
     sub = [l for l in r.json()["routes"][0]["legs"] if l["kind"] == "subway"][0]
     assert sub["alight"]["name"] == "명학"
     eg = sub["egress"]
-    assert any("금정역 방향" in line for line in eg["inside"]), eg["inside"]
+    assert any("10-4" in line for line in eg["inside"]), eg["inside"]
     assert [p["side"] for p in eg["platform"]] == ["opposite", "arrival"]
     # 응답의 설비 요약은 종전대로 6건까지만 싣는다
     assert len(sub["alight"]["facilities"]["elevators"]) == 6
