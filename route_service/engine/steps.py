@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import re
 import math
 
 from .geo import bearing_deg, haversine_m, lead_bearing, trail_bearing, turn_angle
@@ -95,6 +96,38 @@ def _maneuver_from_carried(angle: float) -> str:
     if abs(folded) >= 150.0:
         return "uturn"
     return "sharp_right" if angle > 0 else "sharp_left"
+
+
+_REPORT_RE = re.compile(r"^이용자 제보: (.+?)( \(미확인\))?$")
+_REPORT_DROP = ("기타",)
+
+
+def merge_report_warnings(warnings) -> list:
+    """이용자 제보 경고를 한 줄로 묶는다 (v1.44.3).
+
+    "이용자 제보: 경사 심함 (미확인)", "이용자 제보: 기타 (미확인)" 처럼 같은 지점의 제보가 여러 개면
+    "이용자 제보: 경사 심함, 통행 불가(공사 등) (미확인)" 한 줄로 읽는다. 사유 '기타'는 이용자가 무엇인지
+    알 수 없어 뺀다(제보는 운영 콘솔에서 따로 본다). 확인 안 된 제보가 하나라도 있으면 끝에 "(미확인)".
+    제보가 아닌 경고는 순서 그대로 두고, 묶은 제보는 첫 제보 자리에 둔다.
+    """
+    out, labels, pending, pos = [], [], False, None
+    for w in warnings or []:
+        m = _REPORT_RE.match(w) if isinstance(w, str) else None
+        if not m:
+            if w not in out:
+                out.append(w)
+            continue
+        if pos is None:
+            pos = len(out)
+        if m.group(1) in _REPORT_DROP:
+            continue
+        if m.group(2):
+            pending = True
+        if m.group(1) not in labels:
+            labels.append(m.group(1))
+    if labels:
+        out.insert(pos, "이용자 제보: %s%s" % (", ".join(labels), " (미확인)" if pending else ""))
+    return out
 
 
 def _edge_warnings(data: dict, profile: Profile) -> list:
@@ -493,7 +526,7 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
             dist,
             s["_link_name"],
             s["_data"],
-            s["_warnings"],
+            merge_report_warnings(s["_warnings"]),
         )
         out.append(
             {
@@ -505,7 +538,7 @@ def build_steps(G, path, profile: Profile, merge_m: float = 15.0) -> list:
                 "coord": s["coord"],
                 "link_type": s["_link_type"],
                 "link_name": s["_link_name"],
-                "warnings": s["_warnings"],
+                "warnings": merge_report_warnings(s["_warnings"]),
                 # 횡단보도 링크의 관리번호(안양시 좌표본) — 한 횡단보도가 여러 링크로 나뉘어 있을 때
                 # 클라이언트가 같은 횡단보도의 조각을 묶어 한 번만 안내하게 한다 (v1.33.1, #98)
                 "crosswalk_id": (s["_data"].get("cw_mgmt_no") if s["_link_type"] == "crossing" else None),
