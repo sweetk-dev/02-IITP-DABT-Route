@@ -706,6 +706,56 @@ def ingress_guide(board_name: str, board_exit: dict, pa_board: dict, pa_alight: 
     return {"station": name, "inside": inside, "car": car, "speech": ". ".join(head)}
 
 
+# ── 목적지가 역일 때 — 출구 승강기로 맞이방까지 (v1.46.0) ─────────────────────
+# 지금까지 도보 목적지가 역이면 역 중심 좌표(역사 건물 쪽)에서 경로가 끝났다. 명학역은 1번 출구 승강기에서 약 56m
+# 떨어진 횡단보도 위였고, 휠체어 이용자는 거기서 승강기를 다시 찾아야 했다(2회차 실증 준비 2026-11-13 확인).
+# 목적지가 역이면 휠체어로 들어갈 수 있는 출구(승강기·리프트)까지 안내하고, 도착 문장에서 맞이방으로 가는 방법을 말한다.
+def _concourse_way(txt: str) -> str:
+    """출구 승강기 설비 문구로 맞이방이 위층인지 아래층인지 — 올라가 | 내려가 | 들어가(모름)."""
+    segs = _loc_segments(txt)
+    floors = [f for f, t in segs if f]
+    conc = [f for f, t in segs if f and any(w in t for w in _CONCOURSE_WORDS)]
+    target = conc[0] if conc else (floors[-1] if len(floors) >= 2 else None)
+    if not target:
+        return "들어가"
+    if target.upper().startswith("B"):
+        return "내려가"
+    try:
+        return "올라가" if int(target) >= 2 else "들어가"
+    except ValueError:
+        return "들어가"
+
+
+def station_enter_guide(station_name: str, exit_sel: dict) -> dict:
+    """도보 목적지가 역일 때의 도착 안내 (v1.46.0) — ingress_guide 의 첫 문장과 같은 말투.
+
+    반환: {"station", "exit_no", "via"(elevator|lift|None), "inside": [화면용 문장], "arrive": 도착 스텝 문장}
+    출구 자료가 없으면 exit_sel=None — 역에 도착했다고만 말한다(승강기 위치를 지어내지 않는다).
+    """
+    name = _key(station_name)
+    bx = exit_sel or {}
+    no = bx.get("exit_no")
+    if not no:
+        return {"station": name, "exit_no": None, "via": None, "inside": [],
+                "arrive": "%s역에 도착했습니다" % name}
+    if bx.get("elevator"):
+        via, how, src = "elevator", "승강기", bx["elevator"]
+    elif bx.get("has_elevator") is not True and bx.get("lift"):
+        via, how, src = "lift", "휠체어리프트", bx["lift"]
+    else:
+        via, how, src = None, None, None
+    if not via:
+        return {"station": name, "exit_no": no, "via": None,
+                "inside": ["%s번 출구로 역에 들어갑니다" % no],
+                "arrive": "%s역 %s번 출구에 도착했습니다" % (name, no)}
+    loc = say_loc(src, "ground", no)
+    way = _concourse_way(src)
+    inside = [_with_loc("%s번 출구 %s로 맞이방에 %s니다" % (no, how, way.replace("가", "갑")), loc)]
+    arrive = "%s역 %s번 출구 %s 앞에 도착했습니다%s. %s로 맞이방에 %s세요" % (
+        name, no, how, " (%s)" % loc if loc else "", how, way)
+    return {"station": name, "exit_no": no, "via": via, "inside": inside, "arrive": arrive}
+
+
 def arrival_choices(station_name: str) -> list:
     """역 안에서 출발할 때 "어느 쪽에서 타고 오셨나요?" 선택지 (#79).
 

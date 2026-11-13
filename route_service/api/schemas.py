@@ -52,6 +52,15 @@ class OriginStation(BaseModel):
     travel: Optional[str] = Field(None, description="north | south | 생략(모름)")
 
 
+class DestinationStation(BaseModel):
+    """역으로 가서 역 안(맞이방)으로 들어간다 (v1.46.0) — 도보 목적지가 역일 때만 보낸다.
+
+    destination 좌표(역 대표점) 대신 그 역의 휠체어로 들어갈 수 있는 출구(승강기·리프트)까지 경로를 잡고,
+    도착 문장에서 출구 승강기로 맞이방에 가는 방법을 말한다. 대중교통 모드에서는 쓰지 않는다.
+    """
+    name: str = Field(..., min_length=1, max_length=20, description="역 이름(예: 명학)")
+
+
 class PlanRequest(BaseModel):
     origin: Coord
     destination: Destination
@@ -70,6 +79,9 @@ class PlanRequest(BaseModel):
     origin_station: Optional[OriginStation] = Field(
         None, description="역 안에서 출발(#79, walk 모드만). 주면 출발점을 그 역의 출구로 바꾸고 "
                           "승강장 승강기 → 출구 승강기 안내 스텝을 앞에 붙인다")
+    destination_station: Optional[DestinationStation] = Field(
+        None, description="역 안으로 도착(v1.46.0, walk 모드만). 주면 목적지를 그 역의 휠체어 출구로 바꾸고 "
+                          "도착 문장에 출구 승강기로 맞이방에 가는 방법을 붙인다")
 
 
 class RerouteRequest(BaseModel):
