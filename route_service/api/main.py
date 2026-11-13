@@ -52,6 +52,7 @@ from ..transit import rail
 from .schemas import (
     AccessReportRequest,
     Destination,
+    DestinationStation,
     PlanRequest,
     RecommendRequest,
     ReportReviewRequest,
@@ -1401,6 +1402,11 @@ def route_plan(req: PlanRequest):
                             detail="지원하지 않는 mode 입니다: %s" % req.mode)
     if req.origin_station is not None:
         payload = _plan_from_station(req)
+    elif req.destination_station is not None or _station_poi_name(req.destination):
+        if req.destination_station is None:
+            # 화면에서 고른 역(transit_station) — 출구 자료가 있는 역이면 같은 방식으로 역 안까지 안내한다(v1.46.1)
+            req.destination_station = DestinationStation(name=_station_poi_name(req.destination))
+        payload = _plan_to_station(req)
     else:
         payload = _plan_core(
             req.origin.lat, req.origin.lng, req.destination,
@@ -1546,6 +1552,81 @@ def _plan_from_station(req: PlanRequest) -> dict:
     return payload
 
 
+# ────────────────────────── 역으로 가서 역 안으로 들어가는 도보 경로 (v1.46.0) ──────────────────────────
+# 역 안 출발(#79)의 짝. 도보 목적지가 역이면 지금까지는 역 대표점(역사 건물 쪽)까지 계산해, 출구 승강기에서 수십 m
+# 떨어진 곳에서 "목적지에 도착했습니다"로 끝났다(명학역: 1번 출구 승강기에서 약 56m 떨어진 횡단보도).
+# 휠체어로 들어갈 수 있는 출구 후보 중 출발점에서 가까운 출구 2곳까지 실제 경로를 비교해 빠른 쪽으로 보내고,
+# 도착 스텝 문장을 "○번 출구 승강기 앞에 도착 → 승강기로 맞이방에 올라가세요"로 바꾼다.
+STATION_END_MATCH_M = 15.0   # 재탐색 때 같은 출구로 가는 요청인지 — 목적지 좌표가 출구에서 이 안이면 같은 출구
+
+
+def _apply_station_end(payload: dict, end: dict):
+    """도착 스텝 문장·목적지 이름을 역 도착 안내로 바꾼다 — 첫 계획과 재탐색이 같은 문장을 쓰게 한 곳에 둔다."""
+    guide = end.get("enter") or {}
+    for r in payload.get("routes") or []:
+        steps = r.get("steps") or []
+        if steps and steps[-1].get("maneuver") == "arrive":
+            last = dict(steps[-1])
+            last["instruction"] = guide.get("arrive") or last.get("instruction")
+            last["enter"] = guide
+            steps[-1] = last
+    ex = end.get("exit")
+    payload.setdefault("destination", {})["label"] = (
+        "%s역 %s번 출구" % (end["station"], ex["exit_no"]) if ex else "%s역" % end["station"])
+    payload["station_end"] = end
+
+
+def _station_poi_name(dest: Destination):
+    """목적지가 지하철역 POI(transit_station)이고 그 역의 출구 자료가 있으면 역 이름, 아니면 None (v1.46.1)."""
+    if dest.type != "transit_station" or not dest.poi_id:
+        return None
+    for s in poi_store.STORE.stations():
+        if str(s.get("poi_id")) == str(dest.poi_id):
+            return s["name"] if station_exits.exits_for(s["name"]) else None
+    return None
+
+
+def _plan_to_station(req: PlanRequest) -> dict:
+    ds = req.destination_station
+    st = _find_station(ds.name)
+    if st is None:
+        raise HTTPException(status_code=404, detail="역을 찾을 수 없습니다: %s" % ds.name)
+    profile = _profile_or_400(req.profile)
+    fac = _station_facilities_cached(st) or {}
+    wheel = str(getattr(profile, "id", "")).startswith("wheelchair")
+    opts = station_exits.exit_options(st["name"], fac, wheel)
+    name = station_exits._key(st["name"])
+    metrics.tag(end="station_inside", end_station=name)
+    chosen = None
+    if not opts:
+        # 출구 좌표가 없는 역 — 받은 목적지(역 대표점)로 계획하고 도착 문장만 바꾼다
+        payload = _plan_core(req.origin.lat, req.origin.lng, req.destination,
+                             req.profile, req.alternatives, req.constraints)
+    else:
+        best, last_err, ok = None, None, 0
+        for ex in station_exits.nearest_exits(opts, (req.origin.lat, req.origin.lng), len(opts)):
+            if ok >= 2:
+                break
+            dest = Destination(type="coord", lat=ex["lat"], lng=ex["lng"])
+            try:
+                p = _plan_core(req.origin.lat, req.origin.lng, dest,
+                               req.profile, req.alternatives, req.constraints)
+            except HTTPException as e:
+                last_err = e
+                continue
+            ok += 1
+            dur = p["routes"][0]["summary"]["duration_sec"] if p.get("routes") else float("inf")
+            if best is None or dur < best[0]:
+                best = (dur, p, ex)
+        if best is None:
+            raise last_err or HTTPException(status_code=422, detail="역 출구까지 경로를 만들 수 없습니다")
+        _, payload, chosen = best
+    brief = station_exits.exit_brief(chosen) if chosen else None
+    _apply_station_end(payload, {"station": name, "exit": brief,
+                                 "enter": station_exits.station_enter_guide(name, brief)})
+    return payload
+
+
 def _tag_plan_result(payload: dict):
     try:
         summ = payload["routes"][0]["summary"]
@@ -1564,6 +1645,13 @@ def route_reroute(req: RerouteRequest):
 
     metrics.tag(profile=req.profile, mode="walk", prev_route_id=req.route_id, reason=req.reason)
     payload = _plan_core(req.current.lat, req.current.lng, req.destination, req.profile, 1, None)
+    # 역 안으로 도착하는 경로(v1.46.0)의 재탐색 — 같은 출구로 가는 요청이면 도착 문장을 그대로 잇는다
+    prev = ROUTE_CACHE.get(req.route_id) if req.route_id else None
+    end = (prev or {}).get("station_end")
+    ex = (end or {}).get("exit")
+    if ex and req.destination.lat is not None and req.destination.lng is not None and \
+            transit.haversine_m(req.destination.lat, req.destination.lng, ex["lat"], ex["lng"]) <= STATION_END_MATCH_M:
+        _apply_station_end(payload, end)
     payload["off_route"] = bool(off is not None and off > settings.off_route_threshold_m)
     payload["off_route_dist_m"] = round(off, 1) if off is not None else None
     _tag_plan_result(payload)
