@@ -107,3 +107,19 @@ def test_reroute_keeps_station_arrival_text(client):
         "current": ORIGIN, "route_id": body["route_id"],
         "destination": {"type": "tour", "poi_id": "TBF-1"}}).json()
     assert "station_end" not in other
+
+
+# ── v1.46.1 — 화면에서 고른 역(transit_station)도 역 안까지 ───────────────────
+def test_transit_station_poi_destination_gets_station_end(client):
+    body = client.post("/route/plan", json={"origin": ORIGIN,
+                                             "destination": {"type": "transit_station", "poi_id": "ST-M"}}).json()
+    assert body["station_end"]["station"] == "명학" and body["station_end"]["exit"]["exit_no"] == "1"
+    assert body["routes"][0]["steps"][-1]["instruction"].startswith("명학역 1번 출구 승강기 앞에 도착했습니다")
+
+
+def test_transit_station_without_exit_data_unchanged(client, monkeypatch):
+    monkeypatch.setattr(ex, "_DATA", {})
+    body = client.post("/route/plan", json={"origin": ORIGIN,
+                                             "destination": {"type": "transit_station", "poi_id": "ST-M"}}).json()
+    assert "station_end" not in body
+    assert body["routes"][0]["steps"][-1]["instruction"] == "목적지에 도착했습니다."
