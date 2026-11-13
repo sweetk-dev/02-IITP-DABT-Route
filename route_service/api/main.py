@@ -52,6 +52,7 @@ from ..transit import rail
 from .schemas import (
     AccessReportRequest,
     Destination,
+    DestinationStation,
     PlanRequest,
     RecommendRequest,
     ReportReviewRequest,
@@ -1401,7 +1402,10 @@ def route_plan(req: PlanRequest):
                             detail="지원하지 않는 mode 입니다: %s" % req.mode)
     if req.origin_station is not None:
         payload = _plan_from_station(req)
-    elif req.destination_station is not None:
+    elif req.destination_station is not None or _station_poi_name(req.destination):
+        if req.destination_station is None:
+            # 화면에서 고른 역(transit_station) — 출구 자료가 있는 역이면 같은 방식으로 역 안까지 안내한다(v1.46.1)
+            req.destination_station = DestinationStation(name=_station_poi_name(req.destination))
         payload = _plan_to_station(req)
     else:
         payload = _plan_core(
@@ -1570,6 +1574,16 @@ def _apply_station_end(payload: dict, end: dict):
     payload.setdefault("destination", {})["label"] = (
         "%s역 %s번 출구" % (end["station"], ex["exit_no"]) if ex else "%s역" % end["station"])
     payload["station_end"] = end
+
+
+def _station_poi_name(dest: Destination):
+    """목적지가 지하철역 POI(transit_station)이고 그 역의 출구 자료가 있으면 역 이름, 아니면 None (v1.46.1)."""
+    if dest.type != "transit_station" or not dest.poi_id:
+        return None
+    for s in poi_store.STORE.stations():
+        if str(s.get("poi_id")) == str(dest.poi_id):
+            return s["name"] if station_exits.exits_for(s["name"]) else None
+    return None
 
 
 def _plan_to_station(req: PlanRequest) -> dict:
