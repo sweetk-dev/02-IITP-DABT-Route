@@ -1087,7 +1087,7 @@ def _walk_leg_via_exit(station: dict, direction: str, other, profile, allowed,
 
 def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
                      mode: str, constraints=None, realtime: bool = False,
-                     low_floor=None) -> dict:
+                     low_floor=None, end_station: str = None) -> dict:
     if not NET.loaded:
         raise HTTPException(status_code=503, detail="네트워크가 로드되지 않았습니다")
     profile = _profile_or_400(profile_id)
@@ -1269,6 +1269,14 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             leg["egress"] = station_exits.egress_guide(
                 leg["alight"]["name"], leg["board"]["name"], fac_full, ax, line=leg.get("line"))
 
+    # 목적지가 역이고 그 역에서 내리면 하차역 출구에서 끝낸다(v1.46.4) — 역 대표점까지 걷는 구간을 붙이지 않는다
+    end_leg = None
+    if end_station:
+        ei = _end_station_leg_index(legs, end_station)
+        if ei is not None:
+            legs = legs[:ei + 1]
+            end_leg = legs[ei]
+
     # ── 통합 요약·geometry·steps ──
     walk_legs = [l for l in legs if l["kind"] == "walk"]
     transit_legs = [l for l in legs if l["kind"] != "walk"]
@@ -1308,6 +1316,17 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
             ex_step = _station_exit_step(leg)
             if ex_step:
                 steps.append(ex_step)
+    if end_leg is not None:
+        ax, st_name = end_leg["alight_exit"], end_leg["alight"]["name"]
+        exit_coord = [round(ax["lat"], 7), round(ax["lng"], 7)]
+        if steps and steps[-1]["maneuver"] == "station_exit":
+            # 여기서 끝나므로 '걸어서 이동합니다'를 말하지 않는다
+            steps[-1]["instruction"] = "%s역 %s번 출구입니다" % (st_name, ax["exit_no"])
+        if not geometry or geometry[-1] != exit_coord:
+            geometry.append(exit_coord)
+        steps.append({"maneuver": "arrive", "instruction": "%s역 %s번 출구에 도착했습니다." % (st_name, ax["exit_no"]),
+                      "distance_m": 0, "duration_sec": 0, "coord": exit_coord,
+                      "link_type": None, "link_name": None, "warnings": []})
     if not steps or steps[-1]["maneuver"] != "arrive":
         last = geometry[-1] if geometry else [target["lat"], target["lng"]]
         steps.append({"maneuver": "arrive", "instruction": "목적지에 도착했습니다.",
@@ -1381,6 +1400,12 @@ def _plan_multimodal(origin_lat, origin_lng, dest: Destination, profile_id: str,
     }
     for leg in legs:                     # 내부 필드 정리
         leg.pop("fallback", None)
+    if end_leg is not None:
+        ax = end_leg["alight_exit"]
+        payload["destination"].update({"lat": ax["lat"], "lng": ax["lng"], "resolved_by": "station_exit",
+                                       "note": None})
+        _apply_station_end(payload, {"station": station_exits._key(end_leg["alight"]["name"]), "exit": ax,
+                                     "enter": {}, "by": "subway"})
     _cache_put(route_id, payload)
     metrics.tag(route_id=route_id, walk_m=summary["walk_distance_m"],
                 total_m=summary["total_distance_m"])
@@ -1392,10 +1417,13 @@ def route_plan(req: PlanRequest):
     metrics.tag(profile=req.profile, mode=req.mode or "walk", dest_type=req.destination.type,
                 dest_id=req.destination.poi_id)
     if req.mode in transit.MODES:
+        # 목적지가 역이면(이름으로 받았거나 화면에서 고른 역) 그 역에서 내릴 때 출구에서 끝낸다(v1.46.4)
+        end_st = req.destination_station.name if req.destination_station is not None \
+            else _station_poi_name(req.destination)
         return _plan_multimodal(
             req.origin.lat, req.origin.lng, req.destination,
             req.profile, req.mode, req.constraints, realtime=req.realtime,
-            low_floor=req.low_floor,
+            low_floor=req.low_floor, end_station=end_st,
         )
     if req.mode not in ("", "walk", None):
         raise HTTPException(status_code=400,
@@ -1558,6 +1586,27 @@ def _plan_from_station(req: PlanRequest) -> dict:
 # 휠체어로 들어갈 수 있는 출구 후보 중 출발점에서 가까운 출구 2곳까지 실제 경로를 비교해 빠른 쪽으로 보내고,
 # 도착 스텝 문장을 "○번 출구 승강기 앞에 도착 → 승강기로 맞이방에 올라가세요"로 바꾼다.
 STATION_END_MATCH_M = 15.0   # 재탐색 때 같은 출구로 가는 요청인지 — 목적지 좌표가 출구에서 이 안이면 같은 출구
+
+
+def _end_station_leg_index(legs: list, end_station: str):
+    """마지막 대중교통 구간이 목적지 역에서 내리는 지하철이면 그 leg 의 위치, 아니면 None (v1.46.4).
+
+    "안양역까지 지하철로"처럼 역이 목적지인 지하철 경로는 지금까지 하차역 출구에서 역 대표점까지 도보 구간을
+    붙였다. 대표점이 철로 건너편 역사 쪽이면 휠체어로 철로를 건너는 길을 돌아 1km 넘게 걷는 경로가 됐다
+    (관악역 → 안양역: 하차 뒤 1번 출구에서 1,297m, 전체 3,642m). 내린 역이 목적지이므로 출구에서 끝낸다.
+    하차 출구 좌표가 없으면(출구 자료가 없는 역) 종전대로 둔다.
+    """
+    key = station_exits._key(end_station or "")
+    if not key:
+        return None
+    for i in range(len(legs) - 1, -1, -1):
+        leg = legs[i]
+        if leg["kind"] == "walk":
+            continue
+        if leg["kind"] == "subway" and station_exits._key(leg["alight"]["name"]) == key and leg.get("alight_exit"):
+            return i
+        return None
+    return None
 
 
 def _apply_station_end(payload: dict, end: dict):
